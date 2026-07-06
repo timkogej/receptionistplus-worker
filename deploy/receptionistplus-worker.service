@@ -1,0 +1,25 @@
+[Unit]
+Description=ReceptionistPlus LiveKit Agents worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=receptionistplus
+Group=receptionistplus
+WorkingDirectory=/opt/receptionistplus-worker
+EnvironmentFile=/etc/receptionistplus/.env
+ExecStart=/opt/receptionistplus-worker/.venv/bin/python -m agent.worker start
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
