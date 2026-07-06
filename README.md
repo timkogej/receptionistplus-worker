@@ -51,11 +51,11 @@ step 0.6 of the project plan, not yet configured).
    sudo apt install -y python3.12 python3.12-venv
    ```
 
-2. Copy this repo to the server, e.g. `/opt/receptionistplus-worker`, then create the venv
+2. Copy this repo to the server at `/opt/receptionist-plus`, then create the venv
    and install dependencies:
 
    ```bash
-   cd /opt/receptionistplus-worker
+   cd /opt/receptionist-plus
    python3.12 -m venv .venv
    .venv/bin/pip install -r requirements.txt
    ```
@@ -81,7 +81,7 @@ step 0.6 of the project plan, not yet configured).
 
    The service runs as a dedicated `receptionistplus` user — create it first if it
    doesn't exist (`sudo useradd --system --no-create-home receptionistplus`) and make
-   sure it owns `/opt/receptionistplus-worker`.
+   sure it owns `/opt/receptionist-plus`.
 
 5. Start it once SIP dispatch is configured:
 
