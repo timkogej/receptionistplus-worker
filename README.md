@@ -105,3 +105,20 @@ All settings are read from the environment (see `.env.example`):
 | `TTS_PROVIDER` | no (default `soniox`) | `soniox` or `elevenlabs` |
 | `TTS_VOICE_ID` | no | Provider-specific voice id/name; falls back to provider default |
 | `GREETING_TEXT` | no | Text spoken to callers on join |
+
+## Comparing TTS providers (`tools/tts_ab.py`)
+
+A standalone script (no LiveKit runtime needed) that synthesizes a fixed set of
+Slovenian test sentences through both Soniox TTS and ElevenLabs Flash v2.5, so you
+can listen and compare quality on declension, dual forms, names, times, prices, and
+digit read-out:
+
+```bash
+export SONIOX_API_KEY=...
+export ELEVENLABS_API_KEY=...
+python tools/tts_ab.py
+```
+
+Output goes to `tts_out/soniox/<n>.wav` and `tts_out/elevenlabs/<n>.mp3` (gitignored).
+Optional overrides: `SONIOX_TTS_VOICE` (default `Maya`), `SONIOX_TTS_MODEL` (default
+`tts-rt-v1`), `ELEVENLABS_VOICE_ID` (default Rachel, `21m00Tcm4TlvDq8ikWAM`).

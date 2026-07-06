@@ -1,3 +1,4 @@
 livekit-agents==1.6.4
 livekit-plugins-soniox==1.6.4
 livekit-plugins-elevenlabs==1.6.4
+requests==2.34.2
