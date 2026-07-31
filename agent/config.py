@@ -31,6 +31,8 @@ class Settings:
     tts_voice_id: str | None
     greeting_text: str
 
+    company_slug: str
+
     @classmethod
     def from_env(cls) -> "Settings":
         tts_provider = os.environ.get("TTS_PROVIDER", "soniox").strip().lower()
@@ -60,4 +62,5 @@ class Settings:
                 "GREETING_TEXT",
                 "Thank you for calling. Please hold while we connect you.",
             ),
+            company_slug=_require("COMPANY_SLUG"),
         )
