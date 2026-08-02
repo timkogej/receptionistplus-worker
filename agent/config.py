@@ -33,6 +33,9 @@ class Settings:
 
     company_slug: str
 
+    supabase_url: str
+    supabase_service_role_key: str
+
     @classmethod
     def from_env(cls) -> "Settings":
         tts_provider = os.environ.get("TTS_PROVIDER", "soniox").strip().lower()
@@ -63,4 +66,6 @@ class Settings:
                 "Thank you for calling. Please hold while we connect you.",
             ),
             company_slug=_require("COMPANY_SLUG"),
+            supabase_url=_require("SUPABASE_URL"),
+            supabase_service_role_key=_require("SUPABASE_SERVICE_ROLE_KEY"),
         )

@@ -9,7 +9,9 @@ real bookings via tools (see tools.py).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+import math
+import uuid
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from livekit import agents
@@ -21,10 +23,19 @@ from livekit.plugins import anthropic, elevenlabs, soniox
 from agent.booking_client import init_company
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
+from agent.supabase_client import SupabaseClient
 from agent.tools import BookingTools
 
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
+
+NO_CREDITS_MESSAGE = (
+    "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje."
+)
+
+# Calls shorter than this are treated as accidental hangups/misdials, not
+# billable conversations.
+ABANDONED_CALL_THRESHOLD_SEC = 10
 
 TIMEZONE = ZoneInfo("Europe/Ljubljana")
 
@@ -258,6 +269,45 @@ async def entrypoint(ctx: JobContext) -> None:
     settings = Settings.from_env()
     await ctx.connect()
 
+    supabase = SupabaseClient(settings.supabase_url, settings.supabase_service_role_key)
+    call_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
+    livekit_room = ctx.room.name
+
+    balance = await supabase.get_balance(settings.company_slug)
+    if balance <= 0:
+        logger.warning(
+            "no credits: company_slug=%s balance=%s, rejecting call",
+            settings.company_slug,
+            balance,
+        )
+        gate_session = AgentSession(tts=_build_tts(settings))
+        await gate_session.start(
+            room=ctx.room,
+            agent=Agent(
+                instructions=(
+                    "You only ever speak one fixed message and take no other "
+                    "action; you have no tools."
+                )
+            ),
+        )
+        await gate_session.say(NO_CREDITS_MESSAGE)
+        await gate_session.aclose()
+        await supabase.insert_call(
+            {
+                "id": call_id,
+                "company_slug": settings.company_slug,
+                "started_at": started_at.isoformat(),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "duration_sec": 0,
+                "billed_credits": 0,
+                "outcome": "no_credits",
+                "transcript": [],
+                "livekit_room": livekit_room,
+            }
+        )
+        return
+
     company_data = await init_company(settings.company_slug)
     booking_tools = BookingTools(settings.company_slug, company_data)
 
@@ -271,11 +321,95 @@ async def entrypoint(ctx: JobContext) -> None:
         },
     )
 
+    transcript: list[dict] = []
+    # Set from the session's "close" event, which fires right when the call
+    # actually ends (participant disconnect). The process/job shutdown that
+    # triggers _on_shutdown below can lag well behind that — observed ~26s in
+    # testing — so ended_at must NOT be datetime.now() taken inside
+    # _on_shutdown, or short calls get billed for dead time after hangup.
+    call_ended_at: dict[str, datetime] = {}
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event) -> None:
         item = event.item
         if isinstance(item, ChatMessage) and item.role in ("user", "assistant"):
             transcript_logger.info("%s: %s", item.role, item.text_content)
+            transcript.append(
+                {
+                    "role": item.role,
+                    "text": item.text_content,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+
+    @session.on("close")
+    def _on_close(event) -> None:
+        call_ended_at["value"] = datetime.now(timezone.utc)
+
+    async def _on_shutdown() -> None:
+        ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)
+        duration_sec = max(0, math.ceil((ended_at - started_at).total_seconds()))
+
+        if duration_sec < ABANDONED_CALL_THRESHOLD_SEC:
+            billed_credits = 0.0
+            outcome = "abandoned"
+        else:
+            billed_credits = round(duration_sec / 60.0, 2)
+            outcome = "booked" if booking_tools.created_termin_id else "info_only"
+
+        new_balance = balance
+        if billed_credits > 0:
+            try:
+                new_balance = await supabase.deduct_credits(
+                    company_slug=settings.company_slug,
+                    call_id=call_id,
+                    billed_credits=billed_credits,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to deduct credits for call_id=%s company_slug=%s",
+                    call_id,
+                    settings.company_slug,
+                )
+                new_balance = balance
+            else:
+                try:
+                    settings_row = await supabase.get_settings(settings.company_slug)
+                except Exception:
+                    logger.exception(
+                        "failed to fetch receptionist_settings for company_slug=%s",
+                        settings.company_slug,
+                    )
+                    settings_row = None
+                low_balance_threshold = (
+                    settings_row["low_balance_threshold"] if settings_row else 60
+                )
+                if new_balance < low_balance_threshold:
+                    logger.warning(
+                        "LOW BALANCE: company_slug=%s balance=%s",
+                        settings.company_slug,
+                        new_balance,
+                    )
+
+        try:
+            await supabase.insert_call(
+                {
+                    "id": call_id,
+                    "company_slug": settings.company_slug,
+                    "started_at": started_at.isoformat(),
+                    "ended_at": ended_at.isoformat(),
+                    "duration_sec": duration_sec,
+                    "billed_credits": billed_credits,
+                    "outcome": outcome,
+                    "transcript": transcript,
+                    "created_termin_id": booking_tools.created_termin_id,
+                    "livekit_room": livekit_room,
+                }
+            )
+        except Exception:
+            logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
+
+    ctx.add_shutdown_callback(_on_shutdown)
 
     await session.start(
         room=ctx.room,

@@ -66,6 +66,9 @@ class BookingTools:
         self._company_slug = company_slug
         self._company_data = company_data
         self._last_check_key: tuple | None = None
+        # Set on the first successful create_booking this session, for
+        # receptionist_calls.created_termin_id / outcome (Phase 3 call logging).
+        self.created_termin_id: str | None = None
 
     def _eligible_employee_ids(self, service_ids: list[str]) -> list[str]:
         by_service = self._company_data.get("employeesByServiceId", {})
@@ -308,4 +311,6 @@ class BookingTools:
                 ),
             }
         logger.info("create_booking outcome: %s", result)
+        if result.get("success") and result.get("terminId"):
+            self.created_termin_id = result["terminId"]
         return result
