@@ -9,13 +9,27 @@ spec exists yet — see the "init"/"slots"/"check-slots"/"create" handlers below
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
+import os
+import time
 
 import requests
 
 logger = logging.getLogger("receptionistplus-worker.booking")
 
 BOOKING_WEBHOOK_URL = "https://n8n.jedroplus.com/webhook/booking-v2"
+
+# Phase 5 Part A prep: HMAC-signs requests once the n8n side verifies them.
+# NOT ACTIVE YET — BOOKING_V2_HMAC_SECRET is intentionally unset in every
+# environment right now. n8n is being rolled out in log-only (non-enforcing)
+# mode first, to surface any callers of booking-v2 other than this worker
+# before signatures become mandatory. Do not set this env var until that
+# rollout is confirmed complete and we're ready to flip signing on here too.
+# The n8n Code node rejects timestamps more than 300s old — keep in sync.
+_HMAC_SECRET_ENV = "BOOKING_V2_HMAC_SECRET"
 
 
 class BookingError(RuntimeError):
@@ -34,10 +48,37 @@ class BookingTimeoutError(BookingError):
     """
 
 
+def _sign(raw_body: bytes, *, secret: str, timestamp: str) -> str:
+    """HMAC-SHA256 over "<timestamp>." + raw_body, matching the n8n Code node."""
+    message = f"{timestamp}.".encode() + raw_body
+    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+
+
 def _post(payload: dict, *, timeout: float) -> dict:
     logger.info("booking webhook request: %s", payload)
-    # TODO Phase 5: add HMAC/bearer auth to this call once the webhook requires it.
-    response = requests.post(BOOKING_WEBHOOK_URL, json=payload, timeout=timeout)
+
+    secret = os.environ.get(_HMAC_SECRET_ENV)
+    if secret:
+        # Compact, deterministic serialization — the exact bytes we sign are
+        # the exact bytes sent, so the n8n side never has to reproduce our
+        # JSON serialization to verify the signature (it just HMACs the raw
+        # body it received via the Webhook node's "Raw Body" option).
+        raw_body = json.dumps(payload, separators=(",", ":")).encode()
+        timestamp = str(int(time.time()))
+        signature = _sign(raw_body, secret=secret, timestamp=timestamp)
+        response = requests.post(
+            BOOKING_WEBHOOK_URL,
+            data=raw_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature": signature,
+                "X-Timestamp": timestamp,
+            },
+            timeout=timeout,
+        )
+    else:
+        response = requests.post(BOOKING_WEBHOOK_URL, json=payload, timeout=timeout)
+
     response.raise_for_status()
     data = response.json()
     logger.info("booking webhook response: %s", data)
