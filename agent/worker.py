@@ -40,6 +40,16 @@ TECHNICAL_DIFFICULTY_MESSAGE = (
     "Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj."
 )
 
+# EU AI Act Article 50: callers must be told they're talking to an AI system,
+# no later than the first interaction. Prepended in code rather than baked
+# into GREETING_TEXT so it can't be dropped by a misconfigured or edited
+# per-company greeting — this is the one guaranteed source of disclosure,
+# not the only one.
+AI_DISCLOSURE_SL = (
+    "Prosimo, upoštevajte, da govorite z digitalnim glasovnim asistentom, ne "
+    "z osebo. "
+)
+
 # Pre-rendered once via a working Soniox TTS call (see assets/README or the
 # generation snippet in the Phase 5 Part C notes) so this specific message can
 # still be played when the configured TTS provider is the thing that's down —
@@ -558,7 +568,7 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     try:
-        await session.say(settings.greeting_text)
+        await session.say(AI_DISCLOSURE_SL + settings.greeting_text)
     except Exception:
         # A broken TTS provider surfaces here too; the "error" handler above
         # will already be counting toward _degrade_and_close, so just avoid
