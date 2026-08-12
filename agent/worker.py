@@ -17,11 +17,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from livekit import agents
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions
+from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, llm
 from livekit.agents.llm import ChatMessage
 from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
-from livekit.plugins import anthropic, elevenlabs, soniox
+from livekit.plugins import anthropic, elevenlabs, openai, soniox
 
 from agent.booking_client import init_company
 from agent.company_prompt import render_company_prompt
@@ -47,12 +47,6 @@ TECHNICAL_DIFFICULTY_MESSAGE = (
 TECHNICAL_DIFFICULTY_AUDIO_PATH = (
     Path(__file__).resolve().parent.parent / "assets" / "technical_difficulty_sl.wav"
 )
-
-# Phase 5 Part C: the underlying SDK will otherwise retry a broken STT/TTS/LLM
-# provider (e.g. an invalid API key) indefinitely, leaving the caller in dead
-# air with no end in sight. After this many stt/tts/llm error events in one
-# call, we cut our losses: try to speak an apology, then end the call.
-MAX_CONSECUTIVE_PROVIDER_ERRORS = 2
 
 # Calls shorter than this are treated as accidental hangups/misdials, not
 # billable conversations.
@@ -279,11 +273,19 @@ def _build_stt(settings: Settings) -> soniox.STT:
     )
 
 
-def _build_llm(settings: Settings) -> anthropic.LLM:
-    return anthropic.LLM(
+def _build_llm(settings: Settings) -> llm.LLM:
+    primary = anthropic.LLM(
         model="claude-haiku-4-5",
         api_key=settings.anthropic_api_key,
     )
+    if not settings.openai_api_key:
+        return primary
+
+    # Phase 5 Part C: falls back to GPT-4o-mini if Anthropic is down. Only
+    # kicks in after Anthropic's own attempt fails outright — this is not a
+    # cost-saving load-balance, just an outage safety net.
+    fallback = openai.LLM(model="gpt-4o-mini", api_key=settings.openai_api_key)
+    return llm.FallbackAdapter([primary, fallback])
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -367,18 +369,20 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_close(event) -> None:
         call_ended_at["value"] = datetime.now(timezone.utc)
 
-    # Phase 5 Part C: the SDK retries a broken stt/tts/llm provider on its own,
-    # but for a persistent failure (e.g. an invalid API key) that retry loop
-    # never gives up on its own within a reasonable time, leaving the caller
-    # in dead air. Count consecutive provider errors ourselves and cut the
-    # call short well before that.
-    provider_error_state = {"count": 0, "degrading": False}
+    # Phase 5 Part C: the SDK retries a broken stt/tts/llm provider on its
+    # own, but that retry loop either never gives up (observed with a broken
+    # STT/TTS key — retries indefinitely) or gives up silently after a single
+    # attempt with no further signal (observed with a broken LLM key — one
+    # `recoverable=False` error and then just... nothing). Either way the
+    # caller is left in dead air. `error.recoverable=True` events are the SDK
+    # telling us it's still retrying on its own, so we ignore those; the
+    # first `recoverable=False` event for any provider means the SDK has
+    # already given up on that attempt, which is our cue to cut the call
+    # short ourselves rather than wait for more events that may never come.
+    provider_error_state = {"degrading": False}
 
     async def _degrade_and_close() -> None:
-        logger.error(
-            "ending call early: %d consecutive stt/tts/llm provider errors",
-            provider_error_state["count"],
-        )
+        logger.error("ending call early: unrecoverable stt/tts/llm provider error")
         try:
             # Play a pre-recorded clip rather than calling session.say() with
             # plain text: the configured TTS provider may itself be the thing
@@ -398,19 +402,16 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_session_error(event) -> None:
         if event.error.type not in ("stt_error", "tts_error", "llm_error"):
             return
-        if provider_error_state["degrading"]:
-            return
-
-        provider_error_state["count"] += 1
         logger.warning(
-            "provider error #%d: type=%s recoverable=%s",
-            provider_error_state["count"],
+            "provider error: type=%s recoverable=%s",
             event.error.type,
             event.error.recoverable,
         )
-        if provider_error_state["count"] >= MAX_CONSECUTIVE_PROVIDER_ERRORS:
-            provider_error_state["degrading"] = True
-            asyncio.create_task(_degrade_and_close())
+        if event.error.recoverable or provider_error_state["degrading"]:
+            return
+
+        provider_error_state["degrading"] = True
+        asyncio.create_task(_degrade_and_close())
 
     async def _on_shutdown() -> None:
         ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)

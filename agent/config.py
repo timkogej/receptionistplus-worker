@@ -26,6 +26,7 @@ class Settings:
     soniox_api_key: str | None
     elevenlabs_api_key: str | None
     anthropic_api_key: str
+    openai_api_key: str | None
 
     tts_provider: str
     tts_voice_id: str | None
@@ -59,6 +60,7 @@ class Settings:
             soniox_api_key=soniox_api_key,
             elevenlabs_api_key=elevenlabs_api_key,
             anthropic_api_key=_require("ANTHROPIC_API_KEY"),
+            openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
             tts_provider=tts_provider,
             tts_voice_id=os.environ.get("TTS_VOICE_ID") or None,
             greeting_text=os.environ.get(
