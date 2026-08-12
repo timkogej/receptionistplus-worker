@@ -8,15 +8,18 @@ real bookings via tools (see tools.py).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from livekit import agents
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions
 from livekit.agents.llm import ChatMessage
+from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
 from livekit.plugins import anthropic, elevenlabs, soniox
 
@@ -32,6 +35,24 @@ transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
 NO_CREDITS_MESSAGE = (
     "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje."
 )
+
+TECHNICAL_DIFFICULTY_MESSAGE = (
+    "Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj."
+)
+
+# Pre-rendered once via a working Soniox TTS call (see assets/README or the
+# generation snippet in the Phase 5 Part C notes) so this specific message can
+# still be played when the configured TTS provider is the thing that's down —
+# session.say(..., audio=...) bypasses TTS synthesis entirely for it.
+TECHNICAL_DIFFICULTY_AUDIO_PATH = (
+    Path(__file__).resolve().parent.parent / "assets" / "technical_difficulty_sl.wav"
+)
+
+# Phase 5 Part C: the underlying SDK will otherwise retry a broken STT/TTS/LLM
+# provider (e.g. an invalid API key) indefinitely, leaving the caller in dead
+# air with no end in sight. After this many stt/tts/llm error events in one
+# call, we cut our losses: try to speak an apology, then end the call.
+MAX_CONSECUTIVE_PROVIDER_ERRORS = 2
 
 # Calls shorter than this are treated as accidental hangups/misdials, not
 # billable conversations.
@@ -346,6 +367,51 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_close(event) -> None:
         call_ended_at["value"] = datetime.now(timezone.utc)
 
+    # Phase 5 Part C: the SDK retries a broken stt/tts/llm provider on its own,
+    # but for a persistent failure (e.g. an invalid API key) that retry loop
+    # never gives up on its own within a reasonable time, leaving the caller
+    # in dead air. Count consecutive provider errors ourselves and cut the
+    # call short well before that.
+    provider_error_state = {"count": 0, "degrading": False}
+
+    async def _degrade_and_close() -> None:
+        logger.error(
+            "ending call early: %d consecutive stt/tts/llm provider errors",
+            provider_error_state["count"],
+        )
+        try:
+            # Play a pre-recorded clip rather than calling session.say() with
+            # plain text: the configured TTS provider may itself be the thing
+            # that's broken (as it was during Phase 5 Part C testing, where
+            # STT and TTS shared one invalid key), in which case synthesizing
+            # the apology live would fail silently right along with it.
+            audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
+            await asyncio.wait_for(
+                session.say(TECHNICAL_DIFFICULTY_MESSAGE, audio=audio), timeout=8.0
+            )
+        except Exception:
+            logger.exception("failed to play technical-difficulty message before closing")
+        finally:
+            await session.aclose()
+
+    @session.on("error")
+    def _on_session_error(event) -> None:
+        if event.error.type not in ("stt_error", "tts_error", "llm_error"):
+            return
+        if provider_error_state["degrading"]:
+            return
+
+        provider_error_state["count"] += 1
+        logger.warning(
+            "provider error #%d: type=%s recoverable=%s",
+            provider_error_state["count"],
+            event.error.type,
+            event.error.recoverable,
+        )
+        if provider_error_state["count"] >= MAX_CONSECUTIVE_PROVIDER_ERRORS:
+            provider_error_state["degrading"] = True
+            asyncio.create_task(_degrade_and_close())
+
     async def _on_shutdown() -> None:
         ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)
         duration_sec = max(0, math.ceil((ended_at - started_at).total_seconds()))
@@ -423,7 +489,13 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
     )
 
-    await session.say(settings.greeting_text)
+    try:
+        await session.say(settings.greeting_text)
+    except Exception:
+        # A broken TTS provider surfaces here too; the "error" handler above
+        # will already be counting toward _degrade_and_close, so just avoid
+        # crashing the entrypoint over it.
+        logger.exception("failed to speak greeting")
 
     logger.info("greeting delivered, conversation active")
 
