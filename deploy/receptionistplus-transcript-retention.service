@@ -1,0 +1,18 @@
+[Unit]
+Description=Purge/anonymize receptionist_calls transcripts older than 12 months (GDPR retention)
+
+[Service]
+Type=oneshot
+User=receptionistplus
+Group=receptionistplus
+WorkingDirectory=/opt/receptionist-plus
+EnvironmentFile=/etc/receptionistplus/.env
+ExecStart=/opt/receptionist-plus/.venv/bin/python scripts/purge_old_transcripts.py
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
