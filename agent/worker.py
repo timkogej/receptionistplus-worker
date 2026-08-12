@@ -23,7 +23,7 @@ from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
 from livekit.plugins import anthropic, elevenlabs, openai, soniox
 
-from agent.booking_client import init_company
+from agent.booking_client import BookingError, init_company
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
 from agent.supabase_client import SupabaseClient
@@ -273,6 +273,34 @@ def _build_stt(settings: Settings) -> soniox.STT:
     )
 
 
+async def _init_company_with_retry(
+    company_slug: str, *, attempts: int = 2, retry_delay: float = 1.0
+) -> dict:
+    """Phase 5 Part C: booking-v2 is unreachable often enough (transient
+    network blips, n8n restarts) that a single failed attempt shouldn't sink
+    the call outright. Kept separate from call_booking's own retry policy —
+    unlike create_booking, init has no side effects, so blindly retrying it
+    is safe.
+    """
+    last_exc: BookingError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await init_company(company_slug)
+        except BookingError as exc:
+            last_exc = exc
+            logger.warning(
+                "booking-v2 init attempt %d/%d failed for company_slug=%s: %s",
+                attempt,
+                attempts,
+                company_slug,
+                exc,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _build_llm(settings: Settings) -> llm.LLM:
     primary = anthropic.LLM(
         model="claude-haiku-4-5",
@@ -331,7 +359,46 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         return
 
-    company_data = await init_company(settings.company_slug)
+    try:
+        company_data = await _init_company_with_retry(settings.company_slug)
+    except BookingError:
+        logger.exception(
+            "booking-v2 init failed for company_slug=%s, degrading gracefully",
+            settings.company_slug,
+        )
+        gate_session = AgentSession(tts=_build_tts(settings))
+        await gate_session.start(
+            room=ctx.room,
+            agent=Agent(
+                instructions=(
+                    "You only ever speak one fixed message and take no other "
+                    "action; you have no tools."
+                )
+            ),
+        )
+        try:
+            audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
+            await asyncio.wait_for(
+                gate_session.say(TECHNICAL_DIFFICULTY_MESSAGE, audio=audio), timeout=8.0
+            )
+        except Exception:
+            logger.exception("failed to play technical-difficulty message (init failure path)")
+        await gate_session.aclose()
+        await supabase.insert_call(
+            {
+                "id": call_id,
+                "company_slug": settings.company_slug,
+                "started_at": started_at.isoformat(),
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "duration_sec": 0,
+                "billed_credits": 0,
+                "outcome": "booking_unavailable",
+                "transcript": [],
+                "livekit_room": livekit_room,
+            }
+        )
+        return
+
     booking_tools = BookingTools(settings.company_slug, company_data)
 
     session = AgentSession(
