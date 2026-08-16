@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from zoneinfo import ZoneInfo
 from livekit import agents
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, llm
 from livekit.agents.llm import ChatMessage
+from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
 from livekit.plugins import anthropic, elevenlabs, openai, soniox
@@ -27,7 +29,11 @@ from agent.booking_client import BookingError, init_company
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
 from agent.supabase_client import SupabaseClient
-from agent.tools import BookingTools
+from agent.tools import (
+    CREATE_BOOKING_FILLER_TEXT,
+    GET_SLOTS_FILLER_TEXT,
+    BookingTools,
+)
 
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
@@ -61,6 +67,43 @@ TECHNICAL_DIFFICULTY_AUDIO_PATH = (
 # Calls shorter than this are treated as accidental hangups/misdials, not
 # billable conversations.
 ABANDONED_CALL_THRESHOLD_SEC = 10
+
+# Generic filler (any slow turn, not just the three booking tool calls — see
+# the entrypoint's _generic_filler_loop). Set above create_booking's own
+# filler delay (4.5s) so create_booking's specific tuned wording ("Samo
+# trenutek, urejam rezervacijo...") still gets first chance to fire on that
+# path — the most consequential moment (a real booking in progress)  keeps
+# its specific message; this generic one is a catch-all for everything else,
+# including plain conversational turns which previously had no filler.
+GENERIC_FILLER_PHRASES = [
+    "Samo trenutek...",
+    "En moment...",
+    "Samo sekundo...",
+]
+GENERIC_FILLER_DELAY = 5.0
+
+# Promise-follow-up watchdog (2026-08-16 fix): a fallback-model turn that
+# says "checking..."/"trenutek, prosim..." and then never calls the tool it
+# just promised leaves the caller hanging indefinitely — observed for real
+# during a sustained Anthropic outage where GPT-4o-mini spoke this exact
+# pattern and then produced no further activity for 4+ minutes until the
+# caller gave up. If no new agent/user activity follows such an utterance
+# within this window, treat it as a technical failure (see
+# _watch_for_promise_followup in entrypoint).
+PROMISE_CUE_PATTERN = re.compile(
+    r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
+    r"|poskušam\b|počakajte",
+    re.IGNORECASE,
+)
+PROMISE_WATCHDOG_TIMEOUT_SEC = 12.0
+
+# Our own filler utterances also match PROMISE_CUE_PATTERN by design, but
+# they're paired with an actual in-flight tool call that already has its own
+# real timeout (up to 45s for create_booking) — excluded so the watchdog's
+# much shorter window doesn't kill a call that's legitimately still running.
+_KNOWN_FILLER_TEXTS = frozenset(
+    GENERIC_FILLER_PHRASES + [GET_SLOTS_FILLER_TEXT, CREATE_BOOKING_FILLER_TEXT]
+)
 
 TIMEZONE = ZoneInfo("Europe/Ljubljana")
 
@@ -149,7 +192,22 @@ def slovenian_ordinal_genitive(day: int) -> str:
     raise ValueError(f"day out of range 1-31: {day}")
 
 
+_RELATIVE_DAY_LABELS = {0: "DANES", 1: "JUTRI", 2: "POJUTRIŠNJEM"}
+
+
 def _build_date_context() -> str:
+    """Build the date-lookup table given to the LLM each turn.
+
+    Bug fixed 2026-08-14: the table used to only give each row's absolute
+    date/weekday, leaving the model to work out on its own which row is
+    "jutri" (offset 0 vs 1) — exactly the kind of manual calculation the
+    instructions claimed to forbid. Observed failure: it labeled TODAY's row
+    as "jutri" and offered it as a bookable day, and since tomorrow was
+    actually a closed Saturday, this made the mislabeled date look like a
+    plausible near-term suggestion instead. Fix: stamp DANES/JUTRI/
+    POJUTRIŠNJEM directly onto the first three rows so there's no offset
+    arithmetic left for the model to get wrong.
+    """
     now = datetime.now(TIMEZONE)
     time_str = now.strftime("%H:%M")
 
@@ -159,14 +217,19 @@ def _build_date_context() -> str:
         iso_date = d.strftime("%Y-%m-%d")
         weekday = SLOVENIAN_WEEKDAYS[d.weekday()]
         phrase = f"{slovenian_ordinal_genitive(d.day)} {SLOVENIAN_MONTHS_GENITIVE[d.month]}"
-        rows.append(f"- {iso_date} ({weekday}): {phrase}")
+        label = _RELATIVE_DAY_LABELS.get(offset)
+        label_str = f" [{label}]" if label else ""
+        rows.append(f"- {iso_date} ({weekday}){label_str}: {phrase}")
 
     table = "\n".join(rows)
 
     return (
         f"Current time is {time_str}, timezone Europe/Ljubljana. Below is a "
         f"pre-computed table of the next 14 days: ISO date, Slovenian weekday, "
-        f"and the exact spoken date phrase.\n\n"
+        f"and the exact spoken date phrase. The first three rows are tagged "
+        f"[DANES] (today), [JUTRI] (tomorrow), and [POJUTRIŠNJEM] (the day "
+        f"after tomorrow) directly — use these tags as-is to resolve those "
+        f"specific words, do NOT count rows or compute the offset yourself.\n\n"
         f"{table}\n\n"
         f"To resolve any relative date (jutri, v ponedeljek, čim prej, "
         f"naslednji teden), look up the matching entry in this table — do NOT "
@@ -188,6 +251,40 @@ Rules:
 - If you don't know something, say the owner will call back.
 - Only answer questions using the information given below, or by calling your
   booking tools — never invent data.
+- NEVER state a specific date, day, or time as available (or unavailable)
+  unless you have a get_slots or check_slots tool RESULT from THIS turn or
+  an earlier turn in THIS SAME conversation backing that exact claim. If the
+  caller asks about a date range you have not already queried — including
+  "proti koncu tedna", "naslednji teden", or any date outside what you've
+  already shown them — call get_slots again with the new range. get_slots
+  can be called as many times as needed in one call; there is no limit on
+  how many times you may query it. Never say you "don't have data" for a
+  date range instead of just calling get_slots for it.
+  - Bad: telling the caller "imamo proste termine v ponedeljek in torek"
+    without ever having called get_slots this conversation.
+  - Bad: caller asks "a bi se dalo kaj proti koncu tedna?" → "Nimam podatkov
+    za termine proti koncu tedna." (refusing instead of calling get_slots
+    again with a later date range)
+  - Good: caller asks about a new date range → call get_slots with that
+    range, THEN answer from its actual result.
+- If you tell the caller you are about to check something (e.g. "Preverim
+  razpoložljivost...", "Trenutek, prosim..."), you MUST immediately call the
+  corresponding tool (get_slots/check_slots/create_booking) in that same
+  turn — never say you're checking and then stop without calling the tool.
+  A spoken promise with no tool call leaves the caller waiting with no
+  response.
+- When summarizing a get_slots response, check every date key individually
+  — do not treat a date as unavailable unless its value is literally the
+  string "unavailable". Observed 2026-08-16: a get_slots response with 5
+  weekdays of full availability followed by 2 "unavailable" weekend days got
+  summarized as only the first 4 weekdays being open, silently dropping the
+  5th (a real, fully-available day) as if it were part of the closed
+  weekend block. Read the whole object before excluding any day.
+  - Bad: response has 2026-08-24 through 2026-08-28 all with real time
+    lists, and 2026-08-29/2026-08-30 as "unavailable" → saying "od
+    ponedeljka do četrtka" (Mon-Thu only), skipping Friday.
+  - Good: every date with a real (non-"unavailable") value is available,
+    including the last weekday right before the weekend block.
 - ALL numbers, prices, times, and durations must be written out as Slovenian words,
   never as digits — your output is read aloud by a TTS engine that mispronounces
   digit-formatted numbers and times.
@@ -198,10 +295,43 @@ Rules:
   - Not "V soboto smo odprto od 9.00 do 14.00" → "V soboto smo odprti od devetih do
     štirinajstih" (agreement: "odprti", not "odprto", since the subject is "we"/the salon)
   - Not "Dobra dan" → "Dober dan" (masculine noun "dan" takes "dober", not "dobra")
-  - Not "Odličko" → "Odlično"
   - Not "Termin je prosta" → "Termin je prost" (masculine noun "termin" takes
     "prost", not "prosta" — same agreement rule as "odprti" above)
   - Not "rezervacija je potrdjena" → "rezervacija je potrjena"
+- "Odličko" is NOT a Slovenian word and must never be used, under any
+  circumstance — the correct word is "Odlično" (great/excellent). This is a
+  recurring model mistake, not a one-off — treat it as a hard-banned word.
+  - Not "Odličko! Termin ob deseti uri je prost." → "Odlično! Termin ob
+    deseti uri je prost."
+- Always use formal address (vikanje: "vi"/"vam"/"ste"), never informal
+  "ti"/"tebi"/"si" — even if the caller speaks informally first. Do not
+  mirror the caller's register.
+  - Caller: "Živjo, kako si?" → Bad: "Živjo! Hvala, da vprašaš. Kako ti lahko
+    pomagam danes?" → Good: "Pozdravljeni! Kako vam lahko pomagam?"
+- Your output is spoken directly by a TTS engine — never use markdown
+  (no "**bold**", "*italic*", "-" bullet lists, headings, etc.). Write plain
+  natural spoken sentences only.
+  - Bad: "**Refleksna masaža stopal** – šestdeset minut za petnajst evrov"
+  - Good: "Refleksna masaža stopal traja šestdeset minut in stane petnajst
+    evrov."
+- "Samo trenutek" / "trenutek prosim" are the correct ways to ask the caller
+  to wait — never "prosimo, da mi trenutek", which is not valid Slovenian.
+  - Bad: "Sedaj bom preverila prosti termine. Prosimo, da mi trenutek."
+  - Good: "Sedaj bom preverila prosti termine. Trenutek prosim." (or "Samo
+    trenutek, prosim.")
+- Never enumerate more than 2-3 items aloud in one turn — for any list-like
+  answer (services, prices, available dates, etc.). If there are more than
+  2-3, summarize/group them and ask a clarifying question to narrow down,
+  then list the specific 2-3 that match.
+  - Caller: "Kaj ponujate?" → Bad: naming every single service with prices
+    in one breath. → Good: "Ponujamo več kozmetičnih storitev — na primer
+    pedikuro, nego obraza in masažo. Vas kaj od tega zanima, pa vam povem
+    več?"
+  - EXCEPTION — time slots specifically are NOT covered by this rule: do
+    not apply "just pick any 2-3" here. Follow the more specific time-slot
+    rule under "Booking rules" below instead (group by dopoldan/popoldan
+    and ask a preference first — never lead with 2-3 exact times, even
+    though 2-3 would technically satisfy this generic cap).
 
 Booking rules:
 - You have tools: get_slots, check_slots, create_booking. Use the real service
@@ -251,7 +381,16 @@ Booking rules:
   times once the caller narrows down a preference. Example: "V ponedeljek
   imamo veliko prostih terminov, tako dopoldan kot popoldan — kdaj bi vam bolj
   ustrezalo?" — then once they say e.g. "dopoldan", offer 2-3 specific times
-  from that range."""
+  from that range.
+  - THIS RULE TAKES PRECEDENCE over the generic "cap lists to 2-3 items"
+    rule above, specifically for time slots. Even if only 2-3 slots would
+    satisfy that generic cap, still group by time-of-day and ask the
+    caller's preference first — never lead with specific times.
+    - Bad: "V ponedeljek imamo proste termine ob osmih, devetih in deseti
+      uri. Kateri čas vam najbolj ustreza?" (jumps straight to 3 exact
+      times, skipping the time-of-day question)
+    - Good: "V ponedeljek imamo veliko prostih terminov, tako dopoldan kot
+      popoldan — kdaj bi vam bolj ustrezalo?" """
 
 
 def _build_system_prompt(company_data: dict) -> str:
@@ -273,6 +412,13 @@ def _build_tts(settings: Settings):
     return soniox.TTS(
         api_key=settings.soniox_api_key,
         voice=settings.tts_voice_id or "Maya",
+        # Explicit, not plugin defaults: the plugin defaults to model
+        # "tts-rt-v1-preview" and language "en" if unset, which is what the
+        # live pipeline was silently running on for Slovenian calls (found
+        # 2026-08-16 comparing against tools/tts_ab.py, which explicitly
+        # requests these two params and sounded noticeably better).
+        model="tts-rt-v1",
+        language="sl",
     )
 
 
@@ -429,6 +575,8 @@ async def entrypoint(ctx: JobContext) -> None:
     # _on_shutdown, or short calls get billed for dead time after hangup.
     call_ended_at: dict[str, datetime] = {}
 
+    last_assistant_text = {"value": ""}
+
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event) -> None:
         item = event.item
@@ -441,10 +589,95 @@ async def entrypoint(ctx: JobContext) -> None:
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
+            if item.role == "assistant":
+                last_assistant_text["value"] = item.text_content or ""
 
     @session.on("close")
     def _on_close(event) -> None:
         call_ended_at["value"] = datetime.now(timezone.utc)
+        generic_filler_task.cancel()
+
+    # Generic filler for ANY slow turn, not just the three booking tool calls
+    # (get_slots/check_slots/create_booking already have their own
+    # context.with_filler() in tools.py, tuned per call — this is a separate,
+    # session-wide safety net for plain conversational turns, which had no
+    # filler at all before this and left callers in dead air on a slow
+    # LLM/TTS turn, e.g. during an Anthropic degradation). Mirrors the SDK's
+    # own private _FillerScheduler (voice/filler_scheduler.py) — wait for the
+    # session to go idle, then wait up to GENERIC_FILLER_DELAY for the agent
+    # or caller to become active again; if neither happens, speak a short
+    # filler and repeat. Built on public session.on()/wait_for_idle()/say()
+    # rather than the private class so it doesn't depend on SDK internals.
+    _agent_active = asyncio.Event()
+
+    def _on_agent_state_changed(event) -> None:
+        if event.new_state in ("speaking", "thinking"):
+            _agent_active.set()
+
+    def _on_user_state_changed(event) -> None:
+        if event.new_state == "speaking":
+            _agent_active.set()
+
+    session.on("agent_state_changed", _on_agent_state_changed)
+    session.on("user_state_changed", _on_user_state_changed)
+
+    async def _generic_filler_loop() -> None:
+        step = 0
+        while True:
+            await session.wait_for_idle()
+            _agent_active.clear()
+            try:
+                await asyncio.wait_for(_agent_active.wait(), timeout=GENERIC_FILLER_DELAY)
+                continue  # agent/caller became active in time — no filler needed
+            except asyncio.TimeoutError:
+                pass
+            phrase = GENERIC_FILLER_PHRASES[step % len(GENERIC_FILLER_PHRASES)]
+            step += 1
+            session.say(phrase)
+
+    generic_filler_task = asyncio.create_task(
+        _generic_filler_loop(), name="generic_filler_loop"
+    )
+
+    # Latency investigation (2026-08-14 voice test): aggregate turn-latency
+    # numbers alone can't say whether time is going to STT endpointing, LLM
+    # TTFT, or TTS startup — logging only, no behavior change. Reuses the
+    # SDK's own built-in per-stage metrics (already computed internally)
+    # rather than hand-rolling separate timestamps, and speech_id/request_id
+    # let a later investigation correlate STT/LLM/TTS events for one turn.
+    @session.on("metrics_collected")
+    def _on_metrics_collected(event) -> None:
+        m = event.metrics
+        if isinstance(m, EOUMetrics):
+            logger.info(
+                "latency stt_eou: end_of_utterance_delay=%.3fs transcription_delay=%.3fs speech_id=%s",
+                m.end_of_utterance_delay,
+                m.transcription_delay,
+                m.speech_id,
+            )
+        elif isinstance(m, LLMMetrics):
+            logger.info(
+                "latency llm: ttft=%.3fs duration=%.3fs speech_id=%s request_id=%s",
+                m.ttft,
+                m.duration,
+                m.speech_id,
+                m.request_id,
+            )
+        elif isinstance(m, TTSMetrics):
+            logger.info(
+                "latency tts: ttfb=%.3fs duration=%.3fs speech_id=%s request_id=%s",
+                m.ttfb,
+                m.duration,
+                m.speech_id,
+                m.request_id,
+            )
+        elif isinstance(m, STTMetrics):
+            logger.info(
+                "latency stt: duration=%.3fs audio_duration=%.3fs request_id=%s",
+                m.duration,
+                m.audio_duration,
+                m.request_id,
+            )
 
     # Phase 5 Part C: the SDK retries a broken stt/tts/llm provider on its
     # own, but that retry loop either never gives up (observed with a broken
@@ -489,6 +722,52 @@ async def entrypoint(ctx: JobContext) -> None:
 
         provider_error_state["degrading"] = True
         asyncio.create_task(_degrade_and_close())
+
+    # Promise-follow-up watchdog: catches the case where the agent speaks a
+    # "checking..." utterance and then produces no tool call and no further
+    # speech at all — no exception, no recoverable=False event, nothing for
+    # _on_session_error above to catch. Armed only on the transition FROM
+    # "speaking" (i.e. once the promise utterance has finished playing), so
+    # the utterance's own "speaking" state doesn't immediately satisfy its
+    # own watchdog. Cancelled by any subsequent agent/user activity.
+    _activity_since_promise = asyncio.Event()
+
+    def _on_agent_state_changed_watchdog(event) -> None:
+        if event.new_state in ("thinking", "speaking"):
+            _activity_since_promise.set()
+        if event.old_state == "speaking" and event.new_state != "speaking":
+            text = last_assistant_text["value"]
+            if (
+                text
+                and text not in _KNOWN_FILLER_TEXTS
+                and PROMISE_CUE_PATTERN.search(text)
+            ):
+                _activity_since_promise.clear()
+                asyncio.create_task(_watch_for_promise_followup())
+
+    def _on_user_state_changed_watchdog(event) -> None:
+        if event.new_state == "speaking":
+            _activity_since_promise.set()
+
+    async def _watch_for_promise_followup() -> None:
+        try:
+            await asyncio.wait_for(
+                _activity_since_promise.wait(), timeout=PROMISE_WATCHDOG_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            if provider_error_state["degrading"]:
+                return
+            logger.error(
+                "promise watchdog fired: agent said %r and produced no "
+                "follow-up within %.0fs",
+                last_assistant_text["value"],
+                PROMISE_WATCHDOG_TIMEOUT_SEC,
+            )
+            provider_error_state["degrading"] = True
+            await _degrade_and_close()
+
+    session.on("agent_state_changed", _on_agent_state_changed_watchdog)
+    session.on("user_state_changed", _on_user_state_changed_watchdog)
 
     async def _on_shutdown() -> None:
         ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)
