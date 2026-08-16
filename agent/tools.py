@@ -52,13 +52,64 @@ succeeded.
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
-from agent.booking_client import BookingError, BookingTimeoutError
+from agent.booking_client import (
+    BookingError,
+    BookingMalformedResponseError,
+    BookingTimeoutError,
+)
 
 logger = logging.getLogger("receptionistplus-worker.tools")
+
+_TIMEZONE = ZoneInfo("Europe/Ljubljana")
+
+_MARKUP_PATTERN = re.compile(r"</?[A-Za-z][\w:.-]*(?:\s+[^<>]*)?/?>")
+
+
+def _sanitize_free_text(value: str) -> str:
+    """Strip markup-like fragments from freeform, optional tool-call args.
+
+    Observed 2026-08-14: `notes` came back from the LLM containing a stray
+    tag resembling internal tool-call markup (`</antml parameter>`) with no
+    actual caller-provided content. Root cause unconfirmed, but whatever
+    produces it has no business ending up in a booking record the owner
+    reads — strip it defensively rather than passing it through verbatim.
+    """
+    return _MARKUP_PATTERN.sub("", value).strip()
+
+
+def _filter_elapsed_times_today(slots_by_date: dict) -> None:
+    """Drop already-elapsed HH:MM times from today's entry, in place.
+
+    get_slots returns each open day's full schedule regardless of the
+    current time of day — without this, a caller asking about "today" late
+    in the day could be offered (and, in the worst case, actually book) a
+    time slot that has already passed. Only touches today's date key; other
+    days are untouched, and a day already marked closed (e.g. "unavailable")
+    is left as-is.
+    """
+    now = datetime.now(_TIMEZONE)
+    today_slots = slots_by_date.get(now.strftime("%Y-%m-%d"))
+    if not isinstance(today_slots, list):
+        return
+    current_hhmm = now.strftime("%H:%M")
+    slots_by_date[now.strftime("%Y-%m-%d")] = [
+        t for t in today_slots if t >= current_hhmm
+    ]
+
+
+# Named (not inline) so worker.py's promise-follow-up watchdog can recognize
+# and exclude these specific utterances — they're paired with an actual
+# in-flight tool call that already has its own real timeout, so the
+# watchdog's shorter window must not treat them as an unfulfilled promise.
+GET_SLOTS_FILLER_TEXT = "Samo trenutek, preverjam proste termine..."
+CREATE_BOOKING_FILLER_TEXT = "Samo trenutek, urejam rezervacijo..."
 
 
 class BookingTools:
@@ -114,18 +165,24 @@ class BookingTools:
             service_ids, employee_id, any_person
         )
         try:
-            return await booking_client.get_slots(
-                company_slug=self._company_slug,
-                service_ids=service_ids,
-                start_date=start_date,
-                end_date=end_date,
-                employee_id=employee_id,
-                any_person=any_person,
-                eligible_employee_ids=eligible,
-            )
+            async with context.with_filler(
+                GET_SLOTS_FILLER_TEXT, delay=2.5
+            ):
+                result = await booking_client.get_slots(
+                    company_slug=self._company_slug,
+                    service_ids=service_ids,
+                    start_date=start_date,
+                    end_date=end_date,
+                    employee_id=employee_id,
+                    any_person=any_person,
+                    eligible_employee_ids=eligible,
+                )
         except BookingError as exc:
             logger.error("get_slots failed: %s", exc)
             return {"success": False, "error": "technical_error", "message": str(exc)}
+        if isinstance(result.get("slots"), dict):
+            _filter_elapsed_times_today(result["slots"])
+        return result
 
     @function_tool
     async def check_slots(
@@ -159,15 +216,18 @@ class BookingTools:
             service_ids, employee_id, any_person
         )
         try:
-            result = await booking_client.check_slots(
-                company_slug=self._company_slug,
-                service_ids=service_ids,
-                date=date,
-                time=time,
-                employee_id=employee_id,
-                any_person=any_person,
-                eligible_employee_ids=eligible,
-            )
+            async with context.with_filler(
+                GET_SLOTS_FILLER_TEXT, delay=2.5
+            ):
+                result = await booking_client.check_slots(
+                    company_slug=self._company_slug,
+                    service_ids=service_ids,
+                    date=date,
+                    time=time,
+                    employee_id=employee_id,
+                    any_person=any_person,
+                    eligible_employee_ids=eligible,
+                )
         except BookingError as exc:
             logger.error("check_slots failed: %s", exc)
             self._last_check_key = None
@@ -238,6 +298,9 @@ class BookingTools:
                 ),
             }
 
+        last_name = _sanitize_free_text(last_name)
+        notes = _sanitize_free_text(notes)
+
         employee_id, eligible = self._resolve_person(
             service_ids, employee_id, any_person
         )
@@ -263,7 +326,7 @@ class BookingTools:
         self._last_check_key = None  # single use — force a fresh check per booking
         try:
             async with context.with_filler(
-                "Samo trenutek, urejam rezervacijo...", delay=4.5
+                CREATE_BOOKING_FILLER_TEXT, delay=4.5
             ):
                 result = await booking_client.create_booking(
                     company_slug=self._company_slug,
@@ -296,6 +359,30 @@ class BookingTools:
                     "anything needs correcting — do not call create_booking "
                     "again for this slot. Only call create_booking again if "
                     "check_slots shows the slot is still free."
+                ),
+            }
+        except BookingMalformedResponseError as exc:
+            logger.error(
+                "create_booking got an empty/unparseable response (ambiguous "
+                "outcome): %s",
+                exc,
+            )
+            return {
+                "success": False,
+                "error": "ambiguous_malformed_response",
+                "message": (
+                    "The booking call returned an empty/invalid response, but "
+                    "the appointment may already have been created "
+                    "server-side — this is NOT a plain failure. Tell the "
+                    "caller something like 'Rezervacijo sem morda že "
+                    "naredila, preverjam, prosim počakajte' (do not say a "
+                    "plain error occurred). Then call check_slots for this "
+                    "exact slot. If it now shows the slot as taken, tell the "
+                    "caller their booking is very likely confirmed and the "
+                    "owner will follow up if anything needs correcting — do "
+                    "not call create_booking again for this slot. Only call "
+                    "create_booking again if check_slots shows the slot is "
+                    "still free."
                 ),
             }
         except BookingError as exc:

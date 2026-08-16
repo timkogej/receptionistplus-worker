@@ -48,6 +48,22 @@ class BookingTimeoutError(BookingError):
     """
 
 
+class BookingMalformedResponseError(BookingError):
+    """Raised when the webhook returns a 2xx with an empty/unparseable body.
+
+    Same "unknown outcome" reasoning as BookingTimeoutError, but for a
+    different failure point: this happens when n8n's workflow errors out
+    *after* the core action (e.g. the Termini insert) already committed but
+    *before* the "Respond to Webhook" node runs — for "create" specifically,
+    a downstream node like the confirmation email can fail and the workflow
+    never sends back the real success JSON, even though the booking itself
+    went through. Observed 2026-08-14: a successful booking was reported to
+    the caller as a technical failure because of exactly this. Callers of
+    create_booking must not treat this the same as a clean connection
+    failure or a definite failure.
+    """
+
+
 def _sign(raw_body: bytes, *, secret: str, timestamp: str) -> str:
     """HMAC-SHA256 over "<timestamp>." + raw_body, matching the n8n Code node."""
     message = f"{timestamp}.".encode() + raw_body
@@ -90,6 +106,10 @@ async def call_booking(payload: dict, *, timeout: float = 15) -> dict:
         return await asyncio.to_thread(_post, payload, timeout=timeout)
     except requests.Timeout as exc:
         raise BookingTimeoutError(f"booking webhook call timed out: {exc}") from exc
+    except requests.exceptions.JSONDecodeError as exc:
+        raise BookingMalformedResponseError(
+            f"booking webhook returned an empty/unparseable body: {exc}"
+        ) from exc
     except requests.RequestException as exc:
         raise BookingError(f"booking webhook call failed: {exc}") from exc
 
