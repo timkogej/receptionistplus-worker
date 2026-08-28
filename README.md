@@ -104,7 +104,6 @@ All settings are read from the environment (see `.env.example`):
 | `ELEVENLABS_API_KEY` | if `TTS_PROVIDER=elevenlabs` | ElevenLabs API key |
 | `TTS_PROVIDER` | no (default `soniox`) | `soniox` or `elevenlabs` |
 | `TTS_VOICE_ID` | no | Provider-specific voice id/name; falls back to provider default |
-| `GREETING_TEXT` | no | Text spoken to callers on join |
 
 ## Comparing TTS providers (`tools/tts_ab.py`)
 

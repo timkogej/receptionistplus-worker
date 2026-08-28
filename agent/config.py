@@ -30,7 +30,6 @@ class Settings:
 
     tts_provider: str
     tts_voice_id: str | None
-    greeting_text: str
 
     company_slug: str
 
@@ -63,10 +62,6 @@ class Settings:
             openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
             tts_provider=tts_provider,
             tts_voice_id=os.environ.get("TTS_VOICE_ID") or None,
-            greeting_text=os.environ.get(
-                "GREETING_TEXT",
-                "Thank you for calling. Please hold while we connect you.",
-            ),
             company_slug=_require("COMPANY_SLUG"),
             supabase_url=_require("SUPABASE_URL"),
             supabase_service_role_key=_require("SUPABASE_SERVICE_ROLE_KEY"),

@@ -69,7 +69,7 @@ class SupabaseClient:
                 self._api_key,
                 params={
                     "company_slug": f"eq.{company_slug}",
-                    "select": "company_slug,enabled,low_balance_threshold",
+                    "select": "company_slug,enabled,low_balance_threshold,language",
                 },
             )
             rows = resp.json()

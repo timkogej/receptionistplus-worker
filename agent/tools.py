@@ -108,14 +108,21 @@ def _filter_elapsed_times_today(slots_by_date: dict) -> None:
 # and exclude these specific utterances — they're paired with an actual
 # in-flight tool call that already has its own real timeout, so the
 # watchdog's shorter window must not treat them as an unfulfilled promise.
-GET_SLOTS_FILLER_TEXT = "Samo trenutek, preverjam proste termine..."
-CREATE_BOOKING_FILLER_TEXT = "Samo trenutek, urejam rezervacijo..."
+GET_SLOTS_FILLER_TEXT = {
+    "sl": "Samo trenutek, preverjam proste termine...",
+    "en": "One moment, checking available times...",
+}
+CREATE_BOOKING_FILLER_TEXT = {
+    "sl": "Samo trenutek, urejam rezervacijo...",
+    "en": "One moment, processing your booking...",
+}
 
 
 class BookingTools:
-    def __init__(self, company_slug: str, company_data: dict) -> None:
+    def __init__(self, company_slug: str, company_data: dict, language: str = "sl") -> None:
         self._company_slug = company_slug
         self._company_data = company_data
+        self._language = language
         self._last_check_key: tuple | None = None
         # Set on the first successful create_booking this session, for
         # receptionist_calls.created_termin_id / outcome (Phase 3 call logging).
@@ -166,7 +173,7 @@ class BookingTools:
         )
         try:
             async with context.with_filler(
-                GET_SLOTS_FILLER_TEXT, delay=2.5
+                GET_SLOTS_FILLER_TEXT[self._language], delay=2.5
             ):
                 result = await booking_client.get_slots(
                     company_slug=self._company_slug,
@@ -217,7 +224,7 @@ class BookingTools:
         )
         try:
             async with context.with_filler(
-                GET_SLOTS_FILLER_TEXT, delay=2.5
+                GET_SLOTS_FILLER_TEXT[self._language], delay=2.5
             ):
                 result = await booking_client.check_slots(
                     company_slug=self._company_slug,
@@ -326,7 +333,7 @@ class BookingTools:
         self._last_check_key = None  # single use — force a fresh check per booking
         try:
             async with context.with_filler(
-                CREATE_BOOKING_FILLER_TEXT, delay=4.5
+                CREATE_BOOKING_FILLER_TEXT[self._language], delay=4.5
             ):
                 result = await booking_client.create_booking(
                     company_slug=self._company_slug,

@@ -38,28 +38,59 @@ from agent.tools import (
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
 
-NO_CREDITS_MESSAGE = (
-    "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje."
-)
+SUPPORTED_LANGUAGES = ("sl", "en")
+DEFAULT_LANGUAGE = "sl"
 
-TECHNICAL_DIFFICULTY_MESSAGE = (
-    "Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj."
-)
+NO_CREDITS_MESSAGE = {
+    "sl": "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje.",
+    "en": "We're unable to take your call right now. Please try again later.",
+}
+
+TECHNICAL_DIFFICULTY_MESSAGE = {
+    "sl": "Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj.",
+    "en": (
+        "Sorry, we're experiencing technical difficulties right now — the "
+        "owner will call you back."
+    ),
+}
 
 # EU AI Act Article 50: callers must be told they're talking to an AI system,
 # no later than the first interaction. Prepended in code rather than baked
-# into GREETING_TEXT so it can't be dropped by a misconfigured or edited
-# per-company greeting — this is the one guaranteed source of disclosure,
-# not the only one.
-AI_DISCLOSURE_SL = (
-    "Prosimo, upoštevajte, da govorite z digitalnim glasovnim asistentom, ne "
-    "z osebo. "
-)
+# into the greeting itself so it can't be dropped by a misconfigured or
+# edited per-company greeting — this is the one guaranteed source of
+# disclosure, not the only one.
+AI_DISCLOSURE = {
+    "sl": (
+        "Prosimo, upoštevajte, da govorite z digitalnim glasovnim asistentom, "
+        "ne z osebo. "
+    ),
+    "en": (
+        "Please note that you are speaking with a digital voice assistant, "
+        "not a person. "
+    ),
+}
+
+# Built from company_data.company.naziv (fetched live via booking-v2 init)
+# rather than a hand-maintained env var — a per-company GREETING_TEXT env var
+# went stale for real (found 2026-08-28: production was still greeting
+# callers with "Salon Lepote", a Phase 1 fake test company name, months
+# after switching to real jedroplus-d-o-o data) because nothing forces it to
+# stay in sync with the actual company name. This can't go stale the same
+# way, at the cost of no longer supporting custom greeting wording beyond
+# "Welcome to <company name>" — a deliberate tradeoff, not an oversight.
+GREETING_TEMPLATE = {
+    "sl": "Pozdravljeni, dobrodošli v {name}. Kako vam lahko pomagam?",
+    "en": "Hello, welcome to {name}. How can I help you?",
+}
 
 # Pre-rendered once via a working Soniox TTS call (see assets/README or the
 # generation snippet in the Phase 5 Part C notes) so this specific message can
 # still be played when the configured TTS provider is the thing that's down —
 # session.say(..., audio=...) bypasses TTS synthesis entirely for it.
+# Slovenian-only for now: English calls fall back to a text-only session.say()
+# with no pre-rendered audio (see _say_technical_difficulty) — a deliberate
+# scope decision, not an oversight, since this path only matters when the
+# live TTS provider itself is down.
 TECHNICAL_DIFFICULTY_AUDIO_PATH = (
     Path(__file__).resolve().parent.parent / "assets" / "technical_difficulty_sl.wav"
 )
@@ -75,11 +106,18 @@ ABANDONED_CALL_THRESHOLD_SEC = 10
 # path — the most consequential moment (a real booking in progress)  keeps
 # its specific message; this generic one is a catch-all for everything else,
 # including plain conversational turns which previously had no filler.
-GENERIC_FILLER_PHRASES = [
-    "Samo trenutek...",
-    "En moment...",
-    "Samo sekundo...",
-]
+GENERIC_FILLER_PHRASES = {
+    "sl": [
+        "Samo trenutek...",
+        "En moment...",
+        "Samo sekundo...",
+    ],
+    "en": [
+        "One moment...",
+        "Just a second...",
+        "Give me a moment...",
+    ],
+}
 GENERIC_FILLER_DELAY = 5.0
 
 # Promise-follow-up watchdog (2026-08-16 fix): a fallback-model turn that
@@ -90,19 +128,35 @@ GENERIC_FILLER_DELAY = 5.0
 # caller gave up. If no new agent/user activity follows such an utterance
 # within this window, treat it as a technical failure (see
 # _watch_for_promise_followup in entrypoint).
-PROMISE_CUE_PATTERN = re.compile(
-    r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
-    r"|poskušam\b|počakajte",
-    re.IGNORECASE,
-)
+# Deliberately narrow to present-tense/promise phrasing, same as the
+# Slovenian pattern (e.g. "rezerviram" = "I book", not "rezervirala" = past
+# tense "booked") — must NOT match a past-tense confirmation sentence like
+# "I've booked you in for a pedicure...", or the watchdog would arm itself
+# right after a successful, complete turn and fire a false technical-
+# failure close once the call goes quiet afterward.
+PROMISE_CUE_PATTERNS = {
+    "sl": re.compile(
+        r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
+        r"|poskušam\b|počakajte",
+        re.IGNORECASE,
+    ),
+    "en": re.compile(
+        r"\b(?:one|just a|give me a) moment\b|\bhold on\b|\bplease wait\b"
+        r"|\blet me check\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
+        r"|\bi'?m (?:checking|processing|trying)\b|\bprocessing\b|\btrying\b",
+        re.IGNORECASE,
+    ),
+}
 PROMISE_WATCHDOG_TIMEOUT_SEC = 12.0
 
-# Our own filler utterances also match PROMISE_CUE_PATTERN by design, but
+# Our own filler utterances also match PROMISE_CUE_PATTERNS by design, but
 # they're paired with an actual in-flight tool call that already has its own
 # real timeout (up to 45s for create_booking) — excluded so the watchdog's
 # much shorter window doesn't kill a call that's legitimately still running.
 _KNOWN_FILLER_TEXTS = frozenset(
-    GENERIC_FILLER_PHRASES + [GET_SLOTS_FILLER_TEXT, CREATE_BOOKING_FILLER_TEXT]
+    [p for phrases in GENERIC_FILLER_PHRASES.values() for p in phrases]
+    + list(GET_SLOTS_FILLER_TEXT.values())
+    + list(CREATE_BOOKING_FILLER_TEXT.values())
 )
 
 TIMEZONE = ZoneInfo("Europe/Ljubljana")
@@ -193,9 +247,44 @@ def slovenian_ordinal_genitive(day: int) -> str:
 
 
 _RELATIVE_DAY_LABELS = {0: "DANES", 1: "JUTRI", 2: "POJUTRIŠNJEM"}
+_RELATIVE_DAY_LABELS_EN = {0: "TODAY", 1: "TOMORROW", 2: "DAY AFTER TOMORROW"}
+
+ENGLISH_WEEKDAYS = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+
+# Hardcoded rather than strftime("%B"): %B is locale-dependent and the
+# deployment locale isn't guaranteed to be English (same reasoning as the
+# Slovenian month/weekday dicts above, which exist for the same reason).
+ENGLISH_MONTHS = {
+    1: "January",
+    2: "February",
+    3: "March",
+    4: "April",
+    5: "May",
+    6: "June",
+    7: "July",
+    8: "August",
+    9: "September",
+    10: "October",
+    11: "November",
+    12: "December",
+}
 
 
-def _build_date_context() -> str:
+def _english_ordinal_suffix(day: int) -> str:
+    if 11 <= day % 100 <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+
+def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
     """Build the date-lookup table given to the LLM each turn.
 
     Bug fixed 2026-08-14: the table used to only give each row's absolute
@@ -206,22 +295,55 @@ def _build_date_context() -> str:
     actually a closed Saturday, this made the mislabeled date look like a
     plausible near-term suggestion instead. Fix: stamp DANES/JUTRI/
     POJUTRIŠNJEM directly onto the first three rows so there's no offset
-    arithmetic left for the model to get wrong.
+    arithmetic left for the model to get wrong. Same fix applies to the
+    English TODAY/TOMORROW/DAY AFTER TOMORROW tags below.
     """
     now = datetime.now(TIMEZONE)
     time_str = now.strftime("%H:%M")
+
+    if language == "en":
+        weekday_names = ENGLISH_WEEKDAYS
+        relative_labels = _RELATIVE_DAY_LABELS_EN
+
+        def phrase_for(d: datetime) -> str:
+            return f"{ENGLISH_MONTHS[d.month]} {d.day}{_english_ordinal_suffix(d.day)}"
+    else:
+        weekday_names = SLOVENIAN_WEEKDAYS
+        relative_labels = _RELATIVE_DAY_LABELS
+
+        def phrase_for(d: datetime) -> str:
+            return f"{slovenian_ordinal_genitive(d.day)} {SLOVENIAN_MONTHS_GENITIVE[d.month]}"
 
     rows = []
     for offset in range(14):
         d = now + timedelta(days=offset)
         iso_date = d.strftime("%Y-%m-%d")
-        weekday = SLOVENIAN_WEEKDAYS[d.weekday()]
-        phrase = f"{slovenian_ordinal_genitive(d.day)} {SLOVENIAN_MONTHS_GENITIVE[d.month]}"
-        label = _RELATIVE_DAY_LABELS.get(offset)
+        weekday = weekday_names[d.weekday()]
+        phrase = phrase_for(d)
+        label = relative_labels.get(offset)
         label_str = f" [{label}]" if label else ""
         rows.append(f"- {iso_date} ({weekday}){label_str}: {phrase}")
 
     table = "\n".join(rows)
+
+    if language == "en":
+        return (
+            f"Current time is {time_str}, timezone Europe/Ljubljana. Below is "
+            f"a pre-computed table of the next 14 days: ISO date, weekday, and "
+            f"the exact spoken date phrase. The first three rows are tagged "
+            f"[TODAY], [TOMORROW], and [DAY AFTER TOMORROW] directly — use "
+            f"these tags as-is to resolve those specific words, do NOT count "
+            f"rows or compute the offset yourself.\n\n"
+            f"{table}\n\n"
+            f"To resolve any relative date (tomorrow, on Monday, as soon as "
+            f"possible, next week), look up the matching entry in this table "
+            f"— do NOT calculate the date or weekday yourself. When speaking "
+            f"a date aloud, use the exact phrase from the table verbatim "
+            f"(e.g. \"August 3rd\") — do NOT construct the ordinal yourself, "
+            f"since generating it live is error-prone. If a caller's "
+            f"requested date falls outside this table, tell them you'll have "
+            f"someone call back to confirm rather than guessing."
+        )
 
     return (
         f"Current time is {time_str}, timezone Europe/Ljubljana. Below is a "
@@ -242,7 +364,7 @@ def _build_date_context() -> str:
     )
 
 
-STATIC_PROMPT = """You are a warm, competent Slovenian phone receptionist for a service business.
+STATIC_PROMPT_SL = """You are a warm, competent Slovenian phone receptionist for a service business.
 
 Rules:
 - Always speak Slovenian, with correct declension and gender agreement.
@@ -393,17 +515,161 @@ Booking rules:
       popoldan — kdaj bi vam bolj ustrezalo?" """
 
 
-def _build_system_prompt(company_data: dict) -> str:
+# English adaptation of STATIC_PROMPT_SL: same universal rules (anti-
+# fabrication, promise-before-tool-call, per-date-key reading, list-cap,
+# no-markdown, booking flow), with the Slovenian-specific rules (vikanje,
+# Slovenian digit-to-word phrasing, the "Odličko" ban, "trenutek prosim"
+# wording) dropped or replaced with English equivalents. Kept as a separate
+# string rather than a shared-base composition to avoid fragile string
+# surgery — if the two drift, compare them side by side rather than trying
+# to re-merge.
+STATIC_PROMPT_EN = """You are a warm, competent English-speaking phone receptionist for a service business.
+
+Rules:
+- You must respond only in English, even if the caller speaks another
+  language or if the underlying company data below (service names, employee
+  names, notes) is in Slovenian. Read Slovenian service/employee names as-is
+  (do not translate or invent an English name for them), but every word you
+  generate yourself — sentences, explanations, confirmations — must be in
+  English.
+- Always speak clear, natural English.
+- Keep answers concise — this is a phone call, not a chat window.
+- Never invent prices, hours, or services that are not given to you below.
+- If you don't know something, say the owner will call back.
+- Only answer questions using the information given below, or by calling your
+  booking tools — never invent data.
+- NEVER state a specific date, day, or time as available (or unavailable)
+  unless you have a get_slots or check_slots tool RESULT from THIS turn or
+  an earlier turn in THIS SAME conversation backing that exact claim. If the
+  caller asks about a date range you have not already queried — including
+  "toward the end of the week", "next week", or any date outside what
+  you've already shown them — call get_slots again with the new range.
+  get_slots can be called as many times as needed in one call; there is no
+  limit on how many times you may query it. Never say you "don't have data"
+  for a date range instead of just calling get_slots for it.
+  - Bad: telling the caller "we have openings Monday and Tuesday" without
+    ever having called get_slots this conversation.
+  - Bad: caller asks "anything available toward the weekend?" → "I don't
+    have data on that." (refusing instead of calling get_slots again with a
+    later date range)
+  - Good: caller asks about a new date range → call get_slots with that
+    range, THEN answer from its actual result.
+- If you tell the caller you are about to check something (e.g. "Let me
+  check availability...", "One moment, please..."), you MUST immediately
+  call the corresponding tool (get_slots/check_slots/create_booking) in
+  that same turn — never say you're checking and then stop without calling
+  the tool. A spoken promise with no tool call leaves the caller waiting
+  with no response.
+- When summarizing a get_slots response, check every date key individually
+  — do not treat a date as unavailable unless its value is literally the
+  string "unavailable". Read the whole object before excluding any day.
+  - Bad: response has five weekdays with real time lists and two
+    "unavailable" weekend days → saying "Monday through Thursday", silently
+    dropping the fifth, fully-available weekday.
+  - Good: every date with a real (non-"unavailable") value is available,
+    including the last weekday right before the weekend block.
+- ALL numbers, prices, times, and durations should be spoken naturally, not
+  as raw digit strings — your output is read aloud by a TTS engine.
+  - Not "45 EUR" → "forty-five euros"
+  - Not "9.00 to 14.00" → "nine to two" or "nine a.m. to two p.m."
+  - Not "90 minutes" → you may say "ninety minutes" or "an hour and a half"
+- Your output is spoken directly by a TTS engine — never use markdown
+  (no "**bold**", "*italic*", "-" bullet lists, headings, etc.). Write plain
+  natural spoken sentences only.
+  - Bad: "**Foot reflexology massage** – sixty minutes for fifteen euros"
+  - Good: "The foot reflexology massage takes sixty minutes and costs
+    fifteen euros."
+- Never enumerate more than 2-3 items aloud in one turn — for any list-like
+  answer (services, prices, available dates, etc.). If there are more than
+  2-3, summarize/group them and ask a clarifying question to narrow down,
+  then list the specific 2-3 that match.
+  - Caller: "What do you offer?" → Bad: naming every single service with
+    prices in one breath. → Good: "We offer a range of services — for
+    example pedicures, facials, and massages. Is there something specific
+    you're interested in, and I can tell you more?"
+  - EXCEPTION — time slots specifically are NOT covered by this rule: do
+    not apply "just pick any 2-3" here. Follow the more specific time-slot
+    rule under "Booking rules" below instead (group by morning/afternoon
+    and ask a preference first — never lead with 2-3 exact times, even
+    though 2-3 would technically satisfy this generic cap).
+
+Booking rules:
+- You have tools: get_slots, check_slots, create_booking. Use the real
+  service and employee IDs from the company data below — never invent one.
+- Employee selection: if the caller names a specific employee at any point
+  (e.g. "with Luka", "with Maja Hribar", "is Rok Zupan free"), you MUST
+  match that name to their employeeId from the employee list below and pass
+  employee_id with any_person=false — never pass any_person=true when a
+  name was given, even if you're not 100% sure of the spelling (match by
+  best resemblance to the names you were given — STT transcripts can
+  mangle names). Only use any_person=true when the caller explicitly
+  doesn't care who helps them — phrases like "anyone", "whoever's free",
+  "doesn't matter", "no preference" — or never mentions an employee at all.
+  If a named employee doesn't clearly match anyone on the list, ask the
+  caller to repeat or confirm the name rather than silently falling back to
+  any_person=true.
+- To book an appointment: find a free slot with get_slots, confirm the
+  exact slot is still free with check_slots, then call create_booking.
+  Always call check_slots again immediately before create_booking, even if
+  you already checked or showed that slot earlier in the call —
+  availability can change.
+- Before calling create_booking you need the caller's first name, email,
+  and phone number — ask for these if you don't have them yet. After the
+  caller gives you a phone number, read it back to them digit by digit and
+  ask them to confirm or correct it before calling create_booking — speech
+  recognition can mishear digits, and a wrong number on a real booking
+  means the business can't reach the customer.
+- If create_booking's response has requiresPayment=true, the booking is
+  held but not yet confirmed: tell the caller their reservation is pending
+  and they'll receive a payment link shortly. Never ask the caller for card
+  details yourself.
+- If create_booking fails because you skipped check_slots, or because the
+  slot was taken, call check_slots (or get_slots) again and try a
+  different time — don't just repeat the same create_booking call. If it
+  fails with a technical error, tell the caller plainly that something
+  went wrong and you're checking again before trying once more — never
+  silently retry more than once.
+- Never say the internal booking ID (e.g. "OB-000037") out loud — it has no
+  value to the caller and is for internal records only.
+- After a successful create_booking, confirm the booking in ONE natural,
+  flowing spoken sentence — never as a labeled list of fields, and never
+  including the booking ID. Example: "I've booked you in for a pedicure
+  with Luka Dobrovoljec on Monday, August third, at eleven o'clock. Please
+  arrive a few minutes early."
+- When get_slots returns many available times, do not read every single
+  one aloud. Summarize by time of day instead, and only read out 2-3
+  concrete times once the caller narrows down a preference. Example: "On
+  Monday we have plenty of openings, both morning and afternoon — what
+  would work better for you?" — then once they say e.g. "morning", offer
+  2-3 specific times from that range.
+  - THIS RULE TAKES PRECEDENCE over the generic "cap lists to 2-3 items"
+    rule above, specifically for time slots. Even if only 2-3 slots would
+    satisfy that generic cap, still group by time-of-day and ask the
+    caller's preference first — never lead with specific times.
+    - Bad: "On Monday we have openings at eight, nine, and ten o'clock.
+      Which time works best for you?" (jumps straight to 3 exact times,
+      skipping the time-of-day question)
+    - Good: "On Monday we have plenty of openings, both morning and
+      afternoon — what would work better for you?" """
+
+
+def _build_system_prompt(company_data: dict, language: str = DEFAULT_LANGUAGE) -> str:
+    static_prompt = STATIC_PROMPT_EN if language == "en" else STATIC_PROMPT_SL
+    logger.info(
+        "language pack loaded: language=%s static_prompt=%s",
+        language,
+        "STATIC_PROMPT_EN" if language == "en" else "STATIC_PROMPT_SL",
+    )
     return (
-        STATIC_PROMPT
+        static_prompt
         + "\n\n"
-        + _build_date_context()
+        + _build_date_context(language)
         + "\n\n"
-        + render_company_prompt(company_data)
+        + render_company_prompt(company_data, language)
     )
 
 
-def _build_tts(settings: Settings):
+def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
     if settings.tts_provider == "elevenlabs":
         return elevenlabs.TTS(
             api_key=settings.elevenlabs_api_key,
@@ -418,14 +684,14 @@ def _build_tts(settings: Settings):
         # 2026-08-16 comparing against tools/tts_ab.py, which explicitly
         # requests these two params and sounded noticeably better).
         model="tts-rt-v1",
-        language="sl",
+        language=language,
     )
 
 
-def _build_stt(settings: Settings) -> soniox.STT:
+def _build_stt(settings: Settings, language: str = DEFAULT_LANGUAGE) -> soniox.STT:
     return soniox.STT(
         api_key=settings.soniox_api_key,
-        params=soniox.STTOptions(language_hints=["sl"]),
+        params=soniox.STTOptions(language_hints=[language]),
     )
 
 
@@ -481,6 +747,50 @@ async def entrypoint(ctx: JobContext) -> None:
     started_at = datetime.now(timezone.utc)
     livekit_room = ctx.room.name
 
+    # Fetched up front (not just at call-end, where get_settings was already
+    # called for low_balance_threshold) because language drives TTS/STT
+    # provider config and prompt selection, both needed before the session
+    # even starts.
+    try:
+        settings_row = await supabase.get_settings(settings.company_slug)
+    except Exception:
+        logger.exception(
+            "failed to fetch receptionist_settings for company_slug=%s, "
+            "defaulting language to %s",
+            settings.company_slug,
+            DEFAULT_LANGUAGE,
+        )
+        settings_row = None
+    language = (settings_row or {}).get("language") or DEFAULT_LANGUAGE
+    if language not in SUPPORTED_LANGUAGES:
+        logger.warning(
+            "unsupported language %r for company_slug=%s, defaulting to %s",
+            language,
+            settings.company_slug,
+            DEFAULT_LANGUAGE,
+        )
+        language = DEFAULT_LANGUAGE
+
+    async def _say_technical_difficulty(target_session: AgentSession) -> None:
+        """Play the pre-rendered apology clip for Slovenian (bypasses TTS
+        synthesis entirely, so it still works if the TTS provider itself is
+        the thing that's down); English has no equivalent asset yet (a
+        deliberate scope decision), so it falls back to plain session.say()
+        text, which won't survive a TTS-provider outage but is otherwise
+        fine.
+        """
+        message = TECHNICAL_DIFFICULTY_MESSAGE[language]
+        try:
+            if language == "sl":
+                audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
+                await asyncio.wait_for(
+                    target_session.say(message, audio=audio), timeout=8.0
+                )
+            else:
+                await asyncio.wait_for(target_session.say(message), timeout=8.0)
+        except Exception:
+            logger.exception("failed to play technical-difficulty message")
+
     balance = await supabase.get_balance(settings.company_slug)
     if balance <= 0:
         logger.warning(
@@ -488,7 +798,7 @@ async def entrypoint(ctx: JobContext) -> None:
             settings.company_slug,
             balance,
         )
-        gate_session = AgentSession(tts=_build_tts(settings))
+        gate_session = AgentSession(tts=_build_tts(settings, language))
         await gate_session.start(
             room=ctx.room,
             agent=Agent(
@@ -498,7 +808,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             ),
         )
-        await gate_session.say(NO_CREDITS_MESSAGE)
+        await gate_session.say(NO_CREDITS_MESSAGE[language])
         await gate_session.aclose()
         await supabase.insert_call(
             {
@@ -522,7 +832,7 @@ async def entrypoint(ctx: JobContext) -> None:
             "booking-v2 init failed for company_slug=%s, degrading gracefully",
             settings.company_slug,
         )
-        gate_session = AgentSession(tts=_build_tts(settings))
+        gate_session = AgentSession(tts=_build_tts(settings, language))
         await gate_session.start(
             room=ctx.room,
             agent=Agent(
@@ -532,13 +842,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
             ),
         )
-        try:
-            audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
-            await asyncio.wait_for(
-                gate_session.say(TECHNICAL_DIFFICULTY_MESSAGE, audio=audio), timeout=8.0
-            )
-        except Exception:
-            logger.exception("failed to play technical-difficulty message (init failure path)")
+        await _say_technical_difficulty(gate_session)
         await gate_session.aclose()
         await supabase.insert_call(
             {
@@ -555,12 +859,12 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         return
 
-    booking_tools = BookingTools(settings.company_slug, company_data)
+    booking_tools = BookingTools(settings.company_slug, company_data, language=language)
 
     session = AgentSession(
-        stt=_build_stt(settings),
+        stt=_build_stt(settings, language),
         llm=_build_llm(settings),
-        tts=_build_tts(settings),
+        tts=_build_tts(settings, language),
         turn_handling={
             "turn_detection": "stt",
             "interruption": InterruptionOptions(enabled=True),
@@ -622,6 +926,7 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("user_state_changed", _on_user_state_changed)
 
     async def _generic_filler_loop() -> None:
+        phrases = GENERIC_FILLER_PHRASES[language]
         step = 0
         while True:
             await session.wait_for_idle()
@@ -631,7 +936,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 continue  # agent/caller became active in time — no filler needed
             except asyncio.TimeoutError:
                 pass
-            phrase = GENERIC_FILLER_PHRASES[step % len(GENERIC_FILLER_PHRASES)]
+            phrase = phrases[step % len(phrases)]
             step += 1
             session.say(phrase)
 
@@ -694,17 +999,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async def _degrade_and_close() -> None:
         logger.error("ending call early: unrecoverable stt/tts/llm provider error")
         try:
-            # Play a pre-recorded clip rather than calling session.say() with
-            # plain text: the configured TTS provider may itself be the thing
-            # that's broken (as it was during Phase 5 Part C testing, where
-            # STT and TTS shared one invalid key), in which case synthesizing
-            # the apology live would fail silently right along with it.
-            audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
-            await asyncio.wait_for(
-                session.say(TECHNICAL_DIFFICULTY_MESSAGE, audio=audio), timeout=8.0
-            )
-        except Exception:
-            logger.exception("failed to play technical-difficulty message before closing")
+            await _say_technical_difficulty(session)
         finally:
             await session.aclose()
 
@@ -740,7 +1035,7 @@ async def entrypoint(ctx: JobContext) -> None:
             if (
                 text
                 and text not in _KNOWN_FILLER_TEXTS
-                and PROMISE_CUE_PATTERN.search(text)
+                and PROMISE_CUE_PATTERNS[language].search(text)
             ):
                 _activity_since_promise.clear()
                 asyncio.create_task(_watch_for_promise_followup())
@@ -837,7 +1132,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         room=ctx.room,
         agent=Agent(
-            instructions=_build_system_prompt(company_data),
+            instructions=_build_system_prompt(company_data, language),
             tools=[
                 booking_tools.get_slots,
                 booking_tools.check_slots,
@@ -846,8 +1141,9 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
     )
 
+    greeting = GREETING_TEMPLATE[language].format(name=company_data["company"]["naziv"])
     try:
-        await session.say(AI_DISCLOSURE_SL + settings.greeting_text)
+        await session.say(AI_DISCLOSURE[language] + greeting)
     except Exception:
         # A broken TTS provider surfaces here too; the "error" handler above
         # will already be counting toward _degrade_and_close, so just avoid
