@@ -22,8 +22,11 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    RunContext,
+    StopResponse,
     UserTurnExceededEvent,
     WorkerOptions,
+    function_tool,
     llm,
 )
 from livekit.agents.llm import ChatMessage
@@ -51,6 +54,19 @@ DEFAULT_LANGUAGE = "sl"
 NO_CREDITS_MESSAGE = {
     "sl": "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje.",
     "en": "We're unable to take your call right now. Please try again later.",
+}
+
+# Spoken before closing a call the agent is ending because abuse continued
+# after one warning (see the end_call_abusive tool). Deliberately a normal,
+# warm sign-off rather than a rebuke or an accusation: by this point the
+# decision is made, and the last thing the caller hears should not escalate.
+# It is a graceful close, NOT a hangup — same shape as
+# TECHNICAL_DIFFICULTY_MESSAGE, which is spoken and then followed by
+# session.aclose(). Slovenian uses the feminine "zaključila" per the FEMALE
+# persona rule in STATIC_PROMPT_SL.
+ABUSE_CLOSING_MESSAGE = {
+    "sl": "Hvala za klic. Klic bom zdaj zaključila. Lep dan še naprej.",
+    "en": "Thank you for calling. I'll end the call here. Have a good day.",
 }
 
 TECHNICAL_DIFFICULTY_MESSAGE = {
@@ -579,6 +595,21 @@ Rules:
   call, same as the acknowledgment openers above.
   - Bad: "Hvala, do videnja!"
   - Good: "Hvala, nasvidenje!" (or any of the other correct options above)
+- If the caller is rude, insulting, or aggressive, stay calm and polite —
+  never mirror their tone, never argue back, never insult them. Anger about
+  waiting, prices, or a mistake is NOT abuse: keep helping that caller
+  normally. A swear word out of frustration is not, on its own, a reason to
+  act. Being upset with the business is not being abusive to you.
+  - If it IS genuine abuse (personal insults aimed at you, sexual
+    harassment, threats), warn ONCE, politely and without lecturing — for
+    example: "Prosim, da ostaneva spoštljiva, sicer bom klic morala
+    zaključiti." Then carry on helping normally if the behaviour stops.
+  - If the abuse continues after that one warning, call the
+    end_call_abusive tool. Do not warn a second time, and do not keep
+    repeating the warning instead of acting.
+  - Never end a call without having given that one warning first, and never
+    use the tool for ordinary frustration, a complaint, or dissatisfaction
+    with the company. When in doubt, keep helping.
 - Always use formal address (vikanje: "vi"/"vam"/"ste"), never informal
   "ti"/"tebi"/"si" — even if the caller speaks informally first. Do not
   mirror the caller's register.
@@ -856,6 +887,21 @@ Rules:
   time. Rotate naturally among "Goodbye!", "Have a great day!", "Talk
   soon!", "Thanks for calling, take care!" — vary which one you use call to
   call.
+- If the caller is rude, insulting, or aggressive, stay calm and polite —
+  never mirror their tone, never argue back, never insult them. Anger about
+  waiting, prices, or a mistake is NOT abuse: keep helping that caller
+  normally. A swear word out of frustration is not, on its own, a reason to
+  act. Being upset with the business is not being abusive to you.
+  - If it IS genuine abuse (personal insults aimed at you, sexual
+    harassment, threats), warn ONCE, politely and without lecturing — for
+    example: "I'd ask that we keep this respectful, otherwise I'll have to
+    end the call." Then carry on helping normally if the behaviour stops.
+  - If the abuse continues after that one warning, call the
+    end_call_abusive tool. Do not warn a second time, and do not keep
+    repeating the warning instead of acting.
+  - Never end a call without having given that one warning first, and never
+    use the tool for ordinary frustration, a complaint, or dissatisfaction
+    with the company. When in doubt, keep helping.
 - Your output is spoken directly by a TTS engine — never use markdown
   (no "**bold**", "*italic*", "-" bullet lists, headings, etc.). Write plain
   natural spoken sentences only.
@@ -1340,6 +1386,53 @@ async def entrypoint(ctx: JobContext) -> None:
         },
     )
 
+    # Set by the end_call_abusive tool so _on_shutdown can log the call as
+    # "ended_abusive" rather than the duration/booking-derived outcome.
+    call_end_state = {"abusive": False}
+
+    @function_tool
+    async def end_call_abusive(context: RunContext) -> None:
+        """End this call because the caller remained abusive after a warning.
+
+        Only call this after you have already given the caller ONE polite
+        warning and the abusive behaviour continued anyway. Never call it as
+        a first response, and never for a caller who is merely frustrated,
+        complaining, or unhappy with the company — only for genuine abuse
+        directed at you, such as personal insults, sexual harassment, or
+        threats.
+
+        You do not need to say goodbye first: a short closing line is spoken
+        automatically. Say nothing after calling this.
+        """
+        logger.warning(
+            "ending call for continued abuse after warning: call_id=%s "
+            "company_slug=%s",
+            call_id,
+            settings.company_slug,
+        )
+        call_end_state["abusive"] = True
+
+        # Let whatever the agent was already saying finish, so the closing
+        # line doesn't clip the tail of the warning turn.
+        await context.wait_for_playout()
+        await session.say(ABUSE_CLOSING_MESSAGE[language], allow_interruptions=False)
+
+        # NOT awaited: AgentSession.aclose() force-interrupts and then drains
+        # in-flight speech and tool tasks — and this tool IS one of those
+        # tasks, so awaiting it here would deadlock waiting on ourselves.
+        # (_degrade_and_close can await it safely because it runs from an
+        # event-handler task, not from inside a tool.) Scheduling it means
+        # the close lands on the next loop tick instead.
+        asyncio.create_task(session.aclose(), name="close_after_abuse")
+
+        # Suppress the follow-up LLM turn the SDK would otherwise generate
+        # from this tool's result — without it the model could start speaking
+        # again while the session is closing. StopResponse is handled as a
+        # normal "done" outcome by the tool executor, not an error, so it
+        # neither logs an exception nor trips the session error handler that
+        # drives _degrade_and_close.
+        raise StopResponse
+
     transcript: list[dict] = []
     # Set from the session's "close" event, which fires right when the call
     # actually ends (participant disconnect). The process/job shutdown that
@@ -1547,6 +1640,15 @@ async def entrypoint(ctx: JobContext) -> None:
             billed_credits = round(duration_sec / 60.0, 2)
             outcome = "booked" if booking_tools.created_termin_id else "info_only"
 
+        # Reported as ended_abusive whatever else happened on the call. Billing
+        # is deliberately NOT changed by this: the call really did consume its
+        # duration, and the abusive-close path is the one place where making
+        # billing depend on the agent's own judgement would be a bad idea. If a
+        # booking was created before the caller turned abusive it is not lost —
+        # created_termin_id still goes into its own column below.
+        if call_end_state["abusive"]:
+            outcome = "ended_abusive"
+
         new_balance = balance
         if billed_credits > 0:
             try:
@@ -1610,6 +1712,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 booking_tools.get_slots,
                 booking_tools.check_slots,
                 booking_tools.create_booking,
+                end_call_abusive,
             ],
         ),
     )

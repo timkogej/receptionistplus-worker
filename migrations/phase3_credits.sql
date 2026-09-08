@@ -43,7 +43,22 @@ create table if not exists receptionist_calls (
     ended_at timestamptz,
     duration_sec int,
     billed_credits numeric(12, 2),
-    outcome text,                                 -- booked | info_only | message_taken | abandoned | no_credits | error
+    -- outcome is intentionally free text, not an enum or CHECK constraint, so
+    -- the worker can add a value without a schema migration. The list below is
+    -- documentation of what the worker actually emits (agent/worker.py) and is
+    -- not enforced by the database.
+    --   booked              - create_booking succeeded
+    --   info_only           - answered questions, no booking made
+    --   abandoned           - shorter than ABANDONED_CALL_THRESHOLD_SEC, unbilled
+    --   ended_abusive       - agent closed the call after abuse continued past
+    --                         one warning (still billed by duration; a booking
+    --                         made earlier in the call is kept in
+    --                         created_termin_id)
+    --   no_credits          - credit gate refused the call
+    --   booking_unavailable - booking-v2 init failed, call could not proceed
+    -- ("message_taken" and "error" were listed here historically but the worker
+    -- has never emitted either.)
+    outcome text,
     transcript jsonb,                             -- [{role, text, ts}]
     created_termin_id text,                       -- e.g. "OB-000039" if a booking happened
     livekit_room text,
