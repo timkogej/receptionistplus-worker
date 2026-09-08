@@ -23,11 +23,24 @@ def _render_company_prompt_sl(init_data: dict) -> str:
     services_by_category = init_data.get("servicesByCategory", {})
 
     def service_line(svc: dict) -> str:
+        # The single-employee marker carries its instruction INLINE, on the
+        # service line itself, rather than only tagging the service and
+        # stating the rule separately further down. Observed live 2026-09-08
+        # (Masaža glave, the one single-employee service in this catalogue):
+        # the model read the line correctly — it quoted the price from it —
+        # and still asked "Imate željo po določenem zaposlenem?", because
+        # acting on the marker required joining it to a rule ~30 lines below
+        # and to another in STATIC_PROMPT_SL. Stating the consequence where
+        # the model is already reading removes that join.
         note = ""
         eligible = employees_by_service.get(svc["id"], [])
         if len(eligible) == 1:
             name = employee_names.get(eligible[0], "?")
-            note = f" — edini zaposleni za to storitev: {name}"
+            note = (
+                f" — to storitev opravlja SAMO {name}, zato pri tej storitvi "
+                f"NE sprašuj po želji glede zaposlenega, ampak rezerviraj "
+                f"pri njem/njej"
+            )
         return (
             f'- {svc["naziv"]} (ID storitve: {svc["id"]}): {svc["cena"]} EUR, '
             f'{svc["trajanjeMin"]} minut{note}'
@@ -77,8 +90,8 @@ def _render_company_prompt_sl(init_data: dict) -> str:
         "vprašaj, ali ima željo po določenem zaposlenem — šele ko pove, da ji "
         "je vseeno, rezerviraj pri kateremkoli od zgoraj naštetih zaposlenih, "
         "ki opravljajo izbrano storitev (any_person). Izjema: če je pri "
-        "storitvi naveden edini zaposleni za to storitev, tega vprašanja ne "
-        "postavljaj."
+        "storitvi navedeno, da jo opravlja SAMO en zaposleni, tega vprašanja "
+        "ne postavljaj — rezerviraj pri tistem zaposlenem."
     )
 
     lines.append(
@@ -100,11 +113,17 @@ def _render_company_prompt_en(init_data: dict) -> str:
     services_by_category = init_data.get("servicesByCategory", {})
 
     def service_line(svc: dict) -> str:
+        # See the note in _render_company_prompt_sl: the instruction is inline
+        # on the service line because tagging the service and stating the rule
+        # elsewhere was not enough to stop the model asking the question.
         note = ""
         eligible = employees_by_service.get(svc["id"], [])
         if len(eligible) == 1:
             name = employee_names.get(eligible[0], "?")
-            note = f" — only staff member for this service: {name}"
+            note = (
+                f" — {name} is the ONLY staff member for this service, so do "
+                f"NOT ask about a staff preference for it; book with them"
+            )
         return (
             f'- {svc["naziv"]} (service ID: {svc["id"]}): {svc["cena"]} EUR, '
             f'{svc["trajanjeMin"]} minutes{note}'
@@ -151,8 +170,8 @@ def _render_company_prompt_en(init_data: dict) -> str:
         "whether they'd like a specific staff member — only once they say "
         "they don't mind should you book with any of the staff listed above "
         "who perform the chosen service (any_person). Exception: if a "
-        "service is marked with an only staff member for this service, don't "
-        "ask that question."
+        "service is marked as having only ONE staff member, don't ask that "
+        "question — book with that person."
     )
 
     lines.append(

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import math
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -164,6 +165,13 @@ GENERIC_FILLER_DELAY = 5.0
 # keeps talking through several short non-responses still trips it.
 USER_TURN_MAX_DURATION_SEC = 45.0
 USER_TURN_MAX_WORDS = 150
+
+# How often to log in-progress user-turn growth. This exists to produce direct
+# evidence that interim transcripts actually arrive mid-monologue at the
+# cadence the SDK source implies — the assumption the first attempt at this
+# feature got wrong. Throttled so a normal turn logs once or twice, not per
+# interim (Soniox emits these several times a second).
+USER_TURN_CADENCE_LOG_INTERVAL_SEC = 5.0
 
 # Spoken as a canned line rather than via the SDK's default handler, which
 # calls generate_reply() with English instructions ("Politely cut in...").
@@ -687,7 +695,8 @@ Booking rules:
     ali vam je vseeno kdo vas postreže?" Only proceed with any_person=true
     after the caller answers that they don't care.
     - EXCEPTION: if the service data below marks a service as having only
-      one eligible employee ("edini zaposleni za to storitev"), skip this
+      one eligible employee (the service line says "to storitev opravlja
+      SAMO ..."), skip this
       question entirely — there's no real choice to offer. Silently
       proceed with that one employee (employee_id set, any_person=false),
       without asking.
@@ -958,7 +967,8 @@ Booking rules:
     proceed with any_person=true after the caller answers that they don't
     care.
     - EXCEPTION: if the service data below marks a service as having only
-      one eligible employee ("only staff member for this service"), skip
+      one eligible employee (the service line says "... is the ONLY staff
+      member for this service"), skip
       this question entirely — there's no real choice to offer. Silently
       proceed with that one employee (employee_id set, any_person=false),
       without asking.
@@ -1095,22 +1105,48 @@ class ReceptionistAgent(Agent):
         self._language = language
         self._redirect_step = 0
 
-    async def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None:
+    async def speak_redirect(self, *, source: str, words: int, duration: float) -> None:
+        """Speak the next rotating redirect line. Shared by both trigger paths.
+
+        `source` says which watchdog fired — the entrypoint's interim-based
+        one (which is what actually works with our STT config) or the SDK's
+        user_turn_limit backstop. Rotation state is shared deliberately, so a
+        caller who trips both never hears the same sentence twice.
+        """
         phrases = REDIRECT_PHRASES[self._language]
         phrase = phrases[self._redirect_step % len(phrases)]
         self._redirect_step += 1
         logger.info(
-            "user turn limit exceeded: words=%s duration=%.1fs — redirecting "
-            "with %r",
-            ev.accumulated_word_count,
-            ev.duration,
+            "REDIRECT source=%s words=%s duration=%.1fs — speaking %r",
+            source,
+            words,
+            duration,
             phrase,
         )
-        # Awaited, not fire-and-forget: AgentActivity holds
-        # _user_turn_exceeded_locked only for the duration of this callback,
+        # Awaited, not fire-and-forget: on the SDK path, AgentActivity holds
+        # _user_turn_exceeded_locked only for the duration of that callback,
         # so returning before the line finishes would let a still-rambling
         # caller trigger a second redirect on top of the first one.
         await self.session.say(phrase, allow_interruptions=False)
+
+    async def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None:
+        # Backstop only. Verified 2026-09-08 not to fire in our configuration:
+        # the SDK advances its counters solely on FINAL transcripts
+        # (audio_recognition.py, inside the FINAL_TRANSCRIPT branch), and the
+        # Soniox plugin only emits a FINAL when it detects an ENDPOINT
+        # ("final tokens are accumulated across messages until an endpoint is
+        # detected") — which a continuous monologue never produces. When the
+        # caller finally pauses, the one final that arrives both trips the
+        # limit AND ends the turn, and AgentActivity._user_turn_exceeded_task
+        # deliberately bails once the agent starts its normal reply. Kept
+        # enabled because it costs nothing and would start working if the STT
+        # or turn-detection config ever changes; the real trigger is the
+        # interim-based watchdog in entrypoint().
+        await self.speak_redirect(
+            source="sdk-user-turn-limit",
+            words=ev.accumulated_word_count,
+            duration=ev.duration,
+        )
 
 
 def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
@@ -1474,11 +1510,51 @@ async def entrypoint(ctx: JobContext) -> None:
     # or caller to become active again; if neither happens, speak a short
     # filler and repeat. Built on public session.on()/wait_for_idle()/say()
     # rather than the private class so it doesn't depend on SDK internals.
+    # Constructed here rather than inline at session.start() because the
+    # rambling watchdog below closes over it (shared redirect-phrase rotation).
+    receptionist_agent = ReceptionistAgent(
+        language=language,
+        instructions=_build_system_prompt(company_data, language),
+        tools=[
+            booking_tools.get_slots,
+            booking_tools.check_slots,
+            booking_tools.create_booking,
+            end_call_abusive,
+        ],
+    )
+
+    user_turn_watch: dict = {
+        "started_at": None,
+        "fired": False,
+        "last_log_at": 0.0,
+        "peak_words": 0,
+    }
+
+    def _reset_user_turn_watch(reason: str) -> None:
+        if user_turn_watch["started_at"] is not None:
+            logger.info(
+                "user turn watch reset (%s): peak_words=%d duration=%.1fs "
+                "fired=%s",
+                reason,
+                user_turn_watch["peak_words"],
+                time.monotonic() - user_turn_watch["started_at"],
+                user_turn_watch["fired"],
+            )
+        user_turn_watch["started_at"] = None
+        user_turn_watch["fired"] = False
+        user_turn_watch["last_log_at"] = 0.0
+        user_turn_watch["peak_words"] = 0
+
     _agent_active = asyncio.Event()
 
     def _on_agent_state_changed(event) -> None:
         if event.new_state in ("speaking", "thinking"):
             _agent_active.set()
+        if event.new_state == "speaking":
+            # The caller has been answered, so the current turn is no longer an
+            # unanswered monologue — start counting afresh. Mirrors the SDK's
+            # own rule that the turn tracker resets when the agent speaks.
+            _reset_user_turn_watch("agent spoke")
 
     def _on_user_state_changed(event) -> None:
         if event.new_state == "speaking":
@@ -1486,6 +1562,75 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session.on("agent_state_changed", _on_agent_state_changed)
     session.on("user_state_changed", _on_user_state_changed)
+
+    # Rambling-caller watchdog, interim-transcript based (2026-09-08, second
+    # attempt). The SDK's own turn_handling["user_turn_limit"] is left enabled
+    # as a backstop but CANNOT fire in this configuration — see the comment on
+    # ReceptionistAgent.on_user_turn_exceeded. Root cause, from a real call
+    # (job AJ_k3sjqa3MVBqP): a 365-word, ~2.5-minute monologue produced no
+    # event at all, because the SDK only advances its counters on FINAL
+    # transcripts and Soniox only emits a FINAL on an endpoint, which
+    # continuous speech never produces.
+    #
+    # Interim transcripts, by contrast, DO flow throughout a monologue:
+    # AgentActivity.on_interim_transcript emits user_input_transcribed with
+    # is_final=False on every interim, and the Soniox plugin builds that text
+    # as _merge_lang_segments(final, non_final) — the full running utterance,
+    # growing as the caller talks. So counting from interims measures the turn
+    # in real time without ever needing an endpoint.
+    #
+    # Counters reset when the agent speaks (the caller got a response, so the
+    # turn is no longer unanswered) or when a final lands (turn committed).
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event) -> None:
+        if event.is_final:
+            _reset_user_turn_watch("final transcript")
+            return
+
+        text = (event.transcript or "").strip()
+        if not text:
+            # The SDK also emits an empty interim as an end-of-speech marker
+            # when VAD is absent; it carries no turn content.
+            return
+
+        now = time.monotonic()
+        if user_turn_watch["started_at"] is None:
+            user_turn_watch["started_at"] = now
+            user_turn_watch["last_log_at"] = now
+            logger.info("user turn watch armed (first interim of turn)")
+
+        elapsed = now - user_turn_watch["started_at"]
+        words = len(text.split())
+        user_turn_watch["peak_words"] = max(user_turn_watch["peak_words"], words)
+
+        if now - user_turn_watch["last_log_at"] >= USER_TURN_CADENCE_LOG_INTERVAL_SEC:
+            user_turn_watch["last_log_at"] = now
+            logger.info(
+                "user turn in progress: elapsed=%.1fs words=%d "
+                "(thresholds %.0fs / %d) agent_state=%s",
+                elapsed,
+                words,
+                USER_TURN_MAX_DURATION_SEC,
+                USER_TURN_MAX_WORDS,
+                session.agent_state,
+            )
+
+        if user_turn_watch["fired"]:
+            return
+        if elapsed < USER_TURN_MAX_DURATION_SEC and words < USER_TURN_MAX_WORDS:
+            return
+        # Don't cut in while the agent is already responding — that turn is
+        # answered, and the SDK's own handler bails for the same reason.
+        if session.agent_state in ("speaking", "thinking"):
+            return
+
+        user_turn_watch["fired"] = True
+        asyncio.create_task(
+            receptionist_agent.speak_redirect(
+                source="interim-watchdog", words=words, duration=elapsed
+            ),
+            name="rambling_redirect",
+        )
 
     async def _generic_filler_loop() -> None:
         phrases = GENERIC_FILLER_PHRASES[language]
@@ -1703,19 +1848,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_on_shutdown)
 
-    await session.start(
-        room=ctx.room,
-        agent=ReceptionistAgent(
-            language=language,
-            instructions=_build_system_prompt(company_data, language),
-            tools=[
-                booking_tools.get_slots,
-                booking_tools.check_slots,
-                booking_tools.create_booking,
-                end_call_abusive,
-            ],
-        ),
-    )
+    await session.start(room=ctx.room, agent=receptionist_agent)
 
     greeting = GREETING_TEMPLATE[language].format(name=company_data["company"]["naziv"])
     try:
