@@ -17,8 +17,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from livekit import agents
-from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, llm
+from livekit import agents, rtc
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    UserTurnExceededEvent,
+    WorkerOptions,
+    llm,
+)
 from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.utils.audio import audio_frames_from_file
@@ -125,6 +132,43 @@ GENERIC_FILLER_PHRASES = {
     ],
 }
 GENERIC_FILLER_DELAY = 5.0
+
+# Rambling-caller redirect (2026-09-08). In "stt" turn detection a turn ends
+# on SILENCE, so a caller who monologues without pausing never produces an
+# endpoint and the agent stays mute indefinitely — there was no upper bound on
+# a single user turn anywhere in the config. The SDK has a purpose-built
+# feature for this (turn_handling["user_turn_limit"]) which ships disabled
+# (both thresholds default to None); enabled below.
+#
+# Thresholds are deliberately generous: this must never fire on someone simply
+# explaining what they want. A caller describing a problem in detail runs well
+# under 45s / 150 words; sustained monologue is what we're catching. Whichever
+# trips first wins. The framework accumulates across consecutive user turns
+# and only resets the counters once the agent actually SPEAKS, so a caller who
+# keeps talking through several short non-responses still trips it.
+USER_TURN_MAX_DURATION_SEC = 45.0
+USER_TURN_MAX_WORDS = 150
+
+# Spoken as a canned line rather than via the SDK's default handler, which
+# calls generate_reply() with English instructions ("Politely cut in...").
+# That would work — the system prompt forces Slovenian output anyway — but a
+# fixed line is predictable, costs no LLM round-trip at the exact moment the
+# caller is already monopolising the turn, and can't hallucinate an
+# availability claim. Rotated like the other repeated phrases in this prompt
+# so a caller who trips it twice doesn't hear the identical sentence back.
+# Deliberately worded to hand the turn straight back with a question.
+REDIRECT_PHRASES = {
+    "sl": [
+        "Oprostite, da vas prekinem — kako vam lahko pomagam?",
+        "Oprostite, da vas prekinem — mi lahko na kratko poveste, kaj potrebujete?",
+        "Se opravičujem za prekinitev — povejte mi, prosim, s čim vam lahko pomagam.",
+    ],
+    "en": [
+        "Sorry to jump in — how can I help you?",
+        "Sorry to interrupt — could you tell me briefly what you need?",
+        "Apologies for cutting in — please tell me what I can help you with.",
+    ],
+}
 
 # Promise-follow-up watchdog (2026-08-16 fix): a fallback-model turn that
 # says "checking..."/"trenutek, prosim..." and then never calls the tool it
@@ -980,6 +1024,49 @@ def _build_system_prompt(company_data: dict, language: str = DEFAULT_LANGUAGE) -
     )
 
 
+class ReceptionistAgent(Agent):
+    """Agent with a canned, language-correct redirect for rambling callers.
+
+    Overrides the SDK default `on_user_turn_exceeded`, which calls
+    generate_reply() with English instructions. That would produce Slovenian
+    output (the system prompt forces it) but costs an LLM round-trip at the
+    worst possible moment and could say anything — including an availability
+    claim with no get_slots behind it, which the prompt spends considerable
+    effort forbidding. A fixed line avoids both.
+
+    Speaks with allow_interruptions=False, matching the SDK default handler:
+    the whole point is that the caller is currently talking over everything,
+    so an interruptible cut-in would be talked over too.
+
+    The framework only fires this after checking that a normal end-of-turn
+    reply isn't already on its way (see AgentActivity._user_turn_exceeded_task
+    — it waits on agent_state "speaking" and bails if the agent got there on
+    its own), so this does not double-speak over an ordinary answer.
+    """
+
+    def __init__(self, *, language: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._language = language
+        self._redirect_step = 0
+
+    async def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None:
+        phrases = REDIRECT_PHRASES[self._language]
+        phrase = phrases[self._redirect_step % len(phrases)]
+        self._redirect_step += 1
+        logger.info(
+            "user turn limit exceeded: words=%s duration=%.1fs — redirecting "
+            "with %r",
+            ev.accumulated_word_count,
+            ev.duration,
+            phrase,
+        )
+        # Awaited, not fire-and-forget: AgentActivity holds
+        # _user_turn_exceeded_locked only for the duration of this callback,
+        # so returning before the line finishes would let a still-rambling
+        # caller trigger a second redirect on top of the first one.
+        await self.session.say(phrase, allow_interruptions=False)
+
+
 def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
     if settings.tts_provider == "elevenlabs":
         return elevenlabs.TTS(
@@ -1069,6 +1156,38 @@ async def entrypoint(ctx: JobContext) -> None:
     call_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc)
     livekit_room = ctx.room.name
+
+    # DTMF: LOGGING ONLY for now (2026-09-08) — deliberately no functional
+    # behavior attached yet.
+    #
+    # Inbound keypresses arrive as a room-level SIP signalling event, NOT
+    # through the audio/STT path, so they were previously dropped silently:
+    # nothing in this worker registered any room-level handler at all. They
+    # are not "misheard as noise" by Soniox — out-of-band DTMF never reaches
+    # it.
+    #
+    # The open question this is here to answer with real data: whether the
+    # SIP trunk sends DTMF out-of-band (RFC 2833 / SIP INFO — the normal
+    # case, which produces these events) or in-band as audio tones (in which
+    # case this handler stays silent and the tones hit STT as garbage). That
+    # is trunk configuration and can only be settled by a real call with a
+    # keypress. Registered before the credit/booking gates so it captures
+    # presses on every call, including ones that end early.
+    dtmf_seen: list[str] = []
+
+    def _on_sip_dtmf_received(event: rtc.SipDTMF) -> None:
+        dtmf_seen.append(event.digit)
+        logger.info(
+            "DTMF received: digit=%r code=%s participant=%s total_this_call=%d "
+            "sequence=%r (logging only — no action taken)",
+            event.digit,
+            event.code,
+            event.participant.identity if event.participant else None,
+            len(dtmf_seen),
+            "".join(dtmf_seen),
+        )
+
+    ctx.room.on("sip_dtmf_received", _on_sip_dtmf_received)
 
     # get_settings, get_balance, and the booking-v2 init fetch don't depend
     # on each other's results, so fire all three concurrently rather than
@@ -1204,6 +1323,20 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_handling={
             "turn_detection": "stt",
             "interruption": InterruptionOptions(enabled=True),
+            # Endpointing is left at the framework defaults on purpose:
+            # because turn_detection is the string "stt" (not a
+            # _StreamingTurnDetector instance), _resolve_endpointing picks
+            # min_delay=0.5 / max_delay=3.0 rather than the tighter streaming
+            # defaults (0.3/2.5). That 0.5s grace before taking the turn, and
+            # tolerance for a 3s mid-sentence pause, is what keeps us from
+            # cutting callers off — don't tighten without a voice test.
+            # This limit covers the opposite failure: the caller who never
+            # pauses at all, so endpointing never fires. See
+            # ReceptionistAgent.on_user_turn_exceeded.
+            "user_turn_limit": {
+                "max_duration": USER_TURN_MAX_DURATION_SEC,
+                "max_words": USER_TURN_MAX_WORDS,
+            },
         },
     )
 
@@ -1470,7 +1603,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=Agent(
+        agent=ReceptionistAgent(
+            language=language,
             instructions=_build_system_prompt(company_data, language),
             tools=[
                 booking_tools.get_slots,
