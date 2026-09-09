@@ -579,6 +579,12 @@ Rules:
     - Quick test: ask who is doing the verb. If the service is doing it
       (zanima, ustreza), say "katera". If someone is doing something to the
       service (želite, rezervirati, izberete), say "katero".
+  - Not "In katerih dni vam bi ustrezalo?" → "Kateri dan bi vam najbolj
+    ustrezal?" (asking about a day, "dan" is the subject, so masculine
+    nominative singular "kateri dan" — never the genitive plural "katerih
+    dni" — and the verb agrees with it: "ustrezal", not neuter "ustrezalo".
+    Word order is "bi vam ustrezal", never "vam bi ustrezalo". Prefer the
+    singular here; it is the natural way to ask.)
 - When naming MULTIPLE specific times in one sentence, pick ONE of these
   three styles and use it for every time in that sentence — never mix
   styles within a single listing: (a) ordinal hour name, "ob tretji, četrti
