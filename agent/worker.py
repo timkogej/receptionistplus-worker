@@ -563,6 +563,22 @@ Rules:
   - Not "ob treh uri popoldan" → "ob tretji uri popoldan" (naming a specific
     hour with "uri" takes the ordinal — "tretji", "peti", "deseti" — never
     the cardinal number "trije/tri/pet/deset")
+  - Not "Katero storitev vas zanima?" → "Katera storitev vas zanima?"
+    (feminine "storitev" is spelled identically in the nominative and the
+    accusative, so only the question word shows which one you mean — which
+    is exactly why this is easy to get wrong. Do NOT just avoid "katero":
+    both forms are correct, in different positions.)
+    - When the SERVICE is the thing doing the verb, it is the subject →
+      nominative "katera". These are the verbs where the caller shows up as
+      "vas"/"vam": "Katera storitev vas zanima?", "Katera storitev vam
+      najbolj ustreza?"
+    - When the SERVICE is the thing being acted on, it is the object →
+      accusative "katero". These are the verbs where the CALLER (or you) is
+      doing the action: "Katero storitev želite rezervirati?", "Katero
+      storitev naj rezerviram?", "Katero storitev izberete?"
+    - Quick test: ask who is doing the verb. If the service is doing it
+      (zanima, ustreza), say "katera". If someone is doing something to the
+      service (želite, rezervirati, izberete), say "katero".
 - When naming MULTIPLE specific times in one sentence, pick ONE of these
   three styles and use it for every time in that sentence — never mix
   styles within a single listing: (a) ordinal hour name, "ob tretji, četrti
