@@ -721,6 +721,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # from here, so the pre-greeting gap can be read straight off one call's
     # log lines instead of reconstructed from unrelated timestamps.
     job_t0 = time.monotonic()
+    job_wall_t0 = time.time()
 
     def _t() -> float:
         return time.monotonic() - job_t0
@@ -728,6 +729,47 @@ async def entrypoint(ctx: JobContext) -> None:
     settings = Settings.from_env()
     await ctx.connect()
     logger.info("bootstrap: room connected t=+%.3fs", _t())
+
+    # Pre-job timing (2026-09-23): the t=+ lines above only start when the
+    # job reaches us, but a caller's silence can also come from the time
+    # BEFORE that — call answered → room created → job dispatched — which
+    # nothing measured. An English test call reported a long pre-disclosure
+    # silence while every step our code controls matched the Slovenian
+    # calls, and there was no way to tell whether the gap was before or
+    # after the job started. These two timestamps come from the LiveKit
+    # server, on the same t= scale (negative = before the job started), so
+    # the next such call answers that directly. Cross-clock (LiveKit server
+    # vs this VPS, both NTP-synced), so trust tens of ms, not single ms.
+    room_created = ctx.room.creation_time.timestamp()  # 0.0 if not populated
+    logger.info(
+        "bootstrap: room created t=%s (LiveKit clock)",
+        f"{room_created - job_wall_t0:+.3f}s" if room_created > 0 else "unknown",
+    )
+    caller_join_logged = False
+
+    # First remote participant of ANY kind, with the kind logged: the first
+    # version filtered to SIP and logged nothing on a test call (2026-09-23,
+    # AJ_iNF2G7ByKait), so a filter that silently drops the only caller in
+    # the room is worse than none. The agent is the only local participant.
+    def _log_caller_joined(participant: rtc.RemoteParticipant) -> None:
+        nonlocal caller_join_logged
+        if caller_join_logged:
+            return
+        caller_join_logged = True
+        joined = participant.joined_at
+        logger.info(
+            "bootstrap: caller joined room t=%s (LiveKit clock), seen by us "
+            "t=+%.3fs kind=%s identity=%s",
+            f"{joined.timestamp() - job_wall_t0:+.3f}s" if joined else "unknown",
+            _t(),
+            rtc.ParticipantKind.Name(participant.kind),
+            participant.identity,
+        )
+
+    for participant in ctx.room.remote_participants.values():
+        _log_caller_joined(participant)
+    if not caller_join_logged:
+        ctx.room.on("participant_connected", _log_caller_joined)
 
     supabase = SupabaseClient(settings.supabase_url, settings.supabase_service_role_key)
     call_id = str(uuid.uuid4())
