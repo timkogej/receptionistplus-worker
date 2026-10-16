@@ -194,3 +194,21 @@ def booking_window_days(company: dict | None, default: int = 14) -> int:
     except (TypeError, ValueError):
         days = default
     return max(1, min(60, days))
+
+
+def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
+    """Tells the model how the booking confirmation reaches the caller, which
+    decides whether an email is needed at all (R-ASK-DETAILS)."""
+    if language == "en":
+        return (
+            "Confirmation: by SMS to the phone number of the booking — don't "
+            "ask for an email. After booking, mention they'll get a text."
+            if sms_confirmation
+            else "Confirmation: by email — ask for the caller's email address."
+        )
+    return (
+        "Potrdilo: pride po SMS na telefonsko številko rezervacije — za "
+        "e-naslov ne sprašuj. Po rezervaciji omeni, da bodo dobili SMS."
+        if sms_confirmation
+        else "Potrdilo: pride po e-pošti — vprašaj za e-poštni naslov."
+    )

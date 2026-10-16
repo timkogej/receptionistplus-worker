@@ -18,6 +18,13 @@ alter table receptionist_settings add column if not exists transfer_enabled bool
 alter table receptionist_settings add column if not exists transfer_number text
     check (transfer_number is null or transfer_number ~ '^\+[1-9][0-9]{6,14}$');
 
+-- Booking confirmations from a call go by SMS (n8n "Receptionist+ – SMS
+-- stranki", counted against the company's SMS quota) and the caller isn't
+-- asked for an email. Switch off for businesses without SMS in their plan:
+-- the receptionist then asks for an email and booking-v2 sends the usual
+-- email confirmation.
+alter table receptionist_settings add column if not exists sms_confirmation boolean not null default true;
+
 -- One-to-three sentence summary of the call, written by the worker after
 -- hang-up, for the owner's call list and notifications.
 alter table receptionist_calls add column if not exists summary text;

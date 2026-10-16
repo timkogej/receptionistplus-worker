@@ -31,7 +31,9 @@ PHASE6_CALL_COLUMNS = frozenset(
 )
 
 _SETTINGS_BASE = "company_slug,enabled,low_balance_threshold,language,greeting_text"
-_SETTINGS_PHASE7 = _SETTINGS_BASE + ",instructions,transfer_enabled,transfer_number"
+_SETTINGS_PHASE7 = (
+    _SETTINGS_BASE + ",instructions,transfer_enabled,transfer_number,sms_confirmation"
+)
 
 _PROFILE_SELECT = (
     '"ID Podjetja","Naziv Podjetja","Naslov podjetja","Kontaktni telefon",'

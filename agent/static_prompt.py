@@ -143,6 +143,10 @@ def _strip_rule_ids(source: str) -> str:
 # R-CATEGORIES-FIRST: cap sentence added 2026-10-16 — with six categories
 #   every model in the eval named all six ("manikure, masaže, nega obraza,
 #   pedikure, platišča, pnevmatike in shranjevanje").
+# R-MANAGE-APPOINTMENT: added 2026-10-16 with send_manage_link (SMS with a
+#   one-hour portal login link via n8n "Receptionist+ – SMS stranki").
+# R-ASK-DETAILS: email only when confirmations go by email (2026-10-16:
+#   booking-v2 accepts source=receptionist without email; SMS confirms).
 # R-TRANSFER: added 2026-10-16 with transfer_to_person (only registered
 #   when the company enabled it and is open). The no-tool half matters as
 #   much: without it the model offered "povežem vas" it couldn't do.
@@ -617,7 +621,10 @@ CUSTOMER DATA:
   - Name and last name together — vary which one you use call to call:
     "Kako vam je ime in priimek?", "Kako vam je ime in kako se pišete?",
     "Lahko dobim vaše ime in priimek?"
-  - Email, asked on its own: "Kakšen je vaš e-poštni naslov?"
+  - Email, asked on its own: "Kakšen je vaš e-poštni naslov?" — but
+    ONLY when the confirmation line at the very end says confirmations go
+    by email. When it says they go by SMS, don't ask for an email at all
+    (use one only if the caller offers it).
   - Phone, asked separately: "Mi lahko poveste še vašo telefonsko
     številko?" — but when the caller line at the very end says which
     number they are calling from, follow that line instead (ask only
@@ -729,6 +736,12 @@ ERROR RECOVERY:
   - Bad (no tool): "Takoj vas povežem z lastnikom." (you can't)
   - Good (no tool): "Žal vas ne morem povezati, lahko pa lastniku pustim
     sporočilo, da vas pokliče. Vam to ustreza?"
+- [R-MANAGE-APPOINTMENT] Cancelling or moving an EXISTING appointment is
+  done by the caller themselves in the customer portal. If you have the
+  send_manage_link tool, offer to text them the link ("Pošljem vam SMS s
+  povezavo, kjer termin odpoveste ali prestavite?") and call it on a yes.
+  Without the tool, offer take_message so the owner sorts it out. Never
+  claim you cancelled or moved anything yourself.
 - [R-ABUSE] If the caller is rude, insulting, or aggressive, stay calm and
   polite — never mirror their tone, never argue back, never insult them.
   Anger about waiting, prices, or a mistake is NOT abuse: keep helping that
@@ -1109,7 +1122,10 @@ CUSTOMER DATA:
   - First and last name together — vary which one you use call to call:
     "What's your first and last name?", "Could I get your full name?",
     "Can you tell me your first and last name?"
-  - Email, asked on its own: "What's your email address?"
+  - Email, asked on its own: "What's your email address?" — but ONLY
+    when the confirmation line at the very end says confirmations go by
+    email. When it says they go by SMS, don't ask for an email at all (use
+    one only if the caller offers it).
   - Phone, asked separately: "And what's the best number to reach you
     on?" — but when the caller line at the very end says which number
     they are calling from, follow that line instead (ask only whether you
@@ -1222,6 +1238,12 @@ ERROR RECOVERY:
     can't)
   - Good (no tool): "I'm afraid I can't put you through, but I can leave
     the owner a message to call you back. Would that work?"
+- [R-MANAGE-APPOINTMENT] Cancelling or moving an EXISTING appointment is
+  done by the caller themselves in the customer portal. If you have the
+  send_manage_link tool, offer to text them the link ("Shall I text you a
+  link where you can cancel or move it?") and call it on a yes. Without
+  the tool, offer take_message so the owner sorts it out. Never claim you
+  cancelled or moved anything yourself.
 - [R-ABUSE] If the caller is rude, insulting, or aggressive, stay calm and
   polite — never mirror their tone, never argue back, never insult them.
   Anger about waiting, prices, or a mistake is NOT abuse: keep helping that

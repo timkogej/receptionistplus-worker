@@ -75,6 +75,7 @@ this retry pattern, not to any staleness in n8n's check-slots query.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time as time_module
@@ -362,7 +363,14 @@ def _weekday_for_filler(iso_date: str, language: str) -> str | None:
 
 
 class BookingTools:
-    def __init__(self, company_slug: str, company_data: dict, language: str = "sl") -> None:
+    def __init__(
+        self,
+        company_slug: str,
+        company_data: dict,
+        language: str = "sl",
+        *,
+        on_booked=None,
+    ) -> None:
         self._company_slug = company_slug
         self._company_data = company_data
         self._language = language
@@ -384,6 +392,11 @@ class BookingTools:
         # GET_SLOTS_DAY_FILLERS).
         self._filler_step = 0
         self.spoken_fillers: set[str] = set()
+        # async callback(booking: dict) after a successful create_booking —
+        # worker.py sends the SMS confirmation from it. Runs in the
+        # background so the caller hears the confirmation straight away.
+        self._on_booked = on_booked
+        self.background_tasks: set = set()
 
     def _next_filler(self, variants: list[str], **fmt) -> str:
         text = variants[self._filler_step % len(variants)].format(**fmt)
@@ -625,8 +638,8 @@ class BookingTools:
         """Check whether one exact date/time is still free right now.
 
         Call this as the LAST step before create_booking — after the caller
-        has confirmed the slot AND you have collected their name, email and
-        phone — with the exact same service_ids/employee_id/any_person/
+        has confirmed the slot AND you have collected their details (see
+        your instructions: name, phone, and email only when asked for) — with the exact same service_ids/employee_id/any_person/
         date/time, and then call create_booking straight away in the same
         turn. Never call it before collecting the caller's details: a check
         that old is stale, and create_booking rejects checks older than a
@@ -692,8 +705,8 @@ class BookingTools:
         date: str,
         time: str,
         first_name: str,
-        email: str,
         phone: str,
+        email: str = "",
         last_name: str = "",
         employee_id: str | None = None,
         any_person: bool = False,
@@ -702,7 +715,7 @@ class BookingTools:
         """Actually reserve the appointment. Requires a just-completed check_slots.
 
         Call it right after check_slots, in the same turn, once the caller
-        has confirmed the slot and you have their name, email and phone. A
+        has confirmed the slot and you have their details. A
         check_slots result older than a minute is rejected
         (must_check_slots_first) — then just check again and retry.
 
@@ -720,8 +733,11 @@ class BookingTools:
             date: YYYY-MM-DD.
             time: HH:MM, 24-hour.
             first_name: Caller's first name.
-            email: Caller's email address.
-            phone: Caller's phone number.
+            phone: Caller's phone number (the number they call from, when
+                the caller line says so and they agreed).
+            email: Caller's email address — only if they gave one or it is
+                on file for a confirmed existing customer; may be empty
+                when confirmations go by SMS.
             last_name: Caller's last name, if given.
             employee_id: Employee ID, if any_person is False. Must be
                 someone who performs this service — anyone else is refused.
@@ -839,6 +855,22 @@ class BookingTools:
             self.created_termin_id = result["terminId"]
             # A retry after an ambiguous outcome went through cleanly.
             self.owner_followup_reason = None
+            if self._on_booked is not None:
+                task = asyncio.create_task(
+                    self._on_booked(
+                        {
+                            "terminId": result["terminId"],
+                            "service_ids": list(service_ids),
+                            "date": date,
+                            "time": time,
+                            "phone": phone,
+                            "email": email,
+                        }
+                    ),
+                    name="on_booked",
+                )
+                self.background_tasks.add(task)
+                task.add_done_callback(self.background_tasks.discard)
         # Same label as get_slots/check_slots, for the final confirmation.
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):

@@ -96,6 +96,18 @@ KNOWN_CALLER = {
 }
 
 
+def _check_sms_confirmation_booking(fake, notes) -> list[str]:
+    if len(fake.created) != 1:
+        return [f"expected exactly 1 booking, got {len(fake.created)}"]
+    b = fake.created[0]
+    failures = []
+    if b["email"]:
+        failures.append(f"email {b['email']!r} — caller never gave one and none was needed")
+    if "40987654" not in "".join(ch for ch in b["phone"] if ch.isdigit()):
+        failures.append(f"phone {b['phone']!r}")
+    return failures
+
+
 def _check_known_customer_booking(fake, notes) -> list[str]:
     if len(fake.created) != 1:
         return [f"expected exactly 1 booking, got {len(fake.created)}"]
@@ -316,5 +328,32 @@ SCENARIOS: list[Scripted | Simulated] = [
         ),
         check=_check_known_customer_booking,
         context=KNOWN_CALLER,
+    ),
+    Simulated(
+        "sl-sms-potrdilo-brez-emaila",
+        "sl",
+        persona=(
+            "Si Marko Kranjc in kličeš v kozmetični salon s skrito številko. "
+            "Želiš masažo naslednji teden v ponedeljek dopoldan, vseeno ti je, "
+            "kdo. Telefonska številka: 040 987 654. Če te vprašajo za e-naslov, "
+            "reci, da ga nočeš dati. Izberi prvo ponujeno uro in potrdi."
+        ),
+        check=_check_sms_confirmation_booking,
+        context={"sms_confirmation": True},
+    ),
+    Scripted(
+        "sl-odpoved-brez-orodja",
+        "sl",
+        [
+            Turn(
+                "Rada bi odpovedala jutrišnji termin.",
+                judge=(
+                    "Does not claim to have cancelled anything. Offers to pass "
+                    "the request on to the owner (or asks for details to do "
+                    "so), since it cannot cancel appointments itself."
+                ),
+                forbid_tools=("create_booking",),
+            )
+        ],
     ),
 ]

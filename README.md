@@ -88,6 +88,18 @@ full run costs a few cents. Results go to `evals/results/` (gitignored) for
 before/after comparisons. Every real-call regression worth never seeing again
 belongs in `evals/scenarios.py`.
 
+## n8n workflows this depends on
+
+| Workflow | ID | What the worker uses |
+|---|---|---|
+| Jedroplus Booking v2 | `XdrhufTyyypyYtey` | `init`, `slots`, `check-slots`, `create` (`source: "receptionist"` — email optional for this source only, since 2026-10-16) |
+| Receptionist+ – SMS stranki | `fjIke0d2r1d2m0Cm` | webhook `receptionist-sms`: booking confirmation and portal link SMS; HMAC enforced; quota and `message_outbox` like every other SMS |
+| sms-send (Jedro+) | `HC3rVZ6tVxp2YyVs` | called by the workflow above (BulkGate) |
+
+Backups of every workflow before a change: `~/n8n-backup/<timestamp>-<topic>/`.
+`scripts/send_test_sms.py --phone +386...` sends one real SMS through the
+whole chain (uses SMS quota).
+
 ## Deploy
 
 ```bash

@@ -63,9 +63,11 @@ from agent.business_info import (
     parse_urnik,
     render_business_block,
     render_caller_block,
+    render_confirmation_line,
 )
 from agent.call_notes import CallNotes
 from agent.call_summary import summarize_call
+from agent.sms_client import booking_confirmation_text, send_sms
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -553,6 +555,7 @@ def _build_system_prompt(
     instructions: str | None = None,
     caller_phone: str | None = None,
     customer: dict | None = None,
+    sms_confirmation: bool = False,
 ) -> str:
     static_prompt = STATIC_PROMPT_EN if language == "en" else STATIC_PROMPT_SL
     logger.info(
@@ -570,6 +573,7 @@ def _build_system_prompt(
     if business_block:
         parts.append(business_block)
     parts.append(render_caller_block(caller_phone, customer, language))
+    parts.append(render_confirmation_line(sms_confirmation, language))
     return "\n\n".join(parts)
 
 
@@ -736,6 +740,7 @@ def build_receptionist_agent(
     instructions: str | None = None,
     caller_phone: str | None = None,
     customer: dict | None = None,
+    sms_confirmation: bool = False,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -751,6 +756,7 @@ def build_receptionist_agent(
             instructions=instructions,
             caller_phone=caller_phone,
             customer=customer,
+            sms_confirmation=sms_confirmation,
         ),
         tools=[
             booking_tools.get_slots,
@@ -1771,6 +1777,10 @@ async def entrypoint(ctx: JobContext) -> None:
         if call_end_state["logged_directly"]:
             return
         booking_tools = booking_ref["tools"]
+        if booking_tools is not None and booking_tools.background_tasks:
+            # A confirmation SMS still in flight: let it finish (it may set
+            # a note for the owner) before the call row is written.
+            await asyncio.wait(list(booking_tools.background_tasks), timeout=10.0)
         created_termin_id = booking_tools.created_termin_id if booking_tools else None
         if booking_tools is not None and booking_tools.owner_followup_reason:
             notes.request_callback(booking_tools.owner_followup_reason)
@@ -1968,7 +1978,44 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         return
 
-    booking_tools = BookingTools(company_slug, company_data, language=language)
+    # Default on when the column isn't there yet is deliberately NOT done:
+    # without phase7 the setting is unknown, and asking for an email (the
+    # old behaviour) is the safe choice until SMS is confirmed to work.
+    sms_confirmation = bool((settings_row or {}).get("sms_confirmation", False))
+
+    async def _send_confirmation(booking: dict) -> None:
+        services = {str(s["id"]): s["naziv"] for s in company_data.get("services", [])}
+        text = booking_confirmation_text(
+            company_name=company_data["company"]["naziv"],
+            service_names=[services.get(str(i), "") for i in booking["service_ids"]],
+            date=booking["date"],
+            time_hhmm=booking["time"],
+            language=language,
+        )
+        result = await send_sms(
+            kind="confirmation",
+            company_slug=company_slug,
+            phone=normalize_phone(booking["phone"]) or booking["phone"],
+            text=text,
+            email=booking.get("email") or "",
+            termin_id=booking.get("terminId"),
+            call_id=call_id,
+        )
+        if not result.get("success"):
+            # The caller was told a text is coming; make sure the owner
+            # knows it didn't go, so they can confirm another way.
+            if not notes.message:
+                notes.message = (
+                    f"SMS potrdilo za rezervacijo {booking.get('terminId')} ni bilo "
+                    f"poslano ({result.get('error')}). Potrdite stranki drugače."
+                )
+
+    booking_tools = BookingTools(
+        company_slug,
+        company_data,
+        language=language,
+        on_booked=_send_confirmation if sms_confirmation else None,
+    )
     booking_ref["tools"] = booking_tools
 
     # Caller hung up while the disclosure was playing / init was running.
@@ -1986,9 +2033,44 @@ async def entrypoint(ctx: JobContext) -> None:
         profile, customer = None, None
     call_profile["profile"] = profile
 
+    customer_email = ((customer or {}).get("Email stranke") or "").strip()
+
+    @function_tool
+    async def send_manage_link(context: RunContext) -> dict:
+        """Text the caller a link to the customer portal, where they can
+        cancel or move their existing appointment themselves. Only after
+        they said yes to getting it. The link is valid for one hour."""
+        result = await send_sms(
+            kind="manage_link",
+            company_slug=company_slug,
+            phone=caller_phone or "",
+            email=customer_email,
+            call_id=call_id,
+        )
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": (
+                    "Sent. Tell the caller the text is on its way and that the "
+                    "link works for one hour."
+                ),
+            }
+        return {
+            "success": False,
+            "error": result.get("error"),
+            "message": (
+                "The text could not be sent. Apologise briefly and offer "
+                "take_message so the owner sorts out the appointment."
+            ),
+        }
+
     extra_tools = [end_call_abusive]
     if transfer_enabled:
         extra_tools.insert(0, transfer_to_person)
+    # The portal logs customers in by email, so the link only works for a
+    # known customer (caller ID matched "Stranke") with an email on file.
+    if caller_phone and customer_email:
+        extra_tools.insert(0, send_manage_link)
     receptionist_agent = build_receptionist_agent(
         company_data,
         language,
@@ -2000,6 +2082,7 @@ async def entrypoint(ctx: JobContext) -> None:
         instructions=(settings_row or {}).get("instructions"),
         caller_phone=caller_phone,
         customer=customer,
+        sms_confirmation=sms_confirmation,
     )
     agent_ref["receptionist"] = receptionist_agent
 
