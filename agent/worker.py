@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 import uuid
@@ -33,7 +34,14 @@ from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
-from livekit.plugins import elevenlabs, soniox
+from livekit.agents import JobProcess
+from livekit.agents.voice import room_io
+from livekit.agents.voice.background_audio import (
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
+)
+from livekit.plugins import elevenlabs, noise_cancellation, silero, soniox
 
 from agent.booking_client import BookingError, init_company
 from agent.call_policy import (
@@ -51,12 +59,7 @@ from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL
 from agent.supabase_client import SupabaseClient
 from agent.call_notes import CallNotes
 from agent.llm_factory import LLMConfig, build_llm
-from agent.tools import (
-    CHECK_SLOTS_FILLER_TEXT,
-    CREATE_BOOKING_FILLER_TEXT,
-    GET_SLOTS_FILLER_TEXT,
-    BookingTools,
-)
+from agent.tools import BookingTools
 
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
@@ -158,32 +161,39 @@ SIP_CALLER_NUMBER_ATTR = "sip.phoneNumber"
 # call), so this only bounds a pathological case.
 PARTICIPANT_WAIT_SEC = 5.0
 
-# Generic filler (any slow turn, not just the three booking tool calls — see
-# the entrypoint's _generic_filler_loop). Set above create_booking's own
-# filler delay (4.5s) so create_booking's specific tuned wording ("Samo
-# trenutek, urejam rezervacijo...") still gets first chance to fire on that
-# path — the most consequential moment (a real booking in progress)  keeps
-# its specific message; this generic one is a catch-all for everything else,
-# including plain conversational turns which previously had no filler.
-GENERIC_FILLER_PHRASES = {
-    # Kept in sync with STATIC_PROMPT_SL's approved waiting-phrase rule
-    # ("Samo trenutek" / "trenutek prosim" are the correct forms) — these are
-    # spoken by code rather than the model, so nothing enforces that
-    # automatically. "En moment..." was removed 2026-09-08: it's a Germanism,
-    # not one of the approved forms, and callers were hearing it from the
-    # filler path while the model itself was forbidden to say it.
-    "sl": [
-        "Samo trenutek...",
-        "Trenutek, prosim...",
-        "Samo sekundo...",
-    ],
-    "en": [
-        "One moment...",
-        "Just a second...",
-        "Give me a moment...",
-    ],
+# Slow turns (2026-10-16). The old generic filler waited for the session to
+# go idle and spoke "Samo trenutek..." if nothing happened for 5s — but
+# "thinking" counted as activity, so it never fired on a slow LLM turn, and
+# DID fire whenever the CALLER was silent for 5s (e.g. thinking about which
+# day suits them), telling a silent caller "one moment". It is gone. A slow
+# model turn is now covered by the typing sound (BACKGROUND AUDIO below),
+# which LiveKit plays for exactly as long as the agent is "thinking"; a
+# spoken line can't be used there, because session.say() queues behind the
+# reply being generated and would be heard after it. Tool calls keep their
+# own spoken fillers (tools.py), which are timed correctly by with_filler.
+
+# Caller silence (2026-10-16). LiveKit marks the user "away" after this many
+# seconds in which neither side speaks. First time: check the line is still
+# there; second time in a row: close politely. Long enough that a caller
+# looking something up (a diary, a card) isn't nagged.
+CALLER_SILENCE_SEC = 9.0
+STILL_THERE_PHRASES = {
+    "sl": ["Ste še na liniji?", "Halo, me slišite?"],
+    "en": ["Are you still there?", "Hello, can you hear me?"],
 }
-GENERIC_FILLER_DELAY = 5.0
+SILENCE_CLOSING_MESSAGE = {
+    "sl": "Žal vas ne slišim več. Pokličite nas, prosim, še enkrat. Lep dan.",
+    "en": "I'm afraid I can't hear you anymore. Please call us again. Have a good day.",
+}
+
+# Background audio (2026-10-16): keyboard typing while the agent is
+# "thinking" (LLM or tool call), so a pause sounds like someone typing into
+# a calendar rather than a dropped line, and optionally a quiet office
+# ambience under the whole call. Volumes are low on purpose — on an 8 kHz
+# phone line anything louder competes with speech. Switch off with
+# THINKING_SOUND=off / AMBIENT_SOUND=off in the env.
+THINKING_SOUND_VOLUME = 0.55
+AMBIENT_SOUND_VOLUME = 0.12
 
 # Rambling-caller redirect (2026-09-08). In "stt" turn detection a turn ends
 # on SILENCE, so a caller who monologues without pausing never produces an
@@ -246,27 +256,35 @@ REDIRECT_PHRASES = {
 PROMISE_CUE_PATTERNS = {
     "sl": re.compile(
         r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
-        r"|poskušam\b|počakajte",
+        r"|poskušam\b|počakajte|pogledam\b|vpisujem\b|vas vpišem\b",
         re.IGNORECASE,
     ),
     "en": re.compile(
         r"\b(?:one|just a|give me a) moment\b|\bhold on\b|\bplease wait\b"
-        r"|\blet me check\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
+        r"|\blet me (?:check|look|see)\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
         r"|\bi'?m (?:checking|processing|trying)\b|\bprocessing\b|\btrying\b",
         re.IGNORECASE,
     ),
 }
 PROMISE_WATCHDOG_TIMEOUT_SEC = 12.0
+# On the first silent promise the model is nudged to follow through (a reply
+# is generated with PROMISE_RECOVERY_INSTRUCTIONS); only if that also leads
+# nowhere within another window is the call closed as a technical failure.
+# Before 2026-10-16 the first silent promise closed the call outright.
+PROMISE_RECOVERY_INSTRUCTIONS = (
+    "You told the caller you would check or do something, then stopped "
+    "without doing it. Do it now by calling the right tool. If you can't, "
+    "tell the caller briefly and honestly what you can do instead."
+)
 
 # Our own filler utterances also match PROMISE_CUE_PATTERNS by design, but
 # they're paired with an actual in-flight tool call that already has its own
 # real timeout (up to 45s for create_booking) — excluded so the watchdog's
 # much shorter window doesn't kill a call that's legitimately still running.
+# Tool fillers are now built per call (they name the day), so those are
+# checked against BookingTools.spoken_fillers at runtime instead.
 _KNOWN_FILLER_TEXTS = frozenset(
-    [p for phrases in GENERIC_FILLER_PHRASES.values() for p in phrases]
-    + [p for phrases in GET_SLOTS_FILLER_TEXT.values() for p in phrases]
-    + [p for phrases in CHECK_SLOTS_FILLER_TEXT.values() for p in phrases]
-    + [p for phrases in CREATE_BOOKING_FILLER_TEXT.values() for p in phrases]
+    p for phrases in STILL_THERE_PHRASES.values() for p in phrases
 )
 
 # Post-farewell goodbye loop (2026-09-21). Observed: after "Nasvidenje!" the
@@ -602,6 +620,10 @@ class ReceptionistAgent(Agent):
     async def on_enter(self) -> None:
         self.entered.set()
 
+    @property
+    def has_said_goodbye(self) -> bool:
+        return self._farewell_count > 0
+
     def note_assistant_message(self, text: str) -> None:
         if FAREWELL_PATTERNS[self._language].search(text):
             self._farewell_count += 1
@@ -795,6 +817,54 @@ async def _insert_call_logged(supabase: SupabaseClient, row: dict) -> None:
         await supabase.insert_call(row)
     except Exception:
         logger.exception("failed to insert receptionist_calls row for call_id=%s", row.get("id"))
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in ("0", "off", "false", "no")
+
+
+def _room_options() -> room_io.RoomOptions:
+    """Noise cancellation on the caller's audio: LiveKit Cloud's BVC model
+    tuned for telephony (8 kHz, codec artefacts). It runs before VAD and STT,
+    so street noise, a TV or a hair dryer neither interrupts the agent nor
+    ends up in the transcript. NOISE_CANCELLATION=off disables it — e.g. if
+    the SIP trunk already applies its own (applying it twice degrades
+    speech)."""
+    if not _env_flag("NOISE_CANCELLATION"):
+        return room_io.RoomOptions()
+    return room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=noise_cancellation.BVCTelephony()
+        )
+    )
+
+
+async def _start_background_audio(ctx: JobContext, session: AgentSession) -> None:
+    """Typing while the agent thinks, optional quiet office ambience. Purely
+    cosmetic: any failure is logged and the call goes on without it."""
+    thinking = (
+        [
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=THINKING_SOUND_VOLUME, probability=0.6),
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=THINKING_SOUND_VOLUME, probability=0.4),
+        ]
+        if _env_flag("THINKING_SOUND")
+        else None
+    )
+    ambient = (
+        AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=AMBIENT_SOUND_VOLUME)
+        if _env_flag("AMBIENT_SOUND")
+        else None
+    )
+    if thinking is None and ambient is None:
+        return
+    try:
+        player = BackgroundAudioPlayer(ambient_sound=ambient, thinking_sound=thinking)
+        await player.start(room=ctx.room, agent_session=session)
+    except Exception:
+        logger.exception("background audio failed to start — continuing without it")
 
 
 async def _wait_for_caller(ctx: JobContext) -> rtc.RemoteParticipant | None:
@@ -1123,6 +1193,15 @@ async def entrypoint(ctx: JobContext) -> None:
         stt=_build_stt(settings, language),
         llm=_build_llm(settings),
         tts=_build_tts(settings, language),
+        # Silero VAD (2026-10-16, loaded once per process in prewarm): the
+        # caller starting to talk is detected from the audio itself, within
+        # a few hundred ms, instead of waiting for the STT's first words — so
+        # barge-in stops the agent sooner. Turn END is still decided by
+        # Soniox endpointing ("turn_detection": "stt" below); this only adds
+        # speech-start detection. Background noise that VAD would mistake for
+        # speech is cut first by BVCTelephony (room options at start()).
+        vad=ctx.proc.userdata.get("vad"),
+        user_away_timeout=CALLER_SILENCE_SEC,
         turn_handling={
             "turn_detection": "stt",
             "interruption": InterruptionOptions(enabled=True),
@@ -1238,7 +1317,6 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("close")
     def _on_close(event) -> None:
         call_ended_at["value"] = datetime.now(timezone.utc)
-        generic_filler_task.cancel()
 
     # The real ReceptionistAgent needs company data (prompt + tools), which
     # now arrives AFTER the session has started and the disclosure is already
@@ -1270,20 +1348,61 @@ async def entrypoint(ctx: JobContext) -> None:
         user_turn_watch["last_log_at"] = 0.0
         user_turn_watch["peak_words"] = 0
 
-    _agent_active = asyncio.Event()
-
     def _on_agent_state_changed(event) -> None:
-        if event.new_state in ("speaking", "thinking"):
-            _agent_active.set()
         if event.new_state == "speaking":
             # The caller has been answered, so the current turn is no longer an
             # unanswered monologue — start counting afresh. Mirrors the SDK's
             # own rule that the turn tracker resets when the agent speaks.
             _reset_user_turn_watch("agent spoke")
 
+    # Caller silence: LiveKit sets the user "away" after CALLER_SILENCE_SEC
+    # with neither side speaking. Once: "Ste še na liniji?". Twice in a row:
+    # a short closing and hang up — before this a silent line (caller walked
+    # away, call dropped on their side without a SIP BYE) stayed open, and
+    # billed, until something upstream timed out.
+    silence_state = {"count": 0}
+
     def _on_user_state_changed(event) -> None:
         if event.new_state == "speaking":
-            _agent_active.set()
+            silence_state["count"] = 0
+            return
+        if event.new_state != "away":
+            return
+        receptionist = agent_ref["receptionist"]
+        if receptionist is None or "value" in call_ended_at:
+            return
+        if promise_state["pending"]:
+            # The agent promised to check something and went quiet; the
+            # promise watchdog handles that. "Ste še na liniji?" here would
+            # blame the caller and also cancel the watchdog.
+            return
+        silence_state["count"] += 1
+        asyncio.create_task(
+            _handle_caller_silence(silence_state["count"], receptionist),
+            name="caller_silence",
+        )
+
+    async def _handle_caller_silence(count: int, receptionist) -> None:
+        if receptionist.has_said_goodbye:
+            # Goodbye already said and the caller just hasn't hung up: asking
+            # "are you still there?" now would reopen a finished call.
+            logger.info("caller silent after goodbye — closing")
+            await session.aclose()
+            return
+        if count == 1:
+            phrases = STILL_THERE_PHRASES[language]
+            logger.info("caller silent %.0fs — checking the line", CALLER_SILENCE_SEC)
+            session.say(phrases[0])
+            return
+        logger.info("caller silent again — closing the call")
+        try:
+            await asyncio.wait_for(
+                session.say(SILENCE_CLOSING_MESSAGE[language], allow_interruptions=False),
+                timeout=10.0,
+            )
+        except Exception:
+            logger.exception("failed to speak silence closing message")
+        await session.aclose()
 
     session.on("agent_state_changed", _on_agent_state_changed)
     session.on("user_state_changed", _on_user_state_changed)
@@ -1360,36 +1479,6 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
             name="rambling_redirect",
         )
-
-    # Generic filler for ANY slow turn, not just the three booking tool calls
-    # (get_slots/check_slots/create_booking already have their own
-    # context.with_filler() in tools.py, tuned per call — this is a separate,
-    # session-wide safety net for plain conversational turns, which had no
-    # filler at all before this and left callers in dead air on a slow
-    # LLM/TTS turn, e.g. during an Anthropic degradation). Mirrors the SDK's
-    # own private _FillerScheduler (voice/filler_scheduler.py) — wait for the
-    # session to go idle, then wait up to GENERIC_FILLER_DELAY for the agent
-    # or caller to become active again; if neither happens, speak a short
-    # filler and repeat. Built on public session.on()/wait_for_idle()/say()
-    # rather than the private class so it doesn't depend on SDK internals.
-    async def _generic_filler_loop() -> None:
-        phrases = GENERIC_FILLER_PHRASES[language]
-        step = 0
-        while True:
-            await session.wait_for_idle()
-            _agent_active.clear()
-            try:
-                await asyncio.wait_for(_agent_active.wait(), timeout=GENERIC_FILLER_DELAY)
-                continue  # agent/caller became active in time — no filler needed
-            except asyncio.TimeoutError:
-                pass
-            phrase = phrases[step % len(phrases)]
-            step += 1
-            session.say(phrase)
-
-    generic_filler_task = asyncio.create_task(
-        _generic_filler_loop(), name="generic_filler_loop"
-    )
 
     # Latency investigation (2026-08-14 voice test): aggregate turn-latency
     # numbers alone can't say whether time is going to STT endpointing, LLM
@@ -1478,6 +1567,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # the utterance's own "speaking" state doesn't immediately satisfy its
     # own watchdog. Cancelled by any subsequent agent/user activity.
     _activity_since_promise = asyncio.Event()
+    # pending: a promise is being watched right now (the caller-silence
+    # handler stays out of it — the silence is ours, not the caller's).
+    promise_state = {"pending": False, "recovery_used": False}
 
     def _on_agent_state_changed_watchdog(event) -> None:
         if event.new_state in ("thinking", "speaking"):
@@ -1487,6 +1579,10 @@ async def entrypoint(ctx: JobContext) -> None:
             if (
                 text
                 and text not in _KNOWN_FILLER_TEXTS
+                and not (
+                    booking_ref["tools"] is not None
+                    and text in booking_ref["tools"].spoken_fillers
+                )
                 and PROMISE_CUE_PATTERNS[language].search(text)
             ):
                 _activity_since_promise.clear()
@@ -1497,21 +1593,47 @@ async def entrypoint(ctx: JobContext) -> None:
             _activity_since_promise.set()
 
     async def _watch_for_promise_followup() -> None:
+        promise_state["pending"] = True
         try:
             await asyncio.wait_for(
                 _activity_since_promise.wait(), timeout=PROMISE_WATCHDOG_TIMEOUT_SEC
             )
+            return
         except asyncio.TimeoutError:
-            if provider_error_state["degrading"]:
-                return
-            logger.error(
-                "promise watchdog fired: agent said %r and produced no "
-                "follow-up within %.0fs",
+            pass
+        finally:
+            promise_state["pending"] = False
+        if provider_error_state["degrading"]:
+            return
+        if not promise_state["recovery_used"]:
+            # First stall this call: nudge the model to follow through
+            # instead of hanging up on the caller. If the LLM itself is down
+            # this reply errors out and _on_session_error closes the call.
+            promise_state["recovery_used"] = True
+            logger.warning(
+                "promise watchdog: agent said %r and stopped for %.0fs — "
+                "asking the model to follow through",
                 last_assistant_text["value"],
                 PROMISE_WATCHDOG_TIMEOUT_SEC,
             )
-            provider_error_state["degrading"] = True
-            await _degrade_and_close()
+            _activity_since_promise.clear()
+            session.generate_reply(instructions=PROMISE_RECOVERY_INSTRUCTIONS)
+            try:
+                await asyncio.wait_for(
+                    _activity_since_promise.wait(), timeout=PROMISE_WATCHDOG_TIMEOUT_SEC
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if provider_error_state["degrading"]:
+                return
+        logger.error(
+            "promise watchdog fired: agent said %r and produced no follow-up "
+            "(recovery already tried) — closing as a technical failure",
+            last_assistant_text["value"],
+        )
+        provider_error_state["degrading"] = True
+        await _degrade_and_close()
 
     session.on("agent_state_changed", _on_agent_state_changed_watchdog)
     session.on("user_state_changed", _on_user_state_changed_watchdog)
@@ -1600,7 +1722,6 @@ async def entrypoint(ctx: JobContext) -> None:
         booking_tools = booking_ref["tools"]
         if not (booking_tools and booking_tools.created_termin_id):
             notes.request_callback("Klic je dosegel časovno omejitev, preden je bilo vse urejeno.")
-        generic_filler_task.cancel()
         try:
             await asyncio.wait_for(
                 session.say(TIME_LIMIT_CLOSING_MESSAGE[language], allow_interruptions=False),
@@ -1637,8 +1758,10 @@ async def entrypoint(ctx: JobContext) -> None:
                 text, "before agent ready"
             )
         ),
+        room_options=_room_options(),
     )
     logger.info("bootstrap: session started t=+%.3fs", _t())
+    await _start_background_audio(ctx, session)
     disclosure_handle = session.say(
         AI_DISCLOSURE[language].strip(), allow_interruptions=False
     )
@@ -1739,10 +1862,22 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("greeting delivered, conversation active")
 
 
+def prewarm(proc: JobProcess) -> None:
+    """Runs once per worker process, before any call: loading Silero takes
+    ~1s and must not land on a caller's first second of silence."""
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        # Without VAD the call still works exactly as before (STT-only
+        # speech detection) — never refuse calls over it.
+        logger.exception("failed to load Silero VAD — running without it")
+
+
 if __name__ == "__main__":
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name="receptionistplus-worker",
         )
     )

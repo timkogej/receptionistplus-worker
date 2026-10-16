@@ -24,10 +24,15 @@ Dashboard, Stripe checkout and the credits UI live in the main Jedro+ repo
    the company block (`agent/company_prompt.py`).
 5. **Tools.** `get_slots`, `check_slots`, `create_booking` (booking-v2), `take_message`
    (message / callback request for the owner), `end_call_abusive`.
-6. **Limits.** A call runs at most 15 minutes, less if the balance can't cover it
+6. **Audio.** Caller audio goes through LiveKit noise cancellation (BVCTelephony)
+   and Silero VAD (fast barge-in); turn end is Soniox endpointing. While the
+   agent thinks you hear typing; tool calls that run long get a short spoken
+   line naming what is being checked. 9 s of silence → "Ste še na liniji?",
+   another 9 s → polite close.
+7. **Limits.** A call runs at most 15 minutes, less if the balance can't cover it
    (`agent/call_policy.py`); the caller hears a closing line and the owner gets a
    callback request.
-7. **After the call.** Credits are deducted atomically (`receptionist_deduct_credits`),
+8. **After the call.** Credits are deducted atomically (`receptionist_deduct_credits`),
    and a `receptionist_calls` row is written with outcome, transcript, caller number
    and any message. A database trigger notifies the owner about messages.
 
@@ -113,6 +118,9 @@ script** — run new files from `migrations/` in the Supabase SQL editor first.
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes | receptionist_* tables |
 | `BOOKING_V2_HMAC_SECRET` | yes in prod | signs booking-v2 requests |
 | `COMPANY_SLUG` | no | fallback company for numbers with no mapping |
+| `NOISE_CANCELLATION` | no (on) | BVCTelephony on caller audio; `off` if the trunk already does it |
+| `THINKING_SOUND` | no (on) | keyboard typing while the agent thinks |
+| `AMBIENT_SOUND` | no (on) | quiet office ambience under the call |
 | `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` | no | only for `tools/tts_ab.py` |
 
 To give a company a number, add a row (E.164) — or set `{"company_slug": "..."}`
