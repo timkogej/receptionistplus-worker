@@ -115,9 +115,11 @@ SCENARIOS: list[Scripted | Simulated] = [
             Turn(
                 "Koliko stane pedikura?",
                 judge=(
-                    "Says the pedicure costs thirty euros, with the number "
-                    "written as a word (trideset), not digits, and invents "
-                    "nothing beyond price and duration."
+                    "Company data: Pedikura costs 30 EUR and takes 45 minutes. "
+                    "The reply gives the price as 'trideset evrov' (a word, not "
+                    "digits); mentioning the 45-minute duration or offering to "
+                    "book is fine. Fail only if it states something that "
+                    "contradicts or goes beyond that data."
                 ),
             )
         ],
@@ -149,7 +151,9 @@ SCENARIOS: list[Scripted | Simulated] = [
                 judge=(
                     "Tells the caller that Maja does not do head massage and "
                     "says who does (Luka is one of them), asking which they'd "
-                    "like or whether anyone is fine. Does not accept Maja."
+                    "like or whether anyone is fine. Does not accept Maja for "
+                    "head massage (offering Maja for a service she does "
+                    "perform is fine)."
                 ),
                 forbid_tools=("create_booking", "check_slots"),
             )
@@ -163,10 +167,13 @@ SCENARIOS: list[Scripted | Simulated] = [
                 "Imate jutri dopoldan prosto za pedikuro? Vseeno mi je, kdo.",
                 expect_tools=("get_slots",),
                 judge=(
-                    "Answers about availability only from a slots lookup; "
-                    "either names a few concrete morning times or says "
-                    "plainly that tomorrow is closed/full and offers another "
-                    "day. Times are spoken as words."
+                    "The agent has looked up tomorrow's slots (the agent's "
+                    "own date table says which date and weekday tomorrow is; "
+                    "naming it by weekday and date is correct). The reply "
+                    "either names a few concrete morning clock times, or says "
+                    "plainly that tomorrow morning is closed/full and offers "
+                    "another option. Vague periods like 'early morning' "
+                    "without any clock time fail. Times are spoken as words."
                 ),
             )
         ],
@@ -177,7 +184,10 @@ SCENARIOS: list[Scripted | Simulated] = [
         [
             Turn(
                 "Hi, how much is a manicure with polish?",
-                judge="Replies in English that it costs fifty euros, written as words.",
+                judge=(
+                    "Replies in English that it costs fifty euros, written as "
+                    "words. Mentioning the duration or offering to book is fine."
+                ),
             )
         ],
     ),

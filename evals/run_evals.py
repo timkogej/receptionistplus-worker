@@ -6,6 +6,8 @@ evals/fake_booking.py — nothing is ever booked for real.
 
     .venv/bin/python -m evals.run_evals                       # all, current model
     .venv/bin/python -m evals.run_evals --model claude-haiku-4-5 --repeat 3
+    .venv/bin/python -m evals.run_evals --model claude-haiku-5-5@medium
+    .venv/bin/python -m evals.run_evals --model openai:gpt-5.4-mini
     .venv/bin/python -m evals.run_evals --only sl-vikanje,en-price
 
 Needs ANTHROPIC_API_KEY (read from .env if present). Results are printed and
@@ -16,6 +18,7 @@ comparisons (e.g. a model or prompt change).
 from __future__ import annotations
 
 import argparse
+import re
 import asyncio
 import json
 import logging
@@ -30,6 +33,7 @@ from livekit.agents.voice.run_result import ChatMessageEvent, FunctionCallEvent
 from livekit.plugins import anthropic
 
 from agent.call_notes import CallNotes
+from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
 from agent.worker import build_receptionist_agent
 from evals.fake_booking import FakeBooking
@@ -39,8 +43,11 @@ ROOT = Path(__file__).resolve().parent
 FIXTURE = ROOT / "fixtures" / "company_jedroplus.json"
 RESULTS = ROOT / "results"
 
-DEFAULT_MODEL = "claude-haiku-4-5"  # what production runs today (worker._build_llm)
-DEFAULT_JUDGE = "claude-haiku-4-5"
+# "<model>[@effort]"; "openai:<model>" for OpenAI. Same strings as LLM_MODEL.
+DEFAULT_MODEL = "claude-haiku-5-5@low"
+# A judge that misreads Slovenian passes or fails the wrong things (Haiku 4.5
+# read "petinštirideset minut" as "thirty-four minutes").
+DEFAULT_JUDGE = "claude-haiku-5-5@medium"
 DEFAULT_CALLER = "claude-haiku-4-5"
 
 CALLER_RULES = (
@@ -48,6 +55,29 @@ CALLER_RULES = (
     "stavek ali dva, brez opisov dejanj. Ko je rezervacija potrjena in se "
     "receptorka poslovi, odgovori natanko: KONEC"
 )
+
+
+# Deterministic checks on every Slovenian reply, independent of the judge.
+# "štirideset pet" is how an English-thinking model builds 45; Slovenian puts
+# the unit first and joins it: "petinštirideset". Same for every tens word.
+_TENS = "dvajset|trideset|štirideset|petdeset|šestdeset|sedemdeset|osemdeset|devetdeset"
+_UNITS = "ena|en|dva|dve|tri|štiri|pet|šest|sedem|osem|devet"
+SL_TEXT_CHECKS = [
+    (re.compile(rf"\b(?:{_TENS})\s+(?:in\s+)?(?:{_UNITS})\b", re.I),
+     "number word in English order (e.g. 'štirideset pet' instead of 'petinštirideset')"),
+    (re.compile(r"\d"), "digits in spoken text (TTS reads them badly)"),
+    (re.compile(r"[*#]|^\s*-\s", re.M), "markdown in spoken text"),
+]
+
+
+def _text_failures(language: str, turn_no: int, text: str) -> list[str]:
+    if language != "sl":
+        return []
+    return [
+        f"turn {turn_no}: {why}: {m.group(0)!r}"
+        for pattern, why in SL_TEXT_CHECKS
+        if (m := pattern.search(text))
+    ]
 
 
 def _load_env() -> None:
@@ -68,7 +98,8 @@ def _build(language: str, model: str):
     agent = build_receptionist_agent(
         company, language, booking_tools=booking_tools, notes=notes
     )
-    llm = anthropic.LLM(model=model, caching="ephemeral")
+    name, _, effort = model.partition("@")
+    llm = build_single_llm(name, effort=effort or None)
     return agent, llm, booking_tools, notes
 
 
@@ -105,6 +136,7 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
                 names = _tool_names(result)
                 reply = _assistant_text(result)
                 transcript.append({"user": turn.user, "tools": names, "agent": reply})
+                failures += _text_failures(sc.language, n, reply)
                 for t in turn.expect_tools:
                     if t not in names:
                         failures.append(f"turn {n}: expected tool {t}, got {names}")
@@ -133,6 +165,7 @@ async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
     caller_msgs: list[dict] = [{"role": "user", "content": "(telefon zazvoni, receptorka se oglasi)"}]
     transcript: list[dict] = []
     user_line = sc.opening
+    text_failures: list[str] = []
     with fake.installed():
         async with llm, AgentSession(llm=llm) as session:
             await session.start(agent)
@@ -141,6 +174,7 @@ async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
                 result = await session.run(user_input=user_line)
                 reply = _assistant_text(result) or "(tišina)"
                 transcript.append({"user": user_line, "tools": _tool_names(result), "agent": reply})
+                text_failures += _text_failures(sc.language, len(transcript), reply)
                 caller_msgs.append({"role": "user", "content": reply})
                 if fake.created and any(
                     w in reply.lower() for w in ("lep dan", "nasvidenje", "goodbye", "have a")
@@ -155,7 +189,7 @@ async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
                 user_line = "".join(b.text for b in resp.content if b.type == "text").strip()
                 if user_line == "KONEC":
                     break
-    return {"failures": sc.check(fake, notes), "transcript": transcript}
+    return {"failures": sc.check(fake, notes) + text_failures, "transcript": transcript}
 
 
 async def main() -> int:
@@ -171,7 +205,8 @@ async def main() -> int:
     logging.basicConfig(level=getattr(logging, os.environ.get("EVAL_LOG", "WARNING")))
     only = {s for s in args.only.split(",") if s}
     scenarios = [s for s in SCENARIOS if not only or s.id in only]
-    judge_llm = anthropic.LLM(model=args.judge)
+    judge_name, _, judge_effort = args.judge.partition("@")
+    judge_llm = build_single_llm(judge_name, effort=judge_effort or None)
 
     rows = []
     for sc in scenarios:
@@ -196,7 +231,7 @@ async def main() -> int:
 
     RESULTS.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_path = RESULTS / f"{stamp}-{args.model}.json"
+    out_path = RESULTS / f"{stamp}-{args.model.replace(':', '_').replace('@', '_')}.json"
     out_path.write_text(
         json.dumps(
             {"model": args.model, "judge": args.judge, "caller": args.caller, "results": rows},
