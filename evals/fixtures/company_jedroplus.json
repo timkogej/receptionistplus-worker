@@ -1,0 +1,388 @@
+{
+ "success": true,
+ "employees_ui": [
+  {
+   "id": "42",
+   "label": "Gal Sitar",
+   "subtitle": "Vodja marketinga",
+   "initials": "GS"
+  },
+  {
+   "id": "9",
+   "label": "Rok Zupan",
+   "subtitle": "Specialist",
+   "initials": "RZ"
+  },
+  {
+   "id": "21",
+   "label": "Luka Dobrovoljec",
+   "subtitle": "Specialist",
+   "initials": "LD"
+  },
+  {
+   "id": "45",
+   "label": "Test onboarding 5",
+   "subtitle": "Zaposleni",
+   "initials": "TO"
+  },
+  {
+   "id": "33",
+   "label": "Sonja Mežnar",
+   "subtitle": "Specialist",
+   "initials": "SM"
+  },
+  {
+   "id": "24",
+   "label": "Nina Gabrovec",
+   "subtitle": "Specialistka",
+   "initials": "NG"
+  },
+  {
+   "id": "19",
+   "label": "Maja Hribar",
+   "subtitle": "Specialistka",
+   "initials": "MH"
+  }
+ ],
+ "categories": [
+  {
+   "id": "manikura",
+   "name": "Manikura",
+   "service_count": 1
+  },
+  {
+   "id": "masaza",
+   "name": "Masaža",
+   "service_count": 2
+  },
+  {
+   "id": "nega-obraza",
+   "name": "Nega obraza",
+   "service_count": 1
+  },
+  {
+   "id": "platisca",
+   "name": "Platišča",
+   "service_count": 2
+  },
+  {
+   "id": "pnevmatike",
+   "name": "Pnevmatike",
+   "service_count": 2
+  },
+  {
+   "id": "shranjevanje",
+   "name": "Shranjevanje",
+   "service_count": 1
+  }
+ ],
+ "serviceCategories": [
+  {
+   "id": "manikura",
+   "name": "Manikura",
+   "service_count": 1
+  },
+  {
+   "id": "masaza",
+   "name": "Masaža",
+   "service_count": 2
+  },
+  {
+   "id": "nega-obraza",
+   "name": "Nega obraza",
+   "service_count": 1
+  },
+  {
+   "id": "platisca",
+   "name": "Platišča",
+   "service_count": 2
+  },
+  {
+   "id": "pnevmatike",
+   "name": "Pnevmatike",
+   "service_count": 2
+  },
+  {
+   "id": "shranjevanje",
+   "name": "Shranjevanje",
+   "service_count": 1
+  }
+ ],
+ "services": [
+  {
+   "id": "27",
+   "rowId": 27,
+   "category_id": "masaza",
+   "naziv": "Refleksna masaža stopal",
+   "opis": "Masaža stopal, ki temelji na stimulaciji refleksnih točk.",
+   "trajanjeMin": 60,
+   "cena": 15,
+   "barva": "linear-gradient(135deg, #1E40AF 0%, #7C3AED 50%, #DB2777 100%)"
+  },
+  {
+   "id": "18",
+   "rowId": 18,
+   "category_id": "pnevmatike",
+   "naziv": "Pedikura",
+   "opis": "",
+   "trajanjeMin": 45,
+   "cena": 30,
+   "barva": "linear-gradient(135deg, #FB7185 0%, #F97316 50%, #FBBF24 100%)"
+  },
+  {
+   "id": "46",
+   "rowId": 46,
+   "category_id": "shranjevanje",
+   "naziv": "Shranjevanje pnevmatik",
+   "opis": "Nudimo varno in ustrezno hrambo pnevmatik do naslednje sezone, da ostanejo v dobrem stanju.",
+   "trajanjeMin": 5,
+   "cena": 15,
+   "barva": "linear-gradient(135deg, #6B7280 0%, #4B5563 50%, #1F2937 100%)"
+  },
+  {
+   "id": "42",
+   "rowId": 42,
+   "category_id": "pnevmatike",
+   "naziv": "Nega obraza",
+   "opis": "Hitro in strokovno menjamo letne, zimske ali celoletne pnevmatike glede na sezono in potrebe vozila.",
+   "trajanjeMin": 30,
+   "cena": 40,
+   "barva": "linear-gradient(135deg, #14B8A6 0%, #22C55E 50%, #84CC16 100%)"
+  },
+  {
+   "id": "17",
+   "rowId": 17,
+   "category_id": "manikura",
+   "naziv": "Manikura z lakiranjem",
+   "opis": "Klasična manikura z dodatnim nanosom laka po izbiri.",
+   "trajanjeMin": 60,
+   "cena": 50,
+   "barva": "linear-gradient(135deg, #F472B6 0%, #D946EF 50%, #8B5CF6 100%)"
+  },
+  {
+   "id": "19",
+   "rowId": 19,
+   "category_id": "platisca",
+   "naziv": "Masaža",
+   "opis": "Popravimo manjše poškodbe platišč.",
+   "trajanjeMin": 60,
+   "cena": 40,
+   "barva": "linear-gradient(135deg, #E9D5FF 0%, #A855F7 50%, #6B21A8 100%)"
+  },
+  {
+   "id": "41",
+   "rowId": 41,
+   "category_id": "nega-obraza",
+   "naziv": "Klasična nega obraza",
+   "opis": "Temeljita nega, ki vključuje čiščenje kože, piling, masko in zaključno kremo.",
+   "trajanjeMin": 60,
+   "cena": 40,
+   "barva": "linear-gradient(135deg, #F59E0B 0%, #EC4899 50%, #EF4444 100%)"
+  },
+  {
+   "id": "28",
+   "rowId": 28,
+   "category_id": "platisca",
+   "naziv": "Montaža platišč",
+   "opis": "Strokovno namestimo platišča na vozilo.",
+   "trajanjeMin": 75,
+   "cena": 60,
+   "barva": "linear-gradient(135deg, #F472B6 0%, #A855F7 50%, #06B6D4 100%)"
+  },
+  {
+   "id": "77",
+   "rowId": 77,
+   "category_id": "masaza",
+   "naziv": "Masaža glave",
+   "opis": "",
+   "trajanjeMin": 30,
+   "cena": 0,
+   "barva": "linear-gradient(135deg, #FECACA 0%, #EF4444 50%, #991B1B 100%)"
+  }
+ ],
+ "servicesByCategory": {
+  "masaza": [
+   {
+    "id": "77",
+    "rowId": 77,
+    "category_id": "masaza",
+    "naziv": "Masaža glave",
+    "opis": "",
+    "trajanjeMin": 30,
+    "cena": 0,
+    "barva": "linear-gradient(135deg, #FECACA 0%, #EF4444 50%, #991B1B 100%)"
+   },
+   {
+    "id": "27",
+    "rowId": 27,
+    "category_id": "masaza",
+    "naziv": "Refleksna masaža stopal",
+    "opis": "Masaža stopal, ki temelji na stimulaciji refleksnih točk.",
+    "trajanjeMin": 60,
+    "cena": 15,
+    "barva": "linear-gradient(135deg, #1E40AF 0%, #7C3AED 50%, #DB2777 100%)"
+   }
+  ],
+  "pnevmatike": [
+   {
+    "id": "42",
+    "rowId": 42,
+    "category_id": "pnevmatike",
+    "naziv": "Nega obraza",
+    "opis": "Hitro in strokovno menjamo letne, zimske ali celoletne pnevmatike glede na sezono in potrebe vozila.",
+    "trajanjeMin": 30,
+    "cena": 40,
+    "barva": "linear-gradient(135deg, #14B8A6 0%, #22C55E 50%, #84CC16 100%)"
+   },
+   {
+    "id": "18",
+    "rowId": 18,
+    "category_id": "pnevmatike",
+    "naziv": "Pedikura",
+    "opis": "",
+    "trajanjeMin": 45,
+    "cena": 30,
+    "barva": "linear-gradient(135deg, #FB7185 0%, #F97316 50%, #FBBF24 100%)"
+   }
+  ],
+  "shranjevanje": [
+   {
+    "id": "46",
+    "rowId": 46,
+    "category_id": "shranjevanje",
+    "naziv": "Shranjevanje pnevmatik",
+    "opis": "Nudimo varno in ustrezno hrambo pnevmatik do naslednje sezone, da ostanejo v dobrem stanju.",
+    "trajanjeMin": 5,
+    "cena": 15,
+    "barva": "linear-gradient(135deg, #6B7280 0%, #4B5563 50%, #1F2937 100%)"
+   }
+  ],
+  "manikura": [
+   {
+    "id": "17",
+    "rowId": 17,
+    "category_id": "manikura",
+    "naziv": "Manikura z lakiranjem",
+    "opis": "Klasična manikura z dodatnim nanosom laka po izbiri.",
+    "trajanjeMin": 60,
+    "cena": 50,
+    "barva": "linear-gradient(135deg, #F472B6 0%, #D946EF 50%, #8B5CF6 100%)"
+   }
+  ],
+  "platisca": [
+   {
+    "id": "19",
+    "rowId": 19,
+    "category_id": "platisca",
+    "naziv": "Masaža",
+    "opis": "Popravimo manjše poškodbe platišč.",
+    "trajanjeMin": 60,
+    "cena": 40,
+    "barva": "linear-gradient(135deg, #E9D5FF 0%, #A855F7 50%, #6B21A8 100%)"
+   },
+   {
+    "id": "28",
+    "rowId": 28,
+    "category_id": "platisca",
+    "naziv": "Montaža platišč",
+    "opis": "Strokovno namestimo platišča na vozilo.",
+    "trajanjeMin": 75,
+    "cena": 60,
+    "barva": "linear-gradient(135deg, #F472B6 0%, #A855F7 50%, #06B6D4 100%)"
+   }
+  ],
+  "nega-obraza": [
+   {
+    "id": "41",
+    "rowId": 41,
+    "category_id": "nega-obraza",
+    "naziv": "Klasična nega obraza",
+    "opis": "Temeljita nega, ki vključuje čiščenje kože, piling, masko in zaključno kremo.",
+    "trajanjeMin": 60,
+    "cena": 40,
+    "barva": "linear-gradient(135deg, #F59E0B 0%, #EC4899 50%, #EF4444 100%)"
+   }
+  ]
+ },
+ "employeesByServiceId": {
+  "14": [
+   "42",
+   "9",
+   "33",
+   "24",
+   "19"
+  ],
+  "17": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "18": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "19": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "27": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "28": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "41": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "42": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "46": [
+   "42",
+   "9",
+   "45",
+   "33",
+   "24",
+   "19"
+  ],
+  "77": [
+   "21",
+   "45"
+  ]
+ },
+ "company": {
+  "naziv": "Jedro Kozmetika",
+  "multiple_services_online": false
+ }
+}
