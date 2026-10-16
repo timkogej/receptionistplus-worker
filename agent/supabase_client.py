@@ -27,10 +27,12 @@ logger = logging.getLogger("receptionistplus-worker.supabase")
 # insert that PostgREST rejects for an unknown column is retried without
 # them, so a deploy that runs ahead of its migration still logs the call.
 PHASE6_CALL_COLUMNS = frozenset(
-    {"caller_phone", "dialed_number", "message", "callback_requested", "summary"}
+    {"caller_phone", "dialed_number", "message", "callback_requested", "summary", "language"}
 )
 
-_SETTINGS_BASE = "company_slug,enabled,low_balance_threshold,language,greeting_text"
+_SETTINGS_BASE = (
+    "company_slug,enabled,low_balance_threshold,language,greeting_text,detect_caller_language"
+)
 _SETTINGS_PHASE7 = (
     _SETTINGS_BASE + ",instructions,transfer_enabled,transfer_number,sms_confirmation"
 )
@@ -171,6 +173,30 @@ class SupabaseClient:
             return await asyncio.to_thread(_do)
         except requests.RequestException as exc:
             raise SupabaseError(f"find_customer_by_phone failed: {exc}") from exc
+
+    async def update_customer_language(
+        self, company_id: str, customer_id: str, jedroplus_code: str
+    ) -> None:
+        """Set "Stranke".language ("slo"/"eng"/"de"/"it"/"hr") for one
+        customer of one company."""
+
+        def _do() -> None:
+            _request(
+                "PATCH",
+                f"{self._rest_url}/Stranke",
+                self._api_key,
+                params={
+                    "ID Podjetja": f"eq.{company_id}",
+                    "ID stranke": f"eq.{customer_id}",
+                },
+                json_body={"language": jedroplus_code},
+                prefer="return=minimal",
+            )
+
+        try:
+            await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"update_customer_language failed: {exc}") from exc
 
     async def lookup_company_by_number(self, phone_number: str) -> str | None:
         """company_slug for a dialled E.164 number, or None if unmapped.

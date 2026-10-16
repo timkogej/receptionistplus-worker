@@ -184,6 +184,7 @@ async def create_booking(
     any_person: bool,
     eligible_employee_ids: list[str] | None,
     notes: str,
+    language: str = "sl",
 ) -> dict:
     """Call the "create" action: actually reserve the appointment."""
     payload: dict = {
@@ -202,6 +203,10 @@ async def create_booking(
         # Additive field, not part of the original contract — safe for the
         # workflow to ignore if it doesn't already store it.
         "source": "receptionist",
+        # Stored on the appointment (booking-v2 "Create: Validate" passes it
+        # through; Jedro+ normalises it), so reminders go out in the
+        # language the caller booked in.
+        "language": language,
     }
     if any_person:
         payload["eligibleEmployeeIds"] = eligible_employee_ids or []

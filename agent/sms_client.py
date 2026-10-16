@@ -27,13 +27,20 @@ from datetime import datetime
 import requests
 
 from agent.booking_client import _HMAC_SECRET_ENV, _sign
-from agent.dates import SLOVENIAN_WEEKDAYS
+from agent.dates import WEEKDAYS
 
 logger = logging.getLogger("receptionistplus-worker.sms")
 
 SMS_WEBHOOK_URL = "https://n8n.jedroplus.com/webhook/receptionist-sms"
 
-_EN_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_CONFIRMATION_TEMPLATES = {
+    "sl": "{company}: potrjujemo vaš termin — {services}, {weekday}, {d}. {m}. {y}, ob {time}. Lep pozdrav!",
+    "en": "{company}: your booking is confirmed — {services}, {weekday} {d}/{m}/{y} at {time}. See you then!",
+    "de": "{company}: Ihr Termin ist bestätigt — {services}, {weekday}, {d}.{m}.{y}, um {time} Uhr. Bis bald!",
+    "hr": "{company}: potvrđujemo vaš termin — {services}, {weekday}, {d}. {m}. {y}., u {time}. Lijep pozdrav!",
+    "it": "{company}: confermiamo il suo appuntamento — {services}, {weekday} {d}/{m}/{y} alle {time}. A presto!",
+}
+_DEFAULT_SERVICE_WORD = {"sl": "termin", "en": "appointment", "de": "Termin", "hr": "termin", "it": "appuntamento"}
 
 
 def booking_confirmation_text(
@@ -44,19 +51,19 @@ def booking_confirmation_text(
     time_hhmm: str,
     language: str,
 ) -> str:
-    """Short SMS text. Digits are fine here — this is read, not spoken."""
+    """Short SMS text in the call's language. Digits are fine here — this is
+    read, not spoken."""
+    lang = language if language in _CONFIRMATION_TEMPLATES else "en"
     d = datetime.strptime(date, "%Y-%m-%d").date()
-    services = ", ".join(service_names) or ("termin" if language != "en" else "appointment")
-    if language == "en":
-        return (
-            f"{company_name}: your booking is confirmed — {services}, "
-            f"{_EN_WEEKDAYS[d.weekday()]} {d.day}/{d.month}/{d.year} at {time_hhmm}. "
-            "See you then!"
-        )
-    return (
-        f"{company_name}: potrjujemo vaš termin — {services}, "
-        f"{SLOVENIAN_WEEKDAYS[d.weekday()]}, {d.day}. {d.month}. {d.year}, ob {time_hhmm}. "
-        "Lep pozdrav!"
+    services = ", ".join(n for n in service_names if n) or _DEFAULT_SERVICE_WORD[lang]
+    return _CONFIRMATION_TEMPLATES[lang].format(
+        company=company_name,
+        services=services,
+        weekday=WEEKDAYS[lang][d.weekday()],
+        d=d.day,
+        m=d.month,
+        y=d.year,
+        time=time_hhmm,
     )
 
 
@@ -89,6 +96,7 @@ async def send_sms(
     email: str = "",
     termin_id: str | None = None,
     call_id: str | None = None,
+    language: str = "sl",
     timeout: float = 20.0,
 ) -> dict:
     """{"success": bool, "error": str?}. Never raises: an SMS that doesn't go
@@ -101,6 +109,8 @@ async def send_sms(
         "email": email,
         "terminId": termin_id,
         "callId": call_id,
+        # Lines the workflow adds itself (portal link text) follow it.
+        "language": language,
     }
     try:
         result = await asyncio.to_thread(_post, payload, timeout)

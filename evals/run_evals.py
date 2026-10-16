@@ -36,7 +36,7 @@ from livekit.plugins import anthropic
 from agent.call_notes import CallNotes
 from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
-from agent.worker import build_receptionist_agent
+from agent.worker import LanguageControl, build_receptionist_agent
 from evals.fake_booking import FakeBooking
 from evals.scenarios import SCENARIOS, Scripted, Simulated
 
@@ -120,14 +120,38 @@ def _load_env() -> None:
 
 def _build(language: str, model: str, context: dict | None = None):
     company = json.loads(FIXTURE.read_text())
+    context = dict(context or {})
+    # "switch_languages": the call may switch (detect_caller_language on);
+    # same LanguageControl as the live call, minus the TTS.
+    allowed = context.pop("switch_languages", None)
     booking_tools = BookingTools("eval-company", company, language=language)
     notes = CallNotes()
+    control = None
+    extra_tools = []
+    if allowed:
+        control = LanguageControl(
+            call_lang={"code": language, "history": [language]},
+            allowed=list(allowed),
+            company_data=company,
+            prompt_args=context,
+            booking_tools=booking_tools,
+        )
+        extra_tools.append(control.switch_language)
     agent = build_receptionist_agent(
-        company, language, booking_tools=booking_tools, notes=notes, **(context or {})
+        company,
+        language,
+        booking_tools=booking_tools,
+        notes=notes,
+        extra_tools=extra_tools,
+        switchable_to=[c for c in (allowed or []) if c != language],
+        on_turn_language=control.on_turn if control else None,
+        **context,
     )
+    if control:
+        control.agent = agent
     name, _, effort = model.partition("@")
     llm = build_single_llm(name, effort=effort or None)
-    return agent, llm, booking_tools, notes
+    return agent, llm, booking_tools, notes, control
 
 
 def _tool_names(result) -> list[str]:
@@ -143,7 +167,7 @@ def _assistant_text(result) -> str:
 
 
 async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
-    agent, llm, _tools, _notes = _build(sc.language, model, sc.context)
+    agent, llm, _tools, _notes, control = _build(sc.language, model, sc.context)
     fake = FakeBooking()
     failures: list[str] = []
     transcript: list[dict] = []
@@ -151,6 +175,8 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
         async with llm, AgentSession(llm=llm) as session:
             await session.start(agent)
             for n, turn in enumerate(sc.turns, 1):
+                if control is not None:
+                    control.turn_language["detected"] = turn.detected_language
                 result = await session.run(user_input=turn.user)
                 names = _tool_names(result)
                 reply = _assistant_text(result)
@@ -173,7 +199,7 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
 
 
 async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
-    agent, llm, _tools, notes = _build(sc.language, model, sc.context)
+    agent, llm, _tools, notes, _control = _build(sc.language, model, sc.context)
     fake = FakeBooking()
     caller = anthropic_sdk.AsyncAnthropic()
     # From the simulated caller's side, the receptionist is the "user".

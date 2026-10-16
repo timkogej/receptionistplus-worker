@@ -54,8 +54,8 @@ from agent.call_policy import (
 )
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
-from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, spoken_date_phrase
-from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL
+from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, WEEKDAYS, spoken_date_phrase
+from agent.static_prompt import build_static_prompt
 from agent.supabase_client import SupabaseClient
 from agent.business_info import (
     booking_window_days,
@@ -66,6 +66,15 @@ from agent.business_info import (
     render_confirmation_line,
 )
 from agent.call_notes import CallNotes
+from agent.languages import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_NAMES,
+    SUPPORTED_LANGUAGES,
+    TO_JEDROPLUS_CODE,
+    detect_switch,
+    normalize_language,
+    pack,
+)
 from agent.call_summary import summarize_call
 from agent.sms_client import booking_confirmation_text, send_sms
 from agent.tools import _sanitize_free_text as _sanitize
@@ -75,13 +84,8 @@ from agent.tools import BookingTools
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
 
-SUPPORTED_LANGUAGES = ("sl", "en")
-DEFAULT_LANGUAGE = "sl"
 
-NO_CREDITS_MESSAGE = {
-    "sl": "Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje.",
-    "en": "We're unable to take your call right now. Please try again later.",
-}
+# NO_CREDITS_MESSAGE: per language in agent/languages.py (LanguagePack.no_credits).
 
 # Spoken before closing a call the agent is ending because abuse continued
 # after one warning (see the end_call_abusive tool). Deliberately a normal,
@@ -91,34 +95,16 @@ NO_CREDITS_MESSAGE = {
 # TECHNICAL_DIFFICULTY_MESSAGE, which is spoken and then followed by
 # session.aclose(). Slovenian uses the feminine "zaključila" per the FEMALE
 # persona rule in STATIC_PROMPT_SL.
-ABUSE_CLOSING_MESSAGE = {
-    "sl": "Hvala za klic. Klic bom zdaj zaključila. Lep dan še naprej.",
-    "en": "Thank you for calling. I'll end the call here. Have a good day.",
-}
+# ABUSE_CLOSING_MESSAGE: per language in agent/languages.py (LanguagePack.abuse_closing).
 
-TECHNICAL_DIFFICULTY_MESSAGE = {
-    "sl": "Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj.",
-    "en": (
-        "Sorry, we're experiencing technical difficulties right now — the "
-        "owner will call you back."
-    ),
-}
+# TECHNICAL_DIFFICULTY_MESSAGE: per language in agent/languages.py (LanguagePack.technical_difficulty).
 
 # EU AI Act Article 50: callers must be told they're talking to an AI system,
 # no later than the first interaction. Prepended in code rather than baked
 # into the greeting itself so it can't be dropped by a misconfigured or
 # edited per-company greeting — this is the one guaranteed source of
 # disclosure, not the only one.
-AI_DISCLOSURE = {
-    "sl": (
-        "Prosimo, upoštevajte, da govorite z digitalnim glasovnim asistentom, "
-        "ne z osebo. "
-    ),
-    "en": (
-        "Please note that you are speaking with a digital voice assistant, "
-        "not a person. "
-    ),
-}
+# AI_DISCLOSURE: per language in agent/languages.py (LanguagePack.ai_disclosure).
 
 # Built from company_data.company.naziv (fetched live via booking-v2 init)
 # rather than a hand-maintained env var — a per-company GREETING_TEXT env var
@@ -128,10 +114,7 @@ AI_DISCLOSURE = {
 # stay in sync with the actual company name. This can't go stale the same
 # way, at the cost of no longer supporting custom greeting wording beyond
 # "Welcome to <company name>" — a deliberate tradeoff, not an oversight.
-GREETING_TEMPLATE = {
-    "sl": "Pozdravljeni, dobrodošli v {name}. Kako vam lahko pomagam?",
-    "en": "Hello, welcome to {name}. How can I help you?",
-}
+# GREETING_TEMPLATE: per language in agent/languages.py (LanguagePack.greeting_template).
 
 # Pre-rendered once via a working Soniox TTS call (see assets/README or the
 # generation snippet in the Phase 5 Part C notes) so this specific message can
@@ -148,26 +131,14 @@ TECHNICAL_DIFFICULTY_AUDIO_PATH = (
 # Spoken when the call reaches its time limit (see call_policy.
 # call_time_limit_sec). The callback promise is real: reaching the limit sets
 # callback_requested on the call row, which notifies the owner.
-TIME_LIMIT_CLOSING_MESSAGE = {
-    "sl": (
-        "Oprostite, klic moram zdaj zaključiti. Če česa še nismo uredili, vas "
-        "bomo poklicali nazaj. Lep dan še naprej."
-    ),
-    "en": (
-        "I'm sorry, I have to end the call now. If anything is still open, "
-        "we'll call you back. Have a good day."
-    ),
-}
+# TIME_LIMIT_CLOSING_MESSAGE: per language in agent/languages.py (LanguagePack.time_limit_closing).
 
 # How long to wait, once the time limit is reached, for an in-flight turn
 # (e.g. create_booking, up to 45s) to finish before closing anyway.
 TIME_LIMIT_IDLE_WAIT_SEC = 50.0
 
 # Spoken right before a SIP transfer to a person (transfer_to_person tool).
-TRANSFER_MESSAGE = {
-    "sl": "Povezujem vas, trenutek prosim.",
-    "en": "I'm putting you through now, one moment please.",
-}
+# TRANSFER_MESSAGE: per language in agent/languages.py (LanguagePack.transfer_message).
 
 # SIP participant attributes set by LiveKit for telephony calls.
 SIP_DIALED_NUMBER_ATTR = "sip.trunkPhoneNumber"
@@ -194,14 +165,8 @@ PARTICIPANT_WAIT_SEC = 5.0
 # there; second time in a row: close politely. Long enough that a caller
 # looking something up (a diary, a card) isn't nagged.
 CALLER_SILENCE_SEC = 9.0
-STILL_THERE_PHRASES = {
-    "sl": ["Ste še na liniji?", "Halo, me slišite?"],
-    "en": ["Are you still there?", "Hello, can you hear me?"],
-}
-SILENCE_CLOSING_MESSAGE = {
-    "sl": "Žal vas ne slišim več. Pokličite nas, prosim, še enkrat. Lep dan.",
-    "en": "I'm afraid I can't hear you anymore. Please call us again. Have a good day.",
-}
+# STILL_THERE_PHRASES: per language in agent/languages.py (LanguagePack.still_there).
+# SILENCE_CLOSING_MESSAGE: per language in agent/languages.py (LanguagePack.silence_closing).
 
 # Background audio (2026-10-16): keyboard typing while the agent is
 # "thinking" (LLM or tool call), so a pause sounds like someone typing into
@@ -243,18 +208,7 @@ USER_TURN_CADENCE_LOG_INTERVAL_SEC = 5.0
 # availability claim. Rotated like the other repeated phrases in this prompt
 # so a caller who trips it twice doesn't hear the identical sentence back.
 # Deliberately worded to hand the turn straight back with a question.
-REDIRECT_PHRASES = {
-    "sl": [
-        "Oprostite, da vas prekinem — kako vam lahko pomagam?",
-        "Oprostite, da vas prekinem — mi lahko na kratko poveste, kaj potrebujete?",
-        "Se opravičujem za prekinitev — povejte mi, prosim, s čim vam lahko pomagam.",
-    ],
-    "en": [
-        "Sorry to jump in — how can I help you?",
-        "Sorry to interrupt — could you tell me briefly what you need?",
-        "Apologies for cutting in — please tell me what I can help you with.",
-    ],
-}
+# REDIRECT_PHRASES: per language in agent/languages.py (LanguagePack.redirect_phrases).
 
 # Promise-follow-up watchdog (2026-08-16 fix): a fallback-model turn that
 # says "checking..."/"trenutek, prosim..." and then never calls the tool it
@@ -270,19 +224,7 @@ REDIRECT_PHRASES = {
 # "I've booked you in for a pedicure...", or the watchdog would arm itself
 # right after a successful, complete turn and fire a false technical-
 # failure close once the call goes quiet afterward.
-PROMISE_CUE_PATTERNS = {
-    "sl": re.compile(
-        r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
-        r"|poskušam\b|počakajte|pogledam\b|vpisujem\b|vas vpišem\b",
-        re.IGNORECASE,
-    ),
-    "en": re.compile(
-        r"\b(?:one|just a|give me a) moment\b|\bhold on\b|\bplease wait\b"
-        r"|\blet me (?:check|look|see)\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
-        r"|\bi'?m (?:checking|processing|trying)\b|\bprocessing\b|\btrying\b",
-        re.IGNORECASE,
-    ),
-}
+# PROMISE_CUE_PATTERNS: per language in agent/languages.py (LanguagePack.promise_cues).
 PROMISE_WATCHDOG_TIMEOUT_SEC = 12.0
 # On the first silent promise the model is nudged to follow through (a reply
 # is generated with PROMISE_RECOVERY_INSTRUCTIONS); only if that also leads
@@ -301,7 +243,7 @@ PROMISE_RECOVERY_INSTRUCTIONS = (
 # Tool fillers are now built per call (they name the day), so those are
 # checked against BookingTools.spoken_fillers at runtime instead.
 _KNOWN_FILLER_TEXTS = frozenset(
-    p for phrases in STILL_THERE_PHRASES.values() for p in phrases
+    p for code in SUPPORTED_LANGUAGES for p in pack(code).still_there
 )
 
 # Post-farewell goodbye loop (2026-09-21). Observed: after "Nasvidenje!" the
@@ -315,39 +257,34 @@ _KNOWN_FILLER_TEXTS = frozenset(
 # directions — a turn counts as an acknowledgement only if EVERY word is in
 # this vocabulary, so any real question or request after a farewell still
 # reaches the model.
-FAREWELL_PATTERNS = {
-    "sl": re.compile(
-        r"nasvidenje|lep dan|se slišimo|se vidimo|hvala za klic|adijo",
-        re.IGNORECASE,
-    ),
-    "en": re.compile(
-        r"\bgoodbye\b|\bbye\b|have a (?:great|good|nice|lovely) day"
-        r"|\btalk soon\b|\btake care\b|thanks for calling",
-        re.IGNORECASE,
-    ),
-}
-ACKNOWLEDGEMENT_WORDS = {
-    "sl": frozenset(
-        "ja jaa jap ok okej okay oki hvala lepa najlepša vam tudi enako prav "
-        "v redu dobro super velja odlično adijo adio čao nasvidenje lep dan "
-        "mhm aha no sem rekel rekla že se slišimo vidimo prosim".split()
-    ),
-    "en": frozenset(
-        "yes yeah yep ok okay thanks thank you bye goodbye cheers great "
-        "alright sure have a good nice great lovely day too same to take care "
-        "mhm i said right perfect wonderful".split()
-    ),
-}
+# FAREWELL_PATTERNS: per language in agent/languages.py (LanguagePack.farewells).
+# ACKNOWLEDGEMENT_WORDS: per language in agent/languages.py (LanguagePack.acknowledgements).
 # Farewell turns (with only acknowledgements in between) after which a pure
 # acknowledgement is no longer answered: 1 = the farewell itself, 2 = the one
 # short "Prosim, lep dan!" the prompt allows in reply to the first "hvala".
 FAREWELLS_BEFORE_SILENCE = 2
 
 
+# First sentence of a reply that talks ABOUT the call instead of TO the
+# caller (see ReceptionistAgent.llm_node). English only: the model writes its
+# reasoning in the prompt's language, and a real reply to an English caller
+# never says "per the rules" or "the caller".
+_META_COMMENTARY = re.compile(
+    r"\bthe caller\b|\bper (?:the |my )?rules?\b|\bswitch(?:ing)? (?:the )?(?:call|language)"
+    r"|\bswitch_language\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b",
+    re.IGNORECASE,
+)
+_SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
+
+
+def _is_meta_commentary(text: str) -> bool:
+    return bool(_META_COMMENTARY.search(text))
+
+
 def _is_pure_acknowledgement(text: str, language: str) -> bool:
     words = re.findall(r"[^\W\d_]+", text.lower())
     return bool(words) and all(
-        w in ACKNOWLEDGEMENT_WORDS[language] for w in words
+        w in pack(language).acknowledgements for w in words
     )
 
 
@@ -393,8 +330,11 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str
     next_monday_offset = 7 - now.weekday()
     next_week_offsets = range(next_monday_offset, next_monday_offset + 7)
 
-    if language == "en":
-        weekday_names = ENGLISH_WEEKDAYS
+    if language != "sl":
+        # English instructions for every non-Slovenian call; weekday names
+        # and spoken phrases in the call's language, so the table and the
+        # tools' day labels (same dates.py functions) always agree.
+        weekday_names = WEEKDAYS.get(language, ENGLISH_WEEKDAYS)
         relative_labels = _RELATIVE_DAY_LABELS_EN
         next_week_tag = "NEXT WEEK"
     else:
@@ -422,7 +362,7 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str
 
     table = "\n".join(rows)
 
-    if language == "en":
+    if language != "sl":
         return (
             f"Current time is {time_str}, timezone Europe/Ljubljana. Below is "
             f"a pre-computed table of the next {max(14, days)} days: ISO date, weekday, and "
@@ -556,12 +496,13 @@ def _build_system_prompt(
     caller_phone: str | None = None,
     customer: dict | None = None,
     sms_confirmation: bool = False,
+    switchable_to: list[str] | tuple = (),
 ) -> str:
-    static_prompt = STATIC_PROMPT_EN if language == "en" else STATIC_PROMPT_SL
+    static_prompt = build_static_prompt(language, switchable_to)
     logger.info(
-        "language pack loaded: language=%s static_prompt=%s",
+        "prompt built: language=%s switchable_to=%s",
         language,
-        "STATIC_PROMPT_EN" if language == "en" else "STATIC_PROMPT_SL",
+        ",".join(switchable_to) or "-",
     )
     business_block, hours_known = render_business_block(profile, instructions, language)
     window = booking_window_days(company_data.get("company"))
@@ -637,10 +578,15 @@ class ReceptionistAgent(Agent):
         *,
         language: str,
         on_suppressed_user_turn=None,
+        on_turn_language=None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._language = language
+        # async callback(text) run before each reply, while the caller's turn
+        # is complete but the LLM hasn't started — the one point where a
+        # language switch takes effect for THIS reply (worker.entrypoint).
+        self._on_turn_language = on_turn_language
         self._redirect_step = 0
         # Farewells spoken since the caller last said anything other than a
         # pure acknowledgement — see FAREWELL_PATTERNS.
@@ -658,18 +604,78 @@ class ReceptionistAgent(Agent):
     async def on_enter(self) -> None:
         self.entered.set()
 
+    def set_language(self, language: str) -> None:
+        self._language = language
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        """The default LLM node, minus a first sentence of meta-commentary.
+
+        With thinking off, Claude sometimes writes its reasoning as text
+        before a tool call ("The caller speaks Croatian, so I switch
+        first.") — and every word of text is spoken (eval, 2026-10-16: 1 in
+        3 Croatian switches). The first sentence of each reply is held until
+        it ends (TTS waits for a sentence anyway) and dropped if it is that
+        kind of narration; everything else passes through untouched.
+        """
+        buffer = ""
+        chunk_id = ""
+        filtering = True
+        dropped = 0
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            if not filtering:
+                yield chunk
+                continue
+            content = None
+            if isinstance(chunk, str):
+                content = chunk
+            elif isinstance(chunk, llm.ChatChunk):
+                chunk_id = chunk.id or chunk_id
+                if chunk.delta is not None and chunk.delta.content and not chunk.delta.tool_calls:
+                    content = chunk.delta.content
+            if content is None:
+                # A tool call (or usage): whatever text is held is narration
+                # of that call if it looks like it, a real line otherwise.
+                if buffer and not _is_meta_commentary(buffer):
+                    yield llm.ChatChunk(
+                        id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=buffer)
+                    )
+                elif buffer:
+                    logger.warning("dropped meta-commentary before reply: %r", buffer[:200])
+                buffer = ""
+                yield chunk
+                continue
+            buffer += content
+            m = _SENTENCE_END.search(buffer)
+            if not m:
+                continue
+            sentence, buffer = buffer[: m.end()], buffer[m.end():]
+            if _is_meta_commentary(sentence) and dropped < 3:
+                dropped += 1
+                logger.warning("dropped meta-commentary before reply: %r", sentence[:200])
+                continue
+            filtering = False
+            yield llm.ChatChunk(
+                id=chunk_id,
+                delta=llm.ChoiceDelta(role="assistant", content=sentence + buffer),
+            )
+            buffer = ""
+        if filtering and buffer and not _is_meta_commentary(buffer):
+            yield llm.ChatChunk(id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=buffer))
+
     @property
     def has_said_goodbye(self) -> bool:
         return self._farewell_count > 0
 
     def note_assistant_message(self, text: str) -> None:
-        if FAREWELL_PATTERNS[self._language].search(text):
+        if pack(self._language).farewells.search(text):
             self._farewell_count += 1
 
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: ChatMessage
     ) -> None:
         text = new_message.text_content or ""
+        if self._on_turn_language is not None:
+            await self._on_turn_language(text)
         if not _is_pure_acknowledgement(text, self._language):
             self._farewell_count = 0
             return
@@ -692,7 +698,7 @@ class ReceptionistAgent(Agent):
         user_turn_limit backstop. Rotation state is shared deliberately, so a
         caller who trips both never hears the same sentence twice.
         """
-        phrases = REDIRECT_PHRASES[self._language]
+        phrases = pack(self._language).redirect_phrases
         phrase = phrases[self._redirect_step % len(phrases)]
         self._redirect_step += 1
         logger.info(
@@ -741,6 +747,8 @@ def build_receptionist_agent(
     caller_phone: str | None = None,
     customer: dict | None = None,
     sms_confirmation: bool = False,
+    switchable_to: list[str] | tuple = (),
+    on_turn_language=None,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -749,6 +757,7 @@ def build_receptionist_agent(
     return ReceptionistAgent(
         language=language,
         on_suppressed_user_turn=on_suppressed_user_turn,
+        on_turn_language=on_turn_language,
         instructions=_build_system_prompt(
             company_data,
             language,
@@ -757,6 +766,7 @@ def build_receptionist_agent(
             caller_phone=caller_phone,
             customer=customer,
             sms_confirmation=sms_confirmation,
+            switchable_to=switchable_to,
         ),
         tools=[
             booking_tools.get_slots,
@@ -766,6 +776,114 @@ def build_receptionist_agent(
             *extra_tools,
         ],
     )
+
+
+class LanguageControl:
+    """Switching the call's language mid-call (sklop 5). Shared by
+    entrypoint() and the eval harness, so both switch the same way.
+
+    A switch replaces the agent's instructions with the prompt built for the
+    new language, sets the TTS language (Soniox speaks all five with the same
+    voice), moves the tools' fillers/day labels over, and updates call_lang,
+    which every line spoken by code reads. The conversation so far is kept.
+    """
+
+    def __init__(
+        self,
+        *,
+        call_lang: dict,
+        allowed: list[str],
+        company_data: dict,
+        prompt_args: dict,
+        booking_tools: BookingTools,
+        session=None,
+        turn_language: dict | None = None,
+        enabled: bool = True,
+    ) -> None:
+        self.call_lang = call_lang
+        self.allowed = allowed
+        self.company_data = company_data
+        self.prompt_args = prompt_args
+        self.booking_tools = booking_tools
+        self.session = session
+        self.turn_language = turn_language if turn_language is not None else {
+            "detected": None,
+            "previous": None,
+        }
+        self.enabled = enabled
+        self.agent: "ReceptionistAgent | None" = None
+
+    async def switch(self, new_code: str, why: str) -> bool:
+        new = normalize_language(new_code)
+        if self.agent is None or not new or new == self.call_lang["code"] or new not in self.allowed:
+            return False
+        old = self.call_lang["code"]
+        self.call_lang["code"] = new
+        self.call_lang.setdefault("history", []).append(new)
+        self.agent.set_language(new)
+        self.booking_tools.set_language(new)
+        await self.agent.update_instructions(
+            _build_system_prompt(
+                self.company_data,
+                new,
+                switchable_to=[c for c in self.allowed if c != new],
+                **self.prompt_args,
+            )
+        )
+        if self.session is not None:
+            try:
+                self.session.tts.update_options(language=new)
+            except Exception:
+                logger.exception("TTS language update failed (%s -> %s)", old, new)
+        logger.info("language switch %s -> %s (%s)", old, new, why)
+        return True
+
+    @function_tool
+    async def switch_language(self, context: RunContext, language: str) -> dict:
+        """Switch the call to another language.
+
+        Call this BEFORE replying when the caller speaks another supported
+        language, or asks to speak one ("can we speak English?", "parlate
+        italiano?"). Then answer in that language.
+
+        Args:
+            language: ISO code — "sl" Slovenian, "en" English, "de" German,
+                "hr" Croatian, "it" Italian.
+        """
+        target = normalize_language(language)
+        if target is None or target not in self.allowed:
+            return {
+                "success": False,
+                "message": (
+                    "That language isn't available for this business. "
+                    "Continue in the current language and say so politely."
+                ),
+            }
+        if target == self.call_lang["code"]:
+            return {"success": True, "message": "Already speaking it; just continue."}
+        await self.switch(target, "tool")
+        return {
+            "success": True,
+            "message": f"Switched. From now on reply only in {LANGUAGE_NAMES[target]}.",
+        }
+
+    async def on_turn(self, text: str) -> None:
+        """Before each reply: switch if Soniox heard this turn in another
+        allowed language (languages.detect_switch decides how sure is sure
+        enough)."""
+        if not self.enabled:
+            return
+        detected = self.turn_language["detected"]
+        target = detect_switch(
+            current=self.call_lang["code"],
+            detected=detected,
+            words=len(text.split()),
+            previous_detected=self.turn_language["previous"],
+            allowed=self.allowed,
+        )
+        self.turn_language["previous"] = detected
+        if target:
+            await self.switch(target, f"detected {detected}")
 
 
 def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
@@ -792,10 +910,17 @@ def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
     )
 
 
-def _build_stt(settings: Settings, language: str = DEFAULT_LANGUAGE) -> soniox.STT:
+def _build_stt(
+    settings: Settings, language: str = DEFAULT_LANGUAGE, allowed: list[str] | None = None
+) -> soniox.STT:
+    # Hints, not a restriction: the starting language first, then any other
+    # language the call may switch to. Soniox identifies the language of
+    # every token (enable_language_identification, on by default), which is
+    # what the switch detection reads.
+    hints = [language] + [c for c in (allowed or []) if c != language]
     return soniox.STT(
         api_key=settings.soniox_api_key,
-        params=soniox.STTOptions(language_hints=[language]),
+        params=soniox.STTOptions(language_hints=hints),
     )
 
 
@@ -859,7 +984,7 @@ def _render_greeting(custom: str | None, language: str, company_name: str) -> st
     """
     text = (custom or "").strip()
     if not text:
-        return GREETING_TEMPLATE[language].format(name=company_name)
+        return pack(language).greeting_template.format(name=company_name)
     return text.replace("{name}", company_name).replace("{podjetje}", company_name)
 
 
@@ -1100,7 +1225,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # or language we could use. Say a neutral line and hang up; there is
         # no receptionist_calls row to write (company_slug is NOT NULL).
         logger.error("no company for dialed number %s — rejecting call", dialed_number)
-        await _speak_and_close(ctx, settings, DEFAULT_LANGUAGE, NO_CREDITS_MESSAGE[DEFAULT_LANGUAGE])
+        await _speak_and_close(ctx, settings, DEFAULT_LANGUAGE, pack(DEFAULT_LANGUAGE).no_credits)
         return
 
     # get_settings, get_balance, and the booking-v2 init fetch don't depend
@@ -1171,7 +1296,7 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         settings_row = None
         settings_fetch_failed = True
-    language = (settings_row or {}).get("language") or DEFAULT_LANGUAGE
+    language = normalize_language((settings_row or {}).get("language")) or DEFAULT_LANGUAGE
     if language not in SUPPORTED_LANGUAGES:
         logger.warning(
             "unsupported language %r for company_slug=%s, defaulting to %s",
@@ -1181,6 +1306,19 @@ async def entrypoint(ctx: JobContext) -> None:
         )
         language = DEFAULT_LANGUAGE
 
+    # The company's own language: the owner reads summaries and messages in
+    # it, and the dashboard greeting is written in it. `language` below may
+    # become the caller's instead.
+    company_language = language
+    # Switching languages mid-call is the dashboard's "detect_caller_language"
+    # (Receptionist+ settings). Off = the call stays in the company language,
+    # exactly as before sklop 5.
+    detect_language = bool((settings_row or {}).get("detect_caller_language"))
+    allowed_languages = list(SUPPORTED_LANGUAGES) if detect_language else [language]
+    # The CURRENT language of the call. Everything spoken by code reads it
+    # from here, never from `language`, which is only the starting point.
+    call_lang = {"code": language, "history": [language]}
+
     async def _say_technical_difficulty(target_session: AgentSession) -> None:
         """Play the pre-rendered apology clip for Slovenian (bypasses TTS
         synthesis entirely, so it still works if the TTS provider itself is
@@ -1189,9 +1327,10 @@ async def entrypoint(ctx: JobContext) -> None:
         text, which won't survive a TTS-provider outage but is otherwise
         fine.
         """
-        message = TECHNICAL_DIFFICULTY_MESSAGE[language]
+        current = call_lang["code"]
+        message = pack(current).technical_difficulty
         try:
-            if language == "sl":
+            if current == "sl":
                 audio = audio_frames_from_file(str(TECHNICAL_DIFFICULTY_AUDIO_PATH))
                 await asyncio.wait_for(
                     target_session.say(message, audio=audio), timeout=8.0
@@ -1242,7 +1381,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # running an unnecessary webhook call in the background.
         init_task.cancel()
         caller_context_task.cancel()
-        await _speak_and_close(ctx, settings, language, NO_CREDITS_MESSAGE[language])
+        await _speak_and_close(ctx, settings, language, pack(language).no_credits)
         try:
             await supabase.insert_call(
                 {
@@ -1264,10 +1403,29 @@ async def entrypoint(ctx: JobContext) -> None:
         return
 
     call_limit_sec = MAX_CALL_SEC if balance is None else call_time_limit_sec(balance)
+
+    # A known customer whose stored language ("Stranke".language) differs
+    # from the company's starts the call in their language — disclosure
+    # included. Waits at most 1s for the lookup (it runs since the call
+    # started); otherwise the call starts in the company language and can
+    # still switch once the caller speaks.
+    if detect_language and caller_phone:
+        try:
+            _profile, _customer = await asyncio.wait_for(
+                asyncio.shield(caller_context_task), timeout=1.0
+            )
+            remembered = normalize_language((_customer or {}).get("language"))
+            if remembered and remembered != language and remembered in allowed_languages:
+                logger.info("starting in the known customer's language: %s", remembered)
+                language = remembered
+                call_lang["code"] = remembered
+                call_lang["history"] = [remembered]
+        except Exception:
+            logger.info("caller context not ready within 1s — starting in %s", language)
     logger.info("call time limit: %ss (balance=%s)", call_limit_sec, balance)
 
     session = AgentSession(
-        stt=_build_stt(settings, language),
+        stt=_build_stt(settings, language, allowed_languages),
         llm=_build_llm(settings),
         tts=_build_tts(settings, language),
         # Silero VAD (2026-10-16, loaded once per process in prewarm): the
@@ -1314,6 +1472,7 @@ async def entrypoint(ctx: JobContext) -> None:
         transfer_number
     )
     call_profile: dict = {"profile": None}
+    call_context: dict = {"profile": None, "customer": None}
 
     @function_tool
     async def transfer_to_person(context: RunContext, reason: str) -> dict:
@@ -1342,7 +1501,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
         logger.info("transferring call to a person: reason=%r", reason)
         await context.wait_for_playout()
-        await session.say(TRANSFER_MESSAGE[language], allow_interruptions=False)
+        await session.say(pack(call_lang["code"]).transfer_message, allow_interruptions=False)
         try:
             await ctx.api.sip.transfer_sip_participant(
                 api.TransferSIPParticipantRequest(
@@ -1392,7 +1551,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # Let whatever the agent was already saying finish, so the closing
         # line doesn't clip the tail of the warning turn.
         await context.wait_for_playout()
-        await session.say(ABUSE_CLOSING_MESSAGE[language], allow_interruptions=False)
+        await session.say(pack(call_lang["code"]).abuse_closing, allow_interruptions=False)
 
         # NOT awaited: AgentSession.aclose() force-interrupts and then drains
         # in-flight speech and tool tasks — and this tool IS one of those
@@ -1461,6 +1620,10 @@ async def entrypoint(ctx: JobContext) -> None:
     agent_ref: dict = {"receptionist": None}
     booking_ref: dict = {"tools": None}
 
+    # Soniox's language for the caller's latest final transcript, and the
+    # one before it (see languages.detect_switch).
+    turn_language: dict = {"detected": None, "previous": None}
+
     user_turn_watch: dict = {
         "started_at": None,
         "fired": False,
@@ -1525,14 +1688,14 @@ async def entrypoint(ctx: JobContext) -> None:
             await session.aclose()
             return
         if count == 1:
-            phrases = STILL_THERE_PHRASES[language]
+            phrases = pack(call_lang["code"]).still_there
             logger.info("caller silent %.0fs — checking the line", CALLER_SILENCE_SEC)
             session.say(phrases[0])
             return
         logger.info("caller silent again — closing the call")
         try:
             await asyncio.wait_for(
-                session.say(SILENCE_CLOSING_MESSAGE[language], allow_interruptions=False),
+                session.say(pack(call_lang["code"]).silence_closing, allow_interruptions=False),
                 timeout=10.0,
             )
         except Exception:
@@ -1564,6 +1727,8 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_user_input_transcribed(event) -> None:
         if event.is_final:
             _reset_user_turn_watch("final transcript")
+            if event.transcript and event.transcript.strip():
+                turn_language["detected"] = event.language
             return
 
         text = (event.transcript or "").strip()
@@ -1718,7 +1883,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     booking_ref["tools"] is not None
                     and text in booking_ref["tools"].spoken_fillers
                 )
-                and PROMISE_CUE_PATTERNS[language].search(text)
+                and pack(call_lang["code"]).promise_cues.search(text)
             ):
                 _activity_since_promise.clear()
                 asyncio.create_task(_watch_for_promise_followup())
@@ -1772,6 +1937,29 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session.on("agent_state_changed", _on_agent_state_changed_watchdog)
     session.on("user_state_changed", _on_user_state_changed_watchdog)
+
+    async def _remember_customer_language() -> None:
+        """Language memory without storing anything new: a known customer
+        who booked in another language than the one on file gets their
+        "Stranke".language updated — the same field Jedro+ already uses for
+        their reminders, so those follow too. Only after a booking in this
+        call, so a stranger borrowing the phone can't change it."""
+        customer = (call_context.get("customer") or {})
+        booking_tools = booking_ref["tools"]
+        if not customer.get("ID stranke") or not (booking_tools and booking_tools.created_termin_id):
+            return
+        spoken = call_lang["code"]
+        if normalize_language(customer.get("language")) == spoken:
+            return
+        try:
+            await supabase.update_customer_language(
+                (call_context.get("profile") or {}).get("ID Podjetja", ""),
+                customer["ID stranke"],
+                TO_JEDROPLUS_CODE[spoken],
+            )
+            logger.info("customer language updated to %s", spoken)
+        except Exception:
+            logger.exception("failed to update customer language")
 
     async def _on_shutdown() -> None:
         if call_end_state["logged_directly"]:
@@ -1828,7 +2016,7 @@ async def entrypoint(ctx: JobContext) -> None:
         if notes.has_note:
             summary = await summarize_call(
                 transcript,
-                language,
+                company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=6.0,
             )
@@ -1851,16 +2039,19 @@ async def entrypoint(ctx: JobContext) -> None:
                     "message": notes.message,
                     "callback_requested": notes.callback_requested,
                     "summary": summary,
+                    "language": call_lang["code"],
                 }
             )
         except Exception:
             logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
             return
 
+        await _remember_customer_language()
+
         if summary is None:
             summary = await summarize_call(
                 transcript,
-                language,
+                company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=12.0,
             )
@@ -1893,7 +2084,7 @@ async def entrypoint(ctx: JobContext) -> None:
             notes.request_callback("Klic je dosegel časovno omejitev, preden je bilo vse urejeno.")
         try:
             await asyncio.wait_for(
-                session.say(TIME_LIMIT_CLOSING_MESSAGE[language], allow_interruptions=False),
+                session.say(pack(call_lang["code"]).time_limit_closing, allow_interruptions=False),
                 timeout=15.0,
             )
         except Exception:
@@ -1932,7 +2123,7 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("bootstrap: session started t=+%.3fs", _t())
     await _start_background_audio(ctx, session)
     disclosure_handle = session.say(
-        AI_DISCLOSURE[language].strip(), allow_interruptions=False
+        pack(language).ai_disclosure, allow_interruptions=False
     )
 
     try:
@@ -1990,7 +2181,7 @@ async def entrypoint(ctx: JobContext) -> None:
             service_names=[services.get(str(i), "") for i in booking["service_ids"]],
             date=booking["date"],
             time_hhmm=booking["time"],
-            language=language,
+            language=call_lang["code"],
         )
         result = await send_sms(
             kind="confirmation",
@@ -2000,6 +2191,7 @@ async def entrypoint(ctx: JobContext) -> None:
             email=booking.get("email") or "",
             termin_id=booking.get("terminId"),
             call_id=call_id,
+            language=call_lang["code"],
         )
         if not result.get("success"):
             # The caller was told a text is coming; make sure the owner
@@ -2032,6 +2224,8 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.warning("caller context not ready — continuing without it")
         profile, customer = None, None
     call_profile["profile"] = profile
+    call_context["profile"] = profile
+    call_context["customer"] = customer
 
     customer_email = ((customer or {}).get("Email stranke") or "").strip()
 
@@ -2046,6 +2240,7 @@ async def entrypoint(ctx: JobContext) -> None:
             phone=caller_phone or "",
             email=customer_email,
             call_id=call_id,
+            language=call_lang["code"],
         )
         if result.get("success"):
             return {
@@ -2064,7 +2259,28 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
         }
 
+    prompt_args = dict(
+        profile=profile,
+        instructions=(settings_row or {}).get("instructions"),
+        caller_phone=caller_phone,
+        customer=customer,
+        sms_confirmation=sms_confirmation,
+    )
+
+    language_control = LanguageControl(
+        call_lang=call_lang,
+        allowed=allowed_languages,
+        company_data=company_data,
+        prompt_args=prompt_args,
+        booking_tools=booking_tools,
+        session=session,
+        turn_language=turn_language,
+        enabled=detect_language,
+    )
+
     extra_tools = [end_call_abusive]
+    if detect_language:
+        extra_tools.insert(0, language_control.switch_language)
     if transfer_enabled:
         extra_tools.insert(0, transfer_to_person)
     # The portal logs customers in by email, so the link only works for a
@@ -2078,13 +2294,12 @@ async def entrypoint(ctx: JobContext) -> None:
         notes=notes,
         extra_tools=extra_tools,
         on_suppressed_user_turn=_record_suppressed_user_turn,
-        profile=profile,
-        instructions=(settings_row or {}).get("instructions"),
-        caller_phone=caller_phone,
-        customer=customer,
-        sms_confirmation=sms_confirmation,
+        switchable_to=[c for c in allowed_languages if c != language],
+        on_turn_language=language_control.on_turn,
+        **prompt_args,
     )
     agent_ref["receptionist"] = receptionist_agent
+    language_control.agent = receptionist_agent
 
     # The handoff drains the bootstrap agent first, which waits for queued
     # speech to finish rather than interrupting it — the disclosure always
@@ -2102,7 +2317,9 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     greeting = _render_greeting(
-        (settings_row or {}).get("greeting_text"),
+        # The dashboard greeting is written in the company's language; a call
+        # starting in the caller's own language gets the template instead.
+        (settings_row or {}).get("greeting_text") if language == company_language else None,
         language,
         company_data["company"]["naziv"],
     )

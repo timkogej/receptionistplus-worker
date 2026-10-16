@@ -36,11 +36,32 @@ Dashboard, Stripe checkout and the credits UI live in the main Jedro+ repo
    and a `receptionist_calls` row is written with outcome, transcript, caller number
    and any message. A database trigger notifies the owner about messages.
 
+## Languages
+
+Slovenian, English, German, Croatian and Italian (the five Jedro+ stores per
+customer). The company's `receptionist_settings.language` is where a call
+starts. With **"detect_caller_language"** on (dashboard switch):
+
+- a known customer (caller ID → "Stranke") starts in their stored language;
+- the call switches when Soniox hears the caller speak another of the five
+  (4+ words, or two short turns; Slovenian↔Croatian needs two long turns,
+  they are easily confused), or when the model calls `switch_language` for
+  an explicit request;
+- a switch swaps the agent's instructions, the TTS language (same Soniox
+  voice "Maya" in all five) and every fixed line (`agent/languages.py`);
+- the booking is stored with the call's language and, after a booking, a
+  known customer's "Stranke".language is updated, so reminders follow.
+
+Prompts: `static_prompt.build_static_prompt()` — Slovenian has its own; the
+other languages use the English prompt as the core plus a short language
+note. Summaries and owner messages stay in the company's language.
+
 ## Layout
 
 ```
 agent/
   worker.py          entrypoint: routing, gates, session, watchdogs, call logging
+  languages.py       language packs (every fixed line, 5 languages) + switch rule
   call_policy.py     pure rules: phone normalisation, time limit, billing/outcome
   call_notes.py      take_message tool + callback requests from code paths
   tools.py           booking tools and the business rules enforced in code

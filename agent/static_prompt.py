@@ -1262,3 +1262,122 @@ ERROR RECOVERY:
     dissatisfaction with the company. When in doubt, keep helping."""
 
 STATIC_PROMPT_EN = _strip_rule_ids(_STATIC_PROMPT_EN_SOURCE)
+
+
+# ---------------------------------------------------------------------------
+# Per-language prompts (sklop 5, 2026-10-16)
+#
+# Slovenian keeps its own full prompt (all the R-SL-* grammar work). Every
+# other language uses the English prompt as a language-neutral core: its
+# rules and examples are about behaviour, not English, and the model writes
+# the target language well from English instructions. Only two things
+# change: the persona line and R-LANGUAGE, plus a short note for that
+# language (formal address, the female persona's grammar, numbers as words).
+#
+# When the company allows switching (receptionist_settings.
+# detect_caller_language), R-LANGUAGE says so and points at the
+# switch_language tool instead of insisting on one language.
+# ---------------------------------------------------------------------------
+
+_SL_LANGUAGE_RULE = """- You must always respond in Slovenian, even if the caller
+  code-switches or speaks another language. Every word you generate
+  yourself — sentences, explanations, confirmations — must be in
+  Slovenian."""
+
+_EN_LANGUAGE_RULE = """- You must respond only in English, even if the caller speaks
+  another language or if the underlying company data below (service names,
+  employee names, notes) is in Slovenian. Read Slovenian service/employee
+  names as-is (do not translate or invent an English name for them), but
+  every word you generate yourself — sentences, explanations,
+  confirmations — must be in English."""
+
+_EN_PERSONA = "You are a warm, competent English-speaking phone receptionist for a service business."
+
+LANGUAGE_NOTES = {
+    "de": (
+        "- Speak natural standard German. Always use formal address (\"Sie\", "
+        "\"Ihnen\"), never \"du\". Numbers, prices, times and durations as "
+        "German words: \"fünfundvierzig Euro\", \"um vierzehn Uhr\", "
+        "\"dreißig Minuten\". Waiting phrase: \"Einen Moment, bitte.\""
+    ),
+    "hr": (
+        "- Speak standard Croatian — not Serbian, and no Slovenian words, "
+        "even though the company data is Slovenian. Always formal address "
+        "(\"Vi\", \"Vama\"), never \"ti\". Your persona is FEMALE: "
+        "feminine past forms about yourself (\"rezervirala sam\", "
+        "\"provjerila sam\", \"razumjela sam\"). Numbers, prices, times and "
+        "durations as Croatian words: \"četrdeset pet eura\", \"u četrnaest "
+        "sati\". Waiting phrase: \"Trenutak, molim.\""
+    ),
+    "it": (
+        "- Speak natural Italian. Always formal address (\"Lei\"), never "
+        "\"tu\". Your persona is FEMALE: feminine agreement about yourself "
+        "(\"sono stata\", \"sono sicura\"). Numbers, prices, times and "
+        "durations as Italian words: \"quarantacinque euro\", \"alle "
+        "quattordici\". Waiting phrase: \"Un momento, per favore.\""
+    ),
+}
+
+
+_CROATIAN_CUE = (
+    " Croatian is NOT Slovenian, however close it sounds: \"koliko košta\", "
+    "\"zanima me\", \"molim\", \"hvala lijepa\", \"sutra\", \"tjedan\", "
+    "\"termin u utorak\", \"eura\" mean the caller speaks Croatian — switch "
+    "to Croatian, don't answer in Slovenian."
+)
+
+
+def _switch_rule(language_name: str, others: list[str]) -> str:
+    names = ", ".join(others)
+    rule = (
+        f"- Respond in {language_name}, the language of this call so far. If "
+        f"the caller speaks {names} instead, or asks to speak one of them, "
+        "call switch_language with that language FIRST, then continue the "
+        "call in it — never answer in a language you haven't switched to, "
+        "and never mix languages in one reply. Every word you write is "
+        "spoken to the caller, so the tool call is the first thing in your "
+        "reply and the caller's language comes right after it.\n"
+        "  - Bad: \"The caller speaks German, so I switch first.\" + "
+        "switch_language(de) + \"Guten Tag! ...\"\n"
+        "  - Good: switch_language(de) + \"Guten Tag! ...\"\n"
+        "  A few foreign words (a name, \"okay\", \"sorry\") are not a "
+        "reason to switch. Read Slovenian service and staff names from the "
+        "company data as they are."
+    )
+    if "Croatian" in others and language_name == "Slovenian":
+        rule += _CROATIAN_CUE
+    return rule
+
+
+def build_static_prompt(language: str, switchable_to: list[str] | tuple = ()) -> str:
+    """The static prompt for one call language. `switchable_to`: the OTHER
+    languages the call may switch to (empty = this language only)."""
+    from agent.languages import LANGUAGE_NAMES
+
+    others = [LANGUAGE_NAMES[c] for c in switchable_to if c != language and c in LANGUAGE_NAMES]
+    name = LANGUAGE_NAMES.get(language, "English")
+
+    if language == "sl":
+        prompt = STATIC_PROMPT_SL
+        if others:
+            prompt = prompt.replace(_SL_LANGUAGE_RULE, _switch_rule(name, others))
+        return prompt
+
+    prompt = STATIC_PROMPT_EN
+    if language != "en":
+        prompt = prompt.replace(
+            _EN_PERSONA,
+            f"You are a warm, competent {name}-speaking phone receptionist for a "
+            f"service business. Everything below is written in English, but "
+            f"you speak {name} with callers: apply every rule and example to "
+            f"{name}.",
+        )
+    article = "an" if name[0] in "AEIOU" else "a"
+    rule = (
+        _switch_rule(name, others)
+        if others
+        else _EN_LANGUAGE_RULE.replace("an English", f"{article} {name}").replace("English", name)
+    )
+    if language in LANGUAGE_NOTES:
+        rule += "\n" + LANGUAGE_NOTES[language]
+    return prompt.replace(_EN_LANGUAGE_RULE, rule)

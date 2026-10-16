@@ -29,6 +29,9 @@ class Turn:
     judge: str | None = None
     expect_tools: tuple[str, ...] = ()
     forbid_tools: tuple[str, ...] = ()
+    # What Soniox's language identification would report for this turn
+    # (the live call's switch detection reads it). None = not simulated.
+    detected_language: str | None = None
 
 
 @dataclass
@@ -355,5 +358,126 @@ SCENARIOS: list[Scripted | Simulated] = [
                 forbid_tools=("create_booking",),
             )
         ],
+    ),
+    Scripted(
+        "jezik-preklop-en",
+        "sl",
+        [
+            Turn(
+                "Hi, sorry, do you speak English? I'd like to book a pedicure.",
+                detected_language="en",
+                judge=(
+                    "Replies in English (not Slovenian), helps with booking a "
+                    "pedicure, e.g. asks a staff preference or a day."
+                ),
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
+    ),
+    Scripted(
+        "jezik-preklop-de",
+        "sl",
+        [
+            Turn(
+                "Guten Tag, ich möchte gerne wissen, was eine Maniküre mit Lack kostet.",
+                detected_language="de",
+                judge=(
+                    "Replies in German with formal address (Sie/Ihnen), says it "
+                    "costs fifty euros written as a German word (fünfzig), not "
+                    "digits."
+                ),
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
+    ),
+    Scripted(
+        "jezik-preklop-hr",
+        "sl",
+        [
+            Turn(
+                "Dobar dan, zanima me koliko košta pedikura i koliko traje.",
+                expect_tools=("switch_language",),
+                detected_language="hr",
+                judge=(
+                    "Replies in Croatian (not Slovenian: e.g. 'košta', 'eura', "
+                    "'minuta', not 'stane', 'evrov', 'minut'), formal address, "
+                    "says thirty euros and forty-five minutes in words."
+                ),
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
+    ),
+    Scripted(
+        "jezik-preklop-it",
+        "sl",
+        [
+            Turn(
+                "Buongiorno, vorrei prenotare una pedicure per la prossima settimana.",
+                detected_language="it",
+                judge=(
+                    "Replies in Italian with formal address (Lei), helps book "
+                    "the pedicure (e.g. asks staff preference or which day)."
+                ),
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
+    ),
+    Scripted(
+        "jezik-slovenscina-ostane",
+        "sl",
+        [
+            Turn(
+                "Pozdravljeni, zanima me, ali imate kaj prosto za masažo glave. "
+                "Okay, sorry, mislim naslednji teden.",
+                forbid_tools=("switch_language",),
+                judge="Replies in Slovenian.",
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
+    ),
+    Scripted(
+        "jezik-izklopljeno-ostane-sl",
+        "sl",
+        [
+            Turn(
+                "Hi, do you speak English?",
+                judge=(
+                    "Replies in Slovenian (switching is off for this business), "
+                    "politely, offering to help in Slovenian."
+                ),
+            )
+        ],
+    ),
+    Scripted(
+        "jezik-zacetek-de",
+        "de",
+        [
+            Turn(
+                "Was kostet eine Pediküre und wie lange dauert sie?",
+                judge=(
+                    "Replies in German, formal, says thirty euros and "
+                    "forty-five minutes as German words (dreißig, "
+                    "fünfundvierzig)."
+                ),
+            )
+        ],
+    ),
+    Scripted(
+        "jezik-prosnja-v-slovenscini",
+        "sl",
+        [
+            Turn(
+                "Pozdravljeni, a lahko govoriva angleško, prosim?",
+                expect_tools=("switch_language",),
+                detected_language="sl",
+                judge=(
+                    "Replies in English and offers help. Saying something like "
+                    "'of course, we can continue in English' is fine; failing is "
+                    "Slovenian text, or internal narration such as 'the caller "
+                    "speaks...' or 'per the rules'."
+                ),
+            )
+        ],
+        context={"switch_languages": ("sl", "en", "de", "hr", "it")},
     ),
 ]
