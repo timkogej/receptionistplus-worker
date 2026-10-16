@@ -94,6 +94,27 @@ class HelperFunctions(unittest.TestCase):
 
 
 @unittest.skipIf(T is None, "livekit-agents not installed")
+class Fillers(unittest.TestCase):
+    def test_single_day_names_the_weekday_in_the_accusative(self):
+        tools = T.BookingTools("salon", COMPANY, language="sl")
+        text = tools._get_slots_filler("2026-10-21", "2026-10-21")  # a Wednesday
+        self.assertIn("sredo", text)
+        self.assertIn(text, tools.spoken_fillers)
+
+    def test_range_uses_a_generic_line_and_variants_rotate(self):
+        tools = T.BookingTools("salon", COMPANY, language="en")
+        a = tools._get_slots_filler("2026-10-19", "2026-10-25")
+        b = tools._get_slots_filler("2026-10-19", "2026-10-25")
+        self.assertNotEqual(a, b)
+        self.assertEqual(tools.spoken_fillers, {a, b})
+
+    def test_check_filler_never_talks_about_booking(self):
+        for lang in ("sl", "en"):
+            for line in T.CHECK_SLOTS_FILLER_TEXT[lang]:
+                self.assertNotRegex(line.lower(), r"rezerv|vpis|book")
+
+
+@unittest.skipIf(T is None, "livekit-agents not installed")
 class CreateBookingGate(unittest.TestCase):
     ARGS = dict(service_ids=["multi"], date="2026-10-20", time="10:00", employee_id="e2")
     PERSON = dict(first_name="Ana", email="ana@example.com", phone="+38640123456")
