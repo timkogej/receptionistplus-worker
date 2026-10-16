@@ -23,6 +23,12 @@ import requests
 logger = logging.getLogger("receptionistplus-worker.supabase")
 
 
+# receptionist_calls columns added by migrations/phase6_routing_credits_messages.sql.
+PHASE6_CALL_COLUMNS = frozenset(
+    {"caller_phone", "dialed_number", "message", "callback_requested"}
+)
+
+
 class SupabaseError(RuntimeError):
     """Raised when a Supabase REST call fails or returns an unexpected shape."""
 
@@ -69,7 +75,7 @@ class SupabaseClient:
                 self._api_key,
                 params={
                     "company_slug": f"eq.{company_slug}",
-                    "select": "company_slug,enabled,low_balance_threshold,language",
+                    "select": "company_slug,enabled,low_balance_threshold,language,greeting_text",
                 },
             )
             rows = resp.json()
@@ -103,70 +109,154 @@ class SupabaseClient:
         except requests.RequestException as exc:
             raise SupabaseError(f"get_balance failed for {company_slug!r}: {exc}") from exc
 
+    async def lookup_company_by_number(self, phone_number: str) -> str | None:
+        """company_slug for a dialled E.164 number, or None if unmapped.
+
+        A missing receptionist_phone_numbers table (migration not applied
+        yet) is treated as "no mapping" rather than an error, so the worker
+        can be deployed before the migration without dropping calls.
+        """
+
+        def _do() -> str | None:
+            try:
+                resp = _request(
+                    "GET",
+                    f"{self._rest_url}/receptionist_phone_numbers",
+                    self._api_key,
+                    params={
+                        "phone_number": f"eq.{phone_number}",
+                        "select": "company_slug",
+                    },
+                )
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    logger.warning(
+                        "receptionist_phone_numbers missing (migration phase6 "
+                        "not applied?) — no per-number routing"
+                    )
+                    return None
+                raise
+            rows = resp.json()
+            return rows[0]["company_slug"] if rows else None
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"lookup_company_by_number failed: {exc}") from exc
+
     async def deduct_credits(
         self, *, company_slug: str, call_id: str, billed_credits: float
     ) -> float:
-        """Ledger a deduction and update the running balance. Returns the new balance.
+        """Deduct a call's credits in one transaction. Returns the new balance.
 
-        Order matches the append-only ledger design: write the transaction row
-        first (with the balance it produces), then update the balance itself.
+        Calls the receptionist_deduct_credits SQL function (migration
+        phase6), which locks the balance row, writes the ledger row and the
+        new balance together, and is idempotent per call_id. The old
+        read-then-write sequence lost a deduction whenever two calls ended
+        at the same time.
         """
 
         def _do() -> float:
-            resp = _request(
-                "GET",
-                f"{self._rest_url}/receptionist_credits",
-                self._api_key,
-                params={
-                    "company_slug": f"eq.{company_slug}",
-                    "select": "balance_credits",
-                },
-            )
-            rows = resp.json()
-            current_balance = float(rows[0]["balance_credits"]) if rows else 0.0
-            new_balance = current_balance - billed_credits
-
-            _request(
-                "POST",
-                f"{self._rest_url}/receptionist_credit_transactions",
-                self._api_key,
-                json_body={
-                    "company_slug": company_slug,
-                    "delta_credits": -billed_credits,
-                    "balance_after": new_balance,
-                    "type": "deduction",
-                    "call_id": call_id,
-                },
-                prefer="return=minimal",
-            )
-
-            _request(
-                "PATCH",
-                f"{self._rest_url}/receptionist_credits",
-                self._api_key,
-                params={"company_slug": f"eq.{company_slug}"},
-                json_body={
-                    "balance_credits": new_balance,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-                prefer="return=minimal",
-            )
-            return new_balance
+            try:
+                resp = _request(
+                    "POST",
+                    f"{self._rest_url}/rpc/receptionist_deduct_credits",
+                    self._api_key,
+                    json_body={
+                        "p_company_slug": company_slug,
+                        "p_call_id": call_id,
+                        "p_amount": billed_credits,
+                    },
+                )
+            except requests.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                # Function not created yet (migration phase6 not applied):
+                # bill the old way rather than not at all.
+                logger.warning(
+                    "receptionist_deduct_credits missing — falling back to "
+                    "non-atomic deduction; apply migrations/phase6"
+                )
+                return self._deduct_credits_legacy(company_slug, call_id, billed_credits)
+            return float(resp.json())
 
         try:
             return await asyncio.to_thread(_do)
         except requests.RequestException as exc:
             raise SupabaseError(f"deduct_credits failed for {company_slug!r}: {exc}") from exc
 
+    def _deduct_credits_legacy(
+        self, company_slug: str, call_id: str, billed_credits: float
+    ) -> float:
+        """Pre-phase6 read-then-write deduction. Not atomic; only used until
+        the migration is applied."""
+        resp = _request(
+            "GET",
+            f"{self._rest_url}/receptionist_credits",
+            self._api_key,
+            params={"company_slug": f"eq.{company_slug}", "select": "balance_credits"},
+        )
+        rows = resp.json()
+        current_balance = float(rows[0]["balance_credits"]) if rows else 0.0
+        new_balance = current_balance - billed_credits
+        _request(
+            "POST",
+            f"{self._rest_url}/receptionist_credit_transactions",
+            self._api_key,
+            json_body={
+                "company_slug": company_slug,
+                "delta_credits": -billed_credits,
+                "balance_after": new_balance,
+                "type": "deduction",
+                "call_id": call_id,
+            },
+            prefer="return=minimal",
+        )
+        _request(
+            "PATCH",
+            f"{self._rest_url}/receptionist_credits",
+            self._api_key,
+            params={"company_slug": f"eq.{company_slug}"},
+            json_body={
+                "balance_credits": new_balance,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            prefer="return=minimal",
+        )
+        return new_balance
+
     async def insert_call(self, call_row: dict) -> None:
-        def _do() -> None:
+        """Insert one receptionist_calls row.
+
+        If the phase6 columns aren't there yet (PostgREST rejects unknown
+        columns with a 400), retry without them: losing the caller's number
+        is better than losing the whole call record, which billing history
+        depends on.
+        """
+
+        def _post(row: dict) -> None:
             _request(
                 "POST",
                 f"{self._rest_url}/receptionist_calls",
                 self._api_key,
-                json_body=call_row,
+                json_body=row,
                 prefer="return=minimal",
             )
+
+        def _do() -> None:
+            try:
+                _post(call_row)
+            except requests.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 400:
+                    raise
+                reduced = {k: v for k, v in call_row.items() if k not in PHASE6_CALL_COLUMNS}
+                if reduced == call_row:
+                    raise
+                logger.warning(
+                    "insert_call rejected (%s) — retrying without phase6 columns",
+                    exc.response.text[:200],
+                )
+                _post(reduced)
 
         try:
             await asyncio.to_thread(_do)
