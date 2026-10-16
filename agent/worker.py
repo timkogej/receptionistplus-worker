@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
+import os
 import re
 import time
 import uuid
@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from livekit import agents, rtc
+from livekit import agents, api, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -34,20 +34,43 @@ from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
-from livekit.plugins import anthropic, elevenlabs, openai, soniox
+from livekit.agents import JobProcess
+from livekit.agents.voice import room_io
+from livekit.agents.voice.background_audio import (
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
+)
+from livekit.plugins import elevenlabs, noise_cancellation, silero, soniox
 
 from agent.booking_client import BookingError, init_company
+from agent.call_policy import (
+    MAX_CALL_SEC,
+    bill_call,
+    call_time_limit_sec,
+    company_slug_from_job_metadata,
+    duration_seconds,
+    normalize_phone,
+)
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
 from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, spoken_date_phrase
 from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL
 from agent.supabase_client import SupabaseClient
-from agent.tools import (
-    CHECK_SLOTS_FILLER_TEXT,
-    CREATE_BOOKING_FILLER_TEXT,
-    GET_SLOTS_FILLER_TEXT,
-    BookingTools,
+from agent.business_info import (
+    booking_window_days,
+    is_open,
+    parse_urnik,
+    render_business_block,
+    render_caller_block,
+    render_confirmation_line,
 )
+from agent.call_notes import CallNotes
+from agent.call_summary import summarize_call
+from agent.sms_client import booking_confirmation_text, send_sms
+from agent.tools import _sanitize_free_text as _sanitize
+from agent.llm_factory import LLMConfig, build_llm
+from agent.tools import BookingTools
 
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
@@ -122,36 +145,72 @@ TECHNICAL_DIFFICULTY_AUDIO_PATH = (
     Path(__file__).resolve().parent.parent / "assets" / "technical_difficulty_sl.wav"
 )
 
-# Calls shorter than this are treated as accidental hangups/misdials, not
-# billable conversations.
-ABANDONED_CALL_THRESHOLD_SEC = 10
-
-# Generic filler (any slow turn, not just the three booking tool calls — see
-# the entrypoint's _generic_filler_loop). Set above create_booking's own
-# filler delay (4.5s) so create_booking's specific tuned wording ("Samo
-# trenutek, urejam rezervacijo...") still gets first chance to fire on that
-# path — the most consequential moment (a real booking in progress)  keeps
-# its specific message; this generic one is a catch-all for everything else,
-# including plain conversational turns which previously had no filler.
-GENERIC_FILLER_PHRASES = {
-    # Kept in sync with STATIC_PROMPT_SL's approved waiting-phrase rule
-    # ("Samo trenutek" / "trenutek prosim" are the correct forms) — these are
-    # spoken by code rather than the model, so nothing enforces that
-    # automatically. "En moment..." was removed 2026-09-08: it's a Germanism,
-    # not one of the approved forms, and callers were hearing it from the
-    # filler path while the model itself was forbidden to say it.
-    "sl": [
-        "Samo trenutek...",
-        "Trenutek, prosim...",
-        "Samo sekundo...",
-    ],
-    "en": [
-        "One moment...",
-        "Just a second...",
-        "Give me a moment...",
-    ],
+# Spoken when the call reaches its time limit (see call_policy.
+# call_time_limit_sec). The callback promise is real: reaching the limit sets
+# callback_requested on the call row, which notifies the owner.
+TIME_LIMIT_CLOSING_MESSAGE = {
+    "sl": (
+        "Oprostite, klic moram zdaj zaključiti. Če česa še nismo uredili, vas "
+        "bomo poklicali nazaj. Lep dan še naprej."
+    ),
+    "en": (
+        "I'm sorry, I have to end the call now. If anything is still open, "
+        "we'll call you back. Have a good day."
+    ),
 }
-GENERIC_FILLER_DELAY = 5.0
+
+# How long to wait, once the time limit is reached, for an in-flight turn
+# (e.g. create_booking, up to 45s) to finish before closing anyway.
+TIME_LIMIT_IDLE_WAIT_SEC = 50.0
+
+# Spoken right before a SIP transfer to a person (transfer_to_person tool).
+TRANSFER_MESSAGE = {
+    "sl": "Povezujem vas, trenutek prosim.",
+    "en": "I'm putting you through now, one moment please.",
+}
+
+# SIP participant attributes set by LiveKit for telephony calls.
+SIP_DIALED_NUMBER_ATTR = "sip.trunkPhoneNumber"
+SIP_CALLER_NUMBER_ATTR = "sip.phoneNumber"
+
+# How long to wait for the SIP caller to appear in the room. They are
+# normally already there when the job starts (the room is created for the
+# call), so this only bounds a pathological case.
+PARTICIPANT_WAIT_SEC = 5.0
+
+# Slow turns (2026-10-16). The old generic filler waited for the session to
+# go idle and spoke "Samo trenutek..." if nothing happened for 5s — but
+# "thinking" counted as activity, so it never fired on a slow LLM turn, and
+# DID fire whenever the CALLER was silent for 5s (e.g. thinking about which
+# day suits them), telling a silent caller "one moment". It is gone. A slow
+# model turn is now covered by the typing sound (BACKGROUND AUDIO below),
+# which LiveKit plays for exactly as long as the agent is "thinking"; a
+# spoken line can't be used there, because session.say() queues behind the
+# reply being generated and would be heard after it. Tool calls keep their
+# own spoken fillers (tools.py), which are timed correctly by with_filler.
+
+# Caller silence (2026-10-16). LiveKit marks the user "away" after this many
+# seconds in which neither side speaks. First time: check the line is still
+# there; second time in a row: close politely. Long enough that a caller
+# looking something up (a diary, a card) isn't nagged.
+CALLER_SILENCE_SEC = 9.0
+STILL_THERE_PHRASES = {
+    "sl": ["Ste še na liniji?", "Halo, me slišite?"],
+    "en": ["Are you still there?", "Hello, can you hear me?"],
+}
+SILENCE_CLOSING_MESSAGE = {
+    "sl": "Žal vas ne slišim več. Pokličite nas, prosim, še enkrat. Lep dan.",
+    "en": "I'm afraid I can't hear you anymore. Please call us again. Have a good day.",
+}
+
+# Background audio (2026-10-16): keyboard typing while the agent is
+# "thinking" (LLM or tool call), so a pause sounds like someone typing into
+# a calendar rather than a dropped line, and optionally a quiet office
+# ambience under the whole call. Volumes are low on purpose — on an 8 kHz
+# phone line anything louder competes with speech. Switch off with
+# THINKING_SOUND=off / AMBIENT_SOUND=off in the env.
+THINKING_SOUND_VOLUME = 0.55
+AMBIENT_SOUND_VOLUME = 0.12
 
 # Rambling-caller redirect (2026-09-08). In "stt" turn detection a turn ends
 # on SILENCE, so a caller who monologues without pausing never produces an
@@ -214,27 +273,35 @@ REDIRECT_PHRASES = {
 PROMISE_CUE_PATTERNS = {
     "sl": re.compile(
         r"trenutek|preverim\b|preverjam\b|preveril|urejam\b|uredila\b|rezerviram\b"
-        r"|poskušam\b|počakajte",
+        r"|poskušam\b|počakajte|pogledam\b|vpisujem\b|vas vpišem\b",
         re.IGNORECASE,
     ),
     "en": re.compile(
         r"\b(?:one|just a|give me a) moment\b|\bhold on\b|\bplease wait\b"
-        r"|\blet me check\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
+        r"|\blet me (?:check|look|see)\b|\bi'?ll check\b|\bcheck(?:ing)?\b"
         r"|\bi'?m (?:checking|processing|trying)\b|\bprocessing\b|\btrying\b",
         re.IGNORECASE,
     ),
 }
 PROMISE_WATCHDOG_TIMEOUT_SEC = 12.0
+# On the first silent promise the model is nudged to follow through (a reply
+# is generated with PROMISE_RECOVERY_INSTRUCTIONS); only if that also leads
+# nowhere within another window is the call closed as a technical failure.
+# Before 2026-10-16 the first silent promise closed the call outright.
+PROMISE_RECOVERY_INSTRUCTIONS = (
+    "You told the caller you would check or do something, then stopped "
+    "without doing it. Do it now by calling the right tool. If you can't, "
+    "tell the caller briefly and honestly what you can do instead."
+)
 
 # Our own filler utterances also match PROMISE_CUE_PATTERNS by design, but
 # they're paired with an actual in-flight tool call that already has its own
 # real timeout (up to 45s for create_booking) — excluded so the watchdog's
 # much shorter window doesn't kill a call that's legitimately still running.
+# Tool fillers are now built per call (they name the day), so those are
+# checked against BookingTools.spoken_fillers at runtime instead.
 _KNOWN_FILLER_TEXTS = frozenset(
-    [p for phrases in GENERIC_FILLER_PHRASES.values() for p in phrases]
-    + [p for phrases in GET_SLOTS_FILLER_TEXT.values() for p in phrases]
-    + [p for phrases in CHECK_SLOTS_FILLER_TEXT.values() for p in phrases]
-    + [p for phrases in CREATE_BOOKING_FILLER_TEXT.values() for p in phrases]
+    p for phrases in STILL_THERE_PHRASES.values() for p in phrases
 )
 
 # Post-farewell goodbye loop (2026-09-21). Observed: after "Nasvidenje!" the
@@ -295,7 +362,7 @@ TIMEZONE = ZoneInfo("Europe/Ljubljana")
 _RELATIVE_DAY_LABELS = {0: "DANES", 1: "JUTRI", 2: "POJUTRIŠNJEM"}
 _RELATIVE_DAY_LABELS_EN = {0: "TODAY", 1: "TOMORROW", 2: "DAY AFTER TOMORROW"}
 
-def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
+def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str:
     """Build the date-lookup table given to the LLM each turn.
 
     Bug fixed 2026-08-14: the table used to only give each row's absolute
@@ -322,7 +389,7 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
     time_str = now.strftime("%H:%M")
 
     # ISO week: Monday=0..Sunday=6. Next week starts this many days out —
-    # always lands within the 14-row table (max is 7, when today is Monday).
+    # always lands within a 14-row table (max is 7, when today is Monday).
     next_monday_offset = 7 - now.weekday()
     next_week_offsets = range(next_monday_offset, next_monday_offset + 7)
 
@@ -336,7 +403,10 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         next_week_tag = "NASLEDNJI TEDEN"
 
     rows = []
-    for offset in range(14):
+    # One row per bookable day: the company's booking window
+    # (max_dnevi_rezervacija, see business_info.booking_window_days), at
+    # least 14 so "naslednji teden" always resolves.
+    for offset in range(max(14, days)):
         d = now + timedelta(days=offset)
         iso_date = d.strftime("%Y-%m-%d")
         weekday = weekday_names[d.weekday()]
@@ -355,7 +425,7 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
     if language == "en":
         return (
             f"Current time is {time_str}, timezone Europe/Ljubljana. Below is "
-            f"a pre-computed table of the next 14 days: ISO date, weekday, and "
+            f"a pre-computed table of the next {max(14, days)} days: ISO date, weekday, and "
             f"the exact spoken date phrase. The first three rows are tagged "
             f"[TODAY], [TOMORROW], and [DAY AFTER TOMORROW] directly — use "
             f"these tags as-is to resolve those specific words, do NOT count "
@@ -409,14 +479,16 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         "whichever date you were just looking at. Only if nothing earlier "
         "narrows it down and the weekday matches two rows, ask which one "
         "they mean (\"This Tuesday, or Tuesday next week?\").\n"
-            f"If a caller's requested date falls outside this table, tell "
-            f"them you'll have someone call back to confirm rather than "
-            f"guessing."
+            f"Bookings are open only {days} days ahead — the bookable days "
+            f"are the first {days} rows. If a caller asks for a date beyond "
+            f"that, say plainly that bookings are open only that far ahead, "
+            f"and offer a date within it or to pass the request on so "
+            f"someone calls back (take_message) — never guess."
         )
 
     return (
         f"Current time is {time_str}, timezone Europe/Ljubljana. Below is a "
-        f"pre-computed table of the next 14 days: ISO date, Slovenian weekday, "
+        f"pre-computed table of the next {max(14, days)} days: ISO date, Slovenian weekday, "
         f"and the exact spoken date phrase. The first three rows are tagged "
         f"[DANES] (today), [JUTRI] (tomorrow), and [POJUTRIŠNJEM] (the day "
         f"after tomorrow) directly — use these tags as-is to resolve those "
@@ -467,25 +539,42 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         "whichever date you were just looking at. Only if nothing earlier "
         "narrows it down and the weekday matches two rows, ask which one "
         "they mean (\"Mislite ta torek ali torek naslednji teden?\").\n"
-        f"If a caller's requested date falls outside this table, tell them "
-        f"you'll have someone call back to confirm rather than guessing."
+        f"Rezervacije so odprte samo {days} dni vnaprej — rezervirati se da "
+        f"prvih {days} vrstic. Če klicatelj želi datum dlje od tega, mu "
+        f"preprosto povej, da so termini odprti samo toliko dni vnaprej, in "
+        f"ponudi datum znotraj tega ali da prošnjo posreduješ lastniku "
+        f"(take_message) — nikoli ne ugibaj."
     )
 
 
-def _build_system_prompt(company_data: dict, language: str = DEFAULT_LANGUAGE) -> str:
+def _build_system_prompt(
+    company_data: dict,
+    language: str = DEFAULT_LANGUAGE,
+    *,
+    profile: dict | None = None,
+    instructions: str | None = None,
+    caller_phone: str | None = None,
+    customer: dict | None = None,
+    sms_confirmation: bool = False,
+) -> str:
     static_prompt = STATIC_PROMPT_EN if language == "en" else STATIC_PROMPT_SL
     logger.info(
         "language pack loaded: language=%s static_prompt=%s",
         language,
         "STATIC_PROMPT_EN" if language == "en" else "STATIC_PROMPT_SL",
     )
-    return (
-        static_prompt
-        + "\n\n"
-        + _build_date_context(language)
-        + "\n\n"
-        + render_company_prompt(company_data, language)
-    )
+    business_block, hours_known = render_business_block(profile, instructions, language)
+    window = booking_window_days(company_data.get("company"))
+    parts = [
+        static_prompt,
+        _build_date_context(language, window),
+        render_company_prompt(company_data, language, hours_known=hours_known),
+    ]
+    if business_block:
+        parts.append(business_block)
+    parts.append(render_caller_block(caller_phone, customer, language))
+    parts.append(render_confirmation_line(sms_confirmation, language))
+    return "\n\n".join(parts)
 
 
 class BootstrapAgent(Agent):
@@ -569,6 +658,10 @@ class ReceptionistAgent(Agent):
     async def on_enter(self) -> None:
         self.entered.set()
 
+    @property
+    def has_said_goodbye(self) -> bool:
+        return self._farewell_count > 0
+
     def note_assistant_message(self, text: str) -> None:
         if FAREWELL_PATTERNS[self._language].search(text):
             self._farewell_count += 1
@@ -635,6 +728,46 @@ class ReceptionistAgent(Agent):
         )
 
 
+def build_receptionist_agent(
+    company_data: dict,
+    language: str,
+    *,
+    booking_tools: BookingTools,
+    notes: CallNotes,
+    extra_tools: list | tuple = (),
+    on_suppressed_user_turn=None,
+    profile: dict | None = None,
+    instructions: str | None = None,
+    caller_phone: str | None = None,
+    customer: dict | None = None,
+    sms_confirmation: bool = False,
+) -> "ReceptionistAgent":
+    """The receptionist for one call. Shared by entrypoint() and the eval
+    harness (evals/run_evals.py), so both run the same prompt and tools.
+    extra_tools carries the ones bound to the live session (end_call_abusive).
+    """
+    return ReceptionistAgent(
+        language=language,
+        on_suppressed_user_turn=on_suppressed_user_turn,
+        instructions=_build_system_prompt(
+            company_data,
+            language,
+            profile=profile,
+            instructions=instructions,
+            caller_phone=caller_phone,
+            customer=customer,
+            sms_confirmation=sms_confirmation,
+        ),
+        tools=[
+            booking_tools.get_slots,
+            booking_tools.check_slots,
+            booking_tools.create_booking,
+            notes.take_message,
+            *extra_tools,
+        ],
+    )
+
+
 def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
     if settings.tts_provider == "elevenlabs":
         return elevenlabs.TTS(
@@ -695,25 +828,161 @@ async def _init_company_with_retry(
 
 
 def _build_llm(settings: Settings) -> llm.LLM:
-    # caching="ephemeral" prompt-caches the system prompt, tool schemas, and
-    # (incrementally, as it grows) the chat history — see the plugin's
-    # cache_control handling in llm.py. The system prompt alone (STATIC_PROMPT
-    # + date context + company data) runs ~2.7-3.1k tokens, comfortably over
-    # Haiku's 2048-token minimum cacheable length (higher than Sonnet/Opus's
-    # 1024) — measured 2026-08-29, see latency baseline investigation.
-    primary = anthropic.LLM(
-        model="claude-haiku-4-5",
-        api_key=settings.anthropic_api_key,
-        caching="ephemeral",
+    # Model, effort and fallback come from LLM_MODEL / LLM_EFFORT /
+    # LLM_FALLBACK_MODEL (agent/llm_factory.py). Default since 2026-10-16:
+    # Claude Haiku 5.5 at effort "low" with thinking off, falling back to
+    # gpt-5.4-mini — chosen on evals/run_evals.py (5.5: 21-23/24 per run vs
+    # 18/24 for Haiku 4.5 with the same judge; gpt-4o-mini, the previous
+    # fallback, 16/24 and once quoted a wrong price).
+    config = LLMConfig.from_env()
+    logger.info(
+        "llm: primary=%s effort=%s fallback=%s",
+        config.primary_model,
+        config.effort,
+        config.fallback_model,
     )
-    if not settings.openai_api_key:
-        return primary
+    return build_llm(
+        config,
+        anthropic_api_key=settings.anthropic_api_key,
+        openai_api_key=settings.openai_api_key,
+    )
 
-    # Phase 5 Part C: falls back to GPT-4o-mini if Anthropic is down. Only
-    # kicks in after Anthropic's own attempt fails outright — this is not a
-    # cost-saving load-balance, just an outage safety net.
-    fallback = openai.LLM(model="gpt-4o-mini", api_key=settings.openai_api_key)
-    return llm.FallbackAdapter([primary, fallback])
+
+def _render_greeting(custom: str | None, language: str, company_name: str) -> str:
+    """The greeting spoken after the disclosure.
+
+    The dashboard's greeting_text wins when set (it was saved but never used
+    until 2026-10-16); "{name}" or "{podjetje}" in it is replaced with the
+    company name. Plain str.replace, not str.format: owners type free text,
+    and a stray "{" must not crash the call. The AI disclosure is NOT part
+    of this and can't be removed by it — it is always spoken first, in code.
+    """
+    text = (custom or "").strip()
+    if not text:
+        return GREETING_TEMPLATE[language].format(name=company_name)
+    return text.replace("{name}", company_name).replace("{podjetje}", company_name)
+
+
+async def _insert_call_logged(supabase: SupabaseClient, row: dict) -> None:
+    try:
+        await supabase.insert_call(row)
+    except Exception:
+        logger.exception("failed to insert receptionist_calls row for call_id=%s", row.get("id"))
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in ("0", "off", "false", "no")
+
+
+def _room_options() -> room_io.RoomOptions:
+    """Noise cancellation on the caller's audio: LiveKit Cloud's BVC model
+    tuned for telephony (8 kHz, codec artefacts). It runs before VAD and STT,
+    so street noise, a TV or a hair dryer neither interrupts the agent nor
+    ends up in the transcript. NOISE_CANCELLATION=off disables it — e.g. if
+    the SIP trunk already applies its own (applying it twice degrades
+    speech)."""
+    if not _env_flag("NOISE_CANCELLATION"):
+        return room_io.RoomOptions()
+    return room_io.RoomOptions(
+        audio_input=room_io.AudioInputOptions(
+            noise_cancellation=noise_cancellation.BVCTelephony()
+        )
+    )
+
+
+async def _start_background_audio(ctx: JobContext, session: AgentSession) -> None:
+    """Typing while the agent thinks, optional quiet office ambience. Purely
+    cosmetic: any failure is logged and the call goes on without it."""
+    thinking = (
+        [
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING, volume=THINKING_SOUND_VOLUME, probability=0.6),
+            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=THINKING_SOUND_VOLUME, probability=0.4),
+        ]
+        if _env_flag("THINKING_SOUND")
+        else None
+    )
+    ambient = (
+        AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=AMBIENT_SOUND_VOLUME)
+        if _env_flag("AMBIENT_SOUND")
+        else None
+    )
+    if thinking is None and ambient is None:
+        return
+    try:
+        player = BackgroundAudioPlayer(ambient_sound=ambient, thinking_sound=thinking)
+        await player.start(room=ctx.room, agent_session=session)
+    except Exception:
+        logger.exception("background audio failed to start — continuing without it")
+
+
+async def _wait_for_caller(ctx: JobContext) -> rtc.RemoteParticipant | None:
+    """The SIP caller, or None if nobody shows up within PARTICIPANT_WAIT_SEC."""
+    try:
+        return await asyncio.wait_for(
+            ctx.wait_for_participant(), timeout=PARTICIPANT_WAIT_SEC
+        )
+    except asyncio.TimeoutError:
+        logger.warning("no caller joined within %.0fs", PARTICIPANT_WAIT_SEC)
+        return None
+
+
+async def _resolve_company_slug(
+    ctx: JobContext,
+    supabase: SupabaseClient,
+    dialed_number: str | None,
+    *,
+    fallback: str | None,
+) -> str | None:
+    """Which company this call is for, in order of precedence:
+
+    1. company_slug in the dispatch rule's job metadata (set per number in
+       LiveKit, no database needed);
+    2. receptionist_phone_numbers row for the dialled number;
+    3. COMPANY_SLUG from the worker's env (the pre-routing behaviour, so
+       the existing number keeps working before any row exists).
+
+    A failed lookup falls through to the next source rather than dropping
+    the call.
+    """
+    from_metadata = company_slug_from_job_metadata(ctx.job.metadata)
+    if from_metadata:
+        return from_metadata
+    if dialed_number:
+        try:
+            from_table = await supabase.lookup_company_by_number(dialed_number)
+        except Exception:
+            logger.exception("company lookup failed for dialed=%s", dialed_number)
+            from_table = None
+        if from_table:
+            return from_table
+    return fallback
+
+
+async def _speak_and_close(
+    ctx: JobContext, settings: Settings, language: str, message: str
+) -> None:
+    """Speak one fixed line on a TTS-only session, then close it. Used for
+    calls rejected before the real session exists (no credits, disabled,
+    unknown number)."""
+    gate_session = AgentSession(tts=_build_tts(settings, language))
+    try:
+        await gate_session.start(
+            room=ctx.room,
+            agent=Agent(
+                instructions=(
+                    "You only ever speak one fixed message and take no other "
+                    "action; you have no tools."
+                )
+            ),
+        )
+        await gate_session.say(message)
+    except Exception:
+        logger.exception("failed to speak rejection message")
+    finally:
+        await gate_session.aclose()
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -808,6 +1077,32 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.room.on("sip_dtmf_received", _on_sip_dtmf_received)
 
+    # Who is calling, and which of our numbers they dialled (2026-10-16).
+    # The dialled number decides the company; before this every call went
+    # to the one COMPANY_SLUG in the worker's env, so a company activating
+    # Receptionist+ from the dashboard got nothing.
+    caller = await _wait_for_caller(ctx)
+    caller_attrs = dict(caller.attributes) if caller is not None else {}
+    dialed_number = normalize_phone(caller_attrs.get(SIP_DIALED_NUMBER_ATTR))
+    caller_phone = normalize_phone(caller_attrs.get(SIP_CALLER_NUMBER_ATTR))
+    company_slug = await _resolve_company_slug(
+        ctx, supabase, dialed_number, fallback=settings.company_slug
+    )
+    logger.info(
+        "bootstrap: routing dialed=%s caller=%s -> company_slug=%s t=+%.3fs",
+        dialed_number,
+        "known" if caller_phone else "withheld",
+        company_slug,
+        _t(),
+    )
+    if company_slug is None:
+        # No mapping and no fallback: there is no company whose data, credits
+        # or language we could use. Say a neutral line and hang up; there is
+        # no receptionist_calls row to write (company_slug is NOT NULL).
+        logger.error("no company for dialed number %s — rejecting call", dialed_number)
+        await _speak_and_close(ctx, settings, DEFAULT_LANGUAGE, NO_CREDITS_MESSAGE[DEFAULT_LANGUAGE])
+        return
+
     # get_settings, get_balance, and the booking-v2 init fetch don't depend
     # on each other's results, so fire all three concurrently rather than
     # sequentially — measured 2026-08-30: sequential awaits added up to a
@@ -830,31 +1125,58 @@ async def entrypoint(ctx: JobContext) -> None:
             )
 
     settings_task = asyncio.create_task(
-        _timed("get_settings", supabase.get_settings(settings.company_slug))
+        _timed("get_settings", supabase.get_settings(company_slug))
     )
     balance_task = asyncio.create_task(
-        _timed("get_balance", supabase.get_balance(settings.company_slug))
+        _timed("get_balance", supabase.get_balance(company_slug))
     )
     init_task = asyncio.create_task(
-        _timed("booking-v2 init", _init_company_with_retry(settings.company_slug))
+        _timed("booking-v2 init", _init_company_with_retry(company_slug))
     )
 
+    # Opening hours, address, owner's notes, and whether the caller is an
+    # existing customer (by caller ID). Runs alongside init; needed only
+    # when the real agent is built, after the disclosure. Best effort: any
+    # failure leaves the agent without those extras, never drops the call.
+    async def _load_caller_context() -> tuple[dict | None, dict | None]:
+        try:
+            profile = await supabase.get_company_profile(company_slug)
+        except Exception:
+            logger.exception("company profile lookup failed for %s", company_slug)
+            return None, None
+        customer = None
+        if caller_phone and profile and profile.get("ID Podjetja"):
+            try:
+                customer = await supabase.find_customer_by_phone(
+                    profile["ID Podjetja"], caller_phone
+                )
+            except Exception:
+                logger.exception("customer lookup by phone failed")
+        logger.info("caller context: known_customer=%s", customer is not None)
+        return profile, customer
+
+    caller_context_task = asyncio.create_task(
+        _timed("caller context", _load_caller_context())
+    )
+
+    settings_fetch_failed = False
     try:
         settings_row = await settings_task
     except Exception:
         logger.exception(
             "failed to fetch receptionist_settings for company_slug=%s, "
             "defaulting language to %s",
-            settings.company_slug,
+            company_slug,
             DEFAULT_LANGUAGE,
         )
         settings_row = None
+        settings_fetch_failed = True
     language = (settings_row or {}).get("language") or DEFAULT_LANGUAGE
     if language not in SUPPORTED_LANGUAGES:
         logger.warning(
             "unsupported language %r for company_slug=%s, defaulting to %s",
             language,
-            settings.company_slug,
+            company_slug,
             DEFAULT_LANGUAGE,
         )
         language = DEFAULT_LANGUAGE
@@ -879,48 +1201,84 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception:
             logger.exception("failed to play technical-difficulty message")
 
-    balance = await balance_task
-    if balance <= 0:
+    # A missing balance used to crash the entrypoint here (uncaught
+    # SupabaseError → the caller heard nothing at all). A Supabase blip is
+    # not the company's fault, so the call goes ahead; it is still billed at
+    # the end if Supabase is back by then. With the balance unknown the call
+    # gets the full MAX_CALL_SEC limit.
+    try:
+        balance: float | None = await balance_task
+    except Exception:
+        logger.exception(
+            "failed to fetch balance for company_slug=%s — answering anyway",
+            company_slug,
+        )
+        balance = None
+
+    # enabled=false (switched off in the dashboard) was read but never
+    # checked, so a disabled Receptionist+ kept answering. A missing row
+    # means the company never activated it. Only a failed FETCH lets the
+    # call through, for the same reason as the balance above.
+    if settings_row is not None:
+        enabled = bool(settings_row.get("enabled"))
+    else:
+        enabled = settings_fetch_failed
+
+    reject_outcome = None
+    if not enabled:
+        reject_outcome = "disabled"
+    elif balance is not None and balance <= 0:
+        reject_outcome = "no_credits"
+
+    if reject_outcome is not None:
         logger.warning(
-            "no credits: company_slug=%s balance=%s, rejecting call",
-            settings.company_slug,
+            "rejecting call: company_slug=%s outcome=%s balance=%s",
+            company_slug,
+            reject_outcome,
             balance,
         )
         # Booking-v2 init was fired concurrently above but its result is
         # never needed on this path — cancel it rather than let it keep
         # running an unnecessary webhook call in the background.
         init_task.cancel()
-        gate_session = AgentSession(tts=_build_tts(settings, language))
-        await gate_session.start(
-            room=ctx.room,
-            agent=Agent(
-                instructions=(
-                    "You only ever speak one fixed message and take no other "
-                    "action; you have no tools."
-                )
-            ),
-        )
-        await gate_session.say(NO_CREDITS_MESSAGE[language])
-        await gate_session.aclose()
-        await supabase.insert_call(
-            {
-                "id": call_id,
-                "company_slug": settings.company_slug,
-                "started_at": started_at.isoformat(),
-                "ended_at": datetime.now(timezone.utc).isoformat(),
-                "duration_sec": 0,
-                "billed_credits": 0,
-                "outcome": "no_credits",
-                "transcript": [],
-                "livekit_room": livekit_room,
-            }
-        )
+        caller_context_task.cancel()
+        await _speak_and_close(ctx, settings, language, NO_CREDITS_MESSAGE[language])
+        try:
+            await supabase.insert_call(
+                {
+                    "id": call_id,
+                    "company_slug": company_slug,
+                    "started_at": started_at.isoformat(),
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                    "duration_sec": 0,
+                    "billed_credits": 0,
+                    "outcome": reject_outcome,
+                    "transcript": [],
+                    "livekit_room": livekit_room,
+                    "caller_phone": caller_phone,
+                    "dialed_number": dialed_number,
+                }
+            )
+        except Exception:
+            logger.exception("failed to log rejected call %s", call_id)
         return
+
+    call_limit_sec = MAX_CALL_SEC if balance is None else call_time_limit_sec(balance)
+    logger.info("call time limit: %ss (balance=%s)", call_limit_sec, balance)
 
     session = AgentSession(
         stt=_build_stt(settings, language),
         llm=_build_llm(settings),
         tts=_build_tts(settings, language),
+        # Silero VAD (2026-10-16, loaded once per process in prewarm): the
+        # caller starting to talk is detected from the audio itself, within
+        # a few hundred ms, instead of waiting for the STT's first words — so
+        # barge-in stops the agent sooner. Turn END is still decided by
+        # Soniox endpointing ("turn_detection": "stt" below); this only adds
+        # speech-start detection. Background noise that VAD would mistake for
+        # speech is cut first by BVCTelephony (room options at start()).
+        vad=ctx.proc.userdata.get("vad"),
+        user_away_timeout=CALLER_SILENCE_SEC,
         turn_handling={
             "turn_detection": "stt",
             "interruption": InterruptionOptions(enabled=True),
@@ -943,7 +1301,71 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Set by the end_call_abusive tool so _on_shutdown can log the call as
     # "ended_abusive" rather than the duration/booking-derived outcome.
-    call_end_state = {"abusive": False, "logged_directly": False}
+    call_end_state = {"abusive": False, "logged_directly": False, "transferred": False}
+
+    # Message / callback request for the owner: set by the take_message tool
+    # and by every code path that tells the caller "we'll call you back", so
+    # that promise always reaches the owner (a trigger on receptionist_calls
+    # notifies them; see migrations/phase6).
+    notes = CallNotes()
+
+    transfer_number = (settings_row or {}).get("transfer_number")
+    transfer_enabled = bool((settings_row or {}).get("transfer_enabled")) and bool(
+        transfer_number
+    )
+    call_profile: dict = {"profile": None}
+
+    @function_tool
+    async def transfer_to_person(context: RunContext, reason: str) -> dict:
+        """Put the caller through to a person at the business.
+
+        Use when the caller asks for a person, or for something you can't
+        handle. A short "putting you through" line is spoken automatically;
+        say nothing after calling this.
+
+        Args:
+            reason: One short sentence for the person who answers, in the
+                caller's language — what the caller needs.
+        """
+        schedule = parse_urnik((call_profile["profile"] or {}).get("urnik"))
+        if schedule and not is_open(schedule, datetime.now(TIMEZONE)):
+            return {
+                "success": False,
+                "error": "closed",
+                "message": (
+                    "The business is closed right now, so nobody can take the "
+                    "call. Tell the caller and offer take_message instead."
+                ),
+            }
+        if caller is None:
+            return {"success": False, "error": "no_caller", "message": "Offer take_message."}
+
+        logger.info("transferring call to a person: reason=%r", reason)
+        await context.wait_for_playout()
+        await session.say(TRANSFER_MESSAGE[language], allow_interruptions=False)
+        try:
+            await ctx.api.sip.transfer_sip_participant(
+                api.TransferSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    participant_identity=caller.identity,
+                    transfer_to=f"tel:{transfer_number}",
+                    play_dialtone=False,
+                )
+            )
+        except Exception:
+            logger.exception("SIP transfer failed")
+            return {
+                "success": False,
+                "error": "transfer_failed",
+                "message": (
+                    "The transfer didn't go through. Apologise briefly and "
+                    "offer to have someone call them back (take_message)."
+                ),
+            }
+        call_end_state["transferred"] = True
+        notes.message = notes.message or f"Klic prenesen na {transfer_number}. {_sanitize(reason)}"
+        # The caller has left the room; nothing more to say.
+        raise StopResponse
 
     @function_tool
     async def end_call_abusive(context: RunContext) -> None:
@@ -963,7 +1385,7 @@ async def entrypoint(ctx: JobContext) -> None:
             "ending call for continued abuse after warning: call_id=%s "
             "company_slug=%s",
             call_id,
-            settings.company_slug,
+            company_slug,
         )
         call_end_state["abusive"] = True
 
@@ -1030,7 +1452,6 @@ async def entrypoint(ctx: JobContext) -> None:
     @session.on("close")
     def _on_close(event) -> None:
         call_ended_at["value"] = datetime.now(timezone.utc)
-        generic_filler_task.cancel()
 
     # The real ReceptionistAgent needs company data (prompt + tools), which
     # now arrives AFTER the session has started and the disclosure is already
@@ -1062,20 +1483,61 @@ async def entrypoint(ctx: JobContext) -> None:
         user_turn_watch["last_log_at"] = 0.0
         user_turn_watch["peak_words"] = 0
 
-    _agent_active = asyncio.Event()
-
     def _on_agent_state_changed(event) -> None:
-        if event.new_state in ("speaking", "thinking"):
-            _agent_active.set()
         if event.new_state == "speaking":
             # The caller has been answered, so the current turn is no longer an
             # unanswered monologue — start counting afresh. Mirrors the SDK's
             # own rule that the turn tracker resets when the agent speaks.
             _reset_user_turn_watch("agent spoke")
 
+    # Caller silence: LiveKit sets the user "away" after CALLER_SILENCE_SEC
+    # with neither side speaking. Once: "Ste še na liniji?". Twice in a row:
+    # a short closing and hang up — before this a silent line (caller walked
+    # away, call dropped on their side without a SIP BYE) stayed open, and
+    # billed, until something upstream timed out.
+    silence_state = {"count": 0}
+
     def _on_user_state_changed(event) -> None:
         if event.new_state == "speaking":
-            _agent_active.set()
+            silence_state["count"] = 0
+            return
+        if event.new_state != "away":
+            return
+        receptionist = agent_ref["receptionist"]
+        if receptionist is None or "value" in call_ended_at:
+            return
+        if promise_state["pending"]:
+            # The agent promised to check something and went quiet; the
+            # promise watchdog handles that. "Ste še na liniji?" here would
+            # blame the caller and also cancel the watchdog.
+            return
+        silence_state["count"] += 1
+        asyncio.create_task(
+            _handle_caller_silence(silence_state["count"], receptionist),
+            name="caller_silence",
+        )
+
+    async def _handle_caller_silence(count: int, receptionist) -> None:
+        if receptionist.has_said_goodbye:
+            # Goodbye already said and the caller just hasn't hung up: asking
+            # "are you still there?" now would reopen a finished call.
+            logger.info("caller silent after goodbye — closing")
+            await session.aclose()
+            return
+        if count == 1:
+            phrases = STILL_THERE_PHRASES[language]
+            logger.info("caller silent %.0fs — checking the line", CALLER_SILENCE_SEC)
+            session.say(phrases[0])
+            return
+        logger.info("caller silent again — closing the call")
+        try:
+            await asyncio.wait_for(
+                session.say(SILENCE_CLOSING_MESSAGE[language], allow_interruptions=False),
+                timeout=10.0,
+            )
+        except Exception:
+            logger.exception("failed to speak silence closing message")
+        await session.aclose()
 
     session.on("agent_state_changed", _on_agent_state_changed)
     session.on("user_state_changed", _on_user_state_changed)
@@ -1153,36 +1615,6 @@ async def entrypoint(ctx: JobContext) -> None:
             name="rambling_redirect",
         )
 
-    # Generic filler for ANY slow turn, not just the three booking tool calls
-    # (get_slots/check_slots/create_booking already have their own
-    # context.with_filler() in tools.py, tuned per call — this is a separate,
-    # session-wide safety net for plain conversational turns, which had no
-    # filler at all before this and left callers in dead air on a slow
-    # LLM/TTS turn, e.g. during an Anthropic degradation). Mirrors the SDK's
-    # own private _FillerScheduler (voice/filler_scheduler.py) — wait for the
-    # session to go idle, then wait up to GENERIC_FILLER_DELAY for the agent
-    # or caller to become active again; if neither happens, speak a short
-    # filler and repeat. Built on public session.on()/wait_for_idle()/say()
-    # rather than the private class so it doesn't depend on SDK internals.
-    async def _generic_filler_loop() -> None:
-        phrases = GENERIC_FILLER_PHRASES[language]
-        step = 0
-        while True:
-            await session.wait_for_idle()
-            _agent_active.clear()
-            try:
-                await asyncio.wait_for(_agent_active.wait(), timeout=GENERIC_FILLER_DELAY)
-                continue  # agent/caller became active in time — no filler needed
-            except asyncio.TimeoutError:
-                pass
-            phrase = phrases[step % len(phrases)]
-            step += 1
-            session.say(phrase)
-
-    generic_filler_task = asyncio.create_task(
-        _generic_filler_loop(), name="generic_filler_loop"
-    )
-
     # Latency investigation (2026-08-14 voice test): aggregate turn-latency
     # numbers alone can't say whether time is going to STT endpointing, LLM
     # TTFT, or TTS startup — logging only, no behavior change. Reuses the
@@ -1240,6 +1672,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     async def _degrade_and_close() -> None:
         logger.error("ending call early: unrecoverable stt/tts/llm provider error")
+        # The apology says the owner will call back — make that true.
+        notes.request_callback("Klic se je prekinil zaradi tehnične težave asistenta.")
         try:
             await _say_technical_difficulty(session)
         finally:
@@ -1268,6 +1702,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # the utterance's own "speaking" state doesn't immediately satisfy its
     # own watchdog. Cancelled by any subsequent agent/user activity.
     _activity_since_promise = asyncio.Event()
+    # pending: a promise is being watched right now (the caller-silence
+    # handler stays out of it — the silence is ours, not the caller's).
+    promise_state = {"pending": False, "recovery_used": False}
 
     def _on_agent_state_changed_watchdog(event) -> None:
         if event.new_state in ("thinking", "speaking"):
@@ -1277,6 +1714,10 @@ async def entrypoint(ctx: JobContext) -> None:
             if (
                 text
                 and text not in _KNOWN_FILLER_TEXTS
+                and not (
+                    booking_ref["tools"] is not None
+                    and text in booking_ref["tools"].spoken_fillers
+                )
                 and PROMISE_CUE_PATTERNS[language].search(text)
             ):
                 _activity_since_promise.clear()
@@ -1287,21 +1728,47 @@ async def entrypoint(ctx: JobContext) -> None:
             _activity_since_promise.set()
 
     async def _watch_for_promise_followup() -> None:
+        promise_state["pending"] = True
         try:
             await asyncio.wait_for(
                 _activity_since_promise.wait(), timeout=PROMISE_WATCHDOG_TIMEOUT_SEC
             )
+            return
         except asyncio.TimeoutError:
-            if provider_error_state["degrading"]:
-                return
-            logger.error(
-                "promise watchdog fired: agent said %r and produced no "
-                "follow-up within %.0fs",
+            pass
+        finally:
+            promise_state["pending"] = False
+        if provider_error_state["degrading"]:
+            return
+        if not promise_state["recovery_used"]:
+            # First stall this call: nudge the model to follow through
+            # instead of hanging up on the caller. If the LLM itself is down
+            # this reply errors out and _on_session_error closes the call.
+            promise_state["recovery_used"] = True
+            logger.warning(
+                "promise watchdog: agent said %r and stopped for %.0fs — "
+                "asking the model to follow through",
                 last_assistant_text["value"],
                 PROMISE_WATCHDOG_TIMEOUT_SEC,
             )
-            provider_error_state["degrading"] = True
-            await _degrade_and_close()
+            _activity_since_promise.clear()
+            session.generate_reply(instructions=PROMISE_RECOVERY_INSTRUCTIONS)
+            try:
+                await asyncio.wait_for(
+                    _activity_since_promise.wait(), timeout=PROMISE_WATCHDOG_TIMEOUT_SEC
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+            if provider_error_state["degrading"]:
+                return
+        logger.error(
+            "promise watchdog fired: agent said %r and produced no follow-up "
+            "(recovery already tried) — closing as a technical failure",
+            last_assistant_text["value"],
+        )
+        provider_error_state["degrading"] = True
+        await _degrade_and_close()
 
     session.on("agent_state_changed", _on_agent_state_changed_watchdog)
     session.on("user_state_changed", _on_user_state_changed_watchdog)
@@ -1310,31 +1777,28 @@ async def entrypoint(ctx: JobContext) -> None:
         if call_end_state["logged_directly"]:
             return
         booking_tools = booking_ref["tools"]
+        if booking_tools is not None and booking_tools.background_tasks:
+            # A confirmation SMS still in flight: let it finish (it may set
+            # a note for the owner) before the call row is written.
+            await asyncio.wait(list(booking_tools.background_tasks), timeout=10.0)
         created_termin_id = booking_tools.created_termin_id if booking_tools else None
+        if booking_tools is not None and booking_tools.owner_followup_reason:
+            notes.request_callback(booking_tools.owner_followup_reason)
         ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)
-        duration_sec = max(0, math.ceil((ended_at - started_at).total_seconds()))
+        duration_sec = duration_seconds(started_at, ended_at)
 
-        if duration_sec < ABANDONED_CALL_THRESHOLD_SEC:
-            billed_credits = 0.0
-            outcome = "abandoned"
-        else:
-            billed_credits = round(duration_sec / 60.0, 2)
-            outcome = "booked" if created_termin_id else "info_only"
+        billed_credits, outcome = bill_call(
+            duration_sec,
+            created_termin_id=created_termin_id,
+            abusive=call_end_state["abusive"],
+            transferred=call_end_state["transferred"],
+            message_taken=notes.has_note and not call_end_state["transferred"],
+        )
 
-        # Reported as ended_abusive whatever else happened on the call. Billing
-        # is deliberately NOT changed by this: the call really did consume its
-        # duration, and the abusive-close path is the one place where making
-        # billing depend on the agent's own judgement would be a bad idea. If a
-        # booking was created before the caller turned abusive it is not lost —
-        # created_termin_id still goes into its own column below.
-        if call_end_state["abusive"]:
-            outcome = "ended_abusive"
-
-        new_balance = balance
         if billed_credits > 0:
             try:
                 new_balance = await supabase.deduct_credits(
-                    company_slug=settings.company_slug,
+                    company_slug=company_slug,
                     call_id=call_id,
                     billed_credits=billed_credits,
                 )
@@ -1342,33 +1806,38 @@ async def entrypoint(ctx: JobContext) -> None:
                 logger.exception(
                     "failed to deduct credits for call_id=%s company_slug=%s",
                     call_id,
-                    settings.company_slug,
+                    company_slug,
                 )
-                new_balance = balance
             else:
-                try:
-                    settings_row = await supabase.get_settings(settings.company_slug)
-                except Exception:
-                    logger.exception(
-                        "failed to fetch receptionist_settings for company_slug=%s",
-                        settings.company_slug,
-                    )
-                    settings_row = None
-                low_balance_threshold = (
-                    settings_row["low_balance_threshold"] if settings_row else 60
-                )
-                if new_balance < low_balance_threshold:
+                # The owner is notified by the low-balance trigger on
+                # receptionist_credits (Jedro+ repo); this is just for the log.
+                threshold = (settings_row or {}).get("low_balance_threshold") or 60
+                if new_balance < float(threshold):
                     logger.warning(
                         "LOW BALANCE: company_slug=%s balance=%s",
-                        settings.company_slug,
+                        company_slug,
                         new_balance,
                     )
+
+        # The job process gets shutdown_process_timeout (30s, see
+        # WorkerOptions) for all of this, and billing + the call row come
+        # first. Only when the owner will be NOTIFIED (message/callback) is a
+        # quick summary made before the insert, so the notification carries
+        # it; otherwise it is written afterwards.
+        summary = None
+        if notes.has_note:
+            summary = await summarize_call(
+                transcript,
+                language,
+                anthropic_api_key=settings.anthropic_api_key,
+                timeout=6.0,
+            )
 
         try:
             await supabase.insert_call(
                 {
                     "id": call_id,
-                    "company_slug": settings.company_slug,
+                    "company_slug": company_slug,
                     "started_at": started_at.isoformat(),
                     "ended_at": ended_at.isoformat(),
                     "duration_sec": duration_sec,
@@ -1377,12 +1846,62 @@ async def entrypoint(ctx: JobContext) -> None:
                     "transcript": transcript,
                     "created_termin_id": created_termin_id,
                     "livekit_room": livekit_room,
+                    "caller_phone": caller_phone,
+                    "dialed_number": dialed_number,
+                    "message": notes.message,
+                    "callback_requested": notes.callback_requested,
+                    "summary": summary,
                 }
             )
         except Exception:
             logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
+            return
+
+        if summary is None:
+            summary = await summarize_call(
+                transcript,
+                language,
+                anthropic_api_key=settings.anthropic_api_key,
+                timeout=12.0,
+            )
+            if summary:
+                try:
+                    await supabase.update_call_summary(call_id, summary)
+                except Exception:
+                    logger.exception("failed to store call summary for %s", call_id)
 
     ctx.add_shutdown_callback(_on_shutdown)
+
+    # Time limit (2026-10-16): MAX_CALL_SEC, or less when the balance at the
+    # start of the call can't cover that (call_policy.call_time_limit_sec).
+    # Measured from the job start, like the rest of the bootstrap timings.
+    async def _enforce_call_limit() -> None:
+        await asyncio.sleep(max(0.0, call_limit_sec - _t()))
+        if "value" in call_ended_at:
+            return
+        logger.warning("call reached its time limit (%ss) — closing", call_limit_sec)
+        # Don't cut into a turn in flight — create_booking can take up to
+        # 45s, and closing in the middle of it is the worst moment to hang up.
+        deadline = time.monotonic() + TIME_LIMIT_IDLE_WAIT_SEC
+        while (
+            session.agent_state in ("thinking", "speaking")
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.5)
+        booking_tools = booking_ref["tools"]
+        if not (booking_tools and booking_tools.created_termin_id):
+            notes.request_callback("Klic je dosegel časovno omejitev, preden je bilo vse urejeno.")
+        try:
+            await asyncio.wait_for(
+                session.say(TIME_LIMIT_CLOSING_MESSAGE[language], allow_interruptions=False),
+                timeout=15.0,
+            )
+        except Exception:
+            logger.exception("failed to speak time-limit closing message")
+        await session.aclose()
+
+    call_limit_task = asyncio.create_task(_enforce_call_limit(), name="call_limit")
+    session.on("close", lambda _event: call_limit_task.cancel())
 
     # Disclosure-first bootstrap (2026-09-22). Measured before this change:
     # every call opened with ~2.5s of silence after the job started — ~0.4s
@@ -1408,8 +1927,10 @@ async def entrypoint(ctx: JobContext) -> None:
                 text, "before agent ready"
             )
         ),
+        room_options=_room_options(),
     )
     logger.info("bootstrap: session started t=+%.3fs", _t())
+    await _start_background_audio(ctx, session)
     disclosure_handle = session.say(
         AI_DISCLOSURE[language].strip(), allow_interruptions=False
     )
@@ -1419,7 +1940,7 @@ async def entrypoint(ctx: JobContext) -> None:
     except BookingError:
         logger.exception(
             "booking-v2 init failed for company_slug=%s, degrading gracefully",
-            settings.company_slug,
+            company_slug,
         )
         # The disclosure is already playing on the main session, so the
         # apology goes out on that same session, after it — no separate gate
@@ -1436,10 +1957,11 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.exception("disclosure playout failed before init-failure apology")
         await _say_technical_difficulty(session)
         await session.aclose()
-        await supabase.insert_call(
+        await _insert_call_logged(
+            supabase,
             {
                 "id": call_id,
-                "company_slug": settings.company_slug,
+                "company_slug": company_slug,
                 "started_at": started_at.isoformat(),
                 "ended_at": datetime.now(timezone.utc).isoformat(),
                 "duration_sec": 0,
@@ -1447,11 +1969,53 @@ async def entrypoint(ctx: JobContext) -> None:
                 "outcome": "booking_unavailable",
                 "transcript": transcript,
                 "livekit_room": livekit_room,
+                "caller_phone": caller_phone,
+                "dialed_number": dialed_number,
+                # The apology promised a call back.
+                "message": "Asistent ni mogel naložiti podatkov podjetja (napaka rezervacijskega sistema).",
+                "callback_requested": True,
             }
         )
         return
 
-    booking_tools = BookingTools(settings.company_slug, company_data, language=language)
+    # Default on when the column isn't there yet is deliberately NOT done:
+    # without phase7 the setting is unknown, and asking for an email (the
+    # old behaviour) is the safe choice until SMS is confirmed to work.
+    sms_confirmation = bool((settings_row or {}).get("sms_confirmation", False))
+
+    async def _send_confirmation(booking: dict) -> None:
+        services = {str(s["id"]): s["naziv"] for s in company_data.get("services", [])}
+        text = booking_confirmation_text(
+            company_name=company_data["company"]["naziv"],
+            service_names=[services.get(str(i), "") for i in booking["service_ids"]],
+            date=booking["date"],
+            time_hhmm=booking["time"],
+            language=language,
+        )
+        result = await send_sms(
+            kind="confirmation",
+            company_slug=company_slug,
+            phone=normalize_phone(booking["phone"]) or booking["phone"],
+            text=text,
+            email=booking.get("email") or "",
+            termin_id=booking.get("terminId"),
+            call_id=call_id,
+        )
+        if not result.get("success"):
+            # The caller was told a text is coming; make sure the owner
+            # knows it didn't go, so they can confirm another way.
+            if not notes.message:
+                notes.message = (
+                    f"SMS potrdilo za rezervacijo {booking.get('terminId')} ni bilo "
+                    f"poslano ({result.get('error')}). Potrdite stranki drugače."
+                )
+
+    booking_tools = BookingTools(
+        company_slug,
+        company_data,
+        language=language,
+        on_booked=_send_confirmation if sms_confirmation else None,
+    )
     booking_ref["tools"] = booking_tools
 
     # Caller hung up while the disclosure was playing / init was running.
@@ -1462,16 +2026,63 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("bootstrap: call ended before the agent was ready t=+%.3fs", _t())
         return
 
-    receptionist_agent = ReceptionistAgent(
-        language=language,
+    try:
+        profile, customer = await asyncio.wait_for(caller_context_task, timeout=3.0)
+    except Exception:
+        logger.warning("caller context not ready — continuing without it")
+        profile, customer = None, None
+    call_profile["profile"] = profile
+
+    customer_email = ((customer or {}).get("Email stranke") or "").strip()
+
+    @function_tool
+    async def send_manage_link(context: RunContext) -> dict:
+        """Text the caller a link to the customer portal, where they can
+        cancel or move their existing appointment themselves. Only after
+        they said yes to getting it. The link is valid for one hour."""
+        result = await send_sms(
+            kind="manage_link",
+            company_slug=company_slug,
+            phone=caller_phone or "",
+            email=customer_email,
+            call_id=call_id,
+        )
+        if result.get("success"):
+            return {
+                "success": True,
+                "message": (
+                    "Sent. Tell the caller the text is on its way and that the "
+                    "link works for one hour."
+                ),
+            }
+        return {
+            "success": False,
+            "error": result.get("error"),
+            "message": (
+                "The text could not be sent. Apologise briefly and offer "
+                "take_message so the owner sorts out the appointment."
+            ),
+        }
+
+    extra_tools = [end_call_abusive]
+    if transfer_enabled:
+        extra_tools.insert(0, transfer_to_person)
+    # The portal logs customers in by email, so the link only works for a
+    # known customer (caller ID matched "Stranke") with an email on file.
+    if caller_phone and customer_email:
+        extra_tools.insert(0, send_manage_link)
+    receptionist_agent = build_receptionist_agent(
+        company_data,
+        language,
+        booking_tools=booking_tools,
+        notes=notes,
+        extra_tools=extra_tools,
         on_suppressed_user_turn=_record_suppressed_user_turn,
-        instructions=_build_system_prompt(company_data, language),
-        tools=[
-            booking_tools.get_slots,
-            booking_tools.check_slots,
-            booking_tools.create_booking,
-            end_call_abusive,
-        ],
+        profile=profile,
+        instructions=(settings_row or {}).get("instructions"),
+        caller_phone=caller_phone,
+        customer=customer,
+        sms_confirmation=sms_confirmation,
     )
     agent_ref["receptionist"] = receptionist_agent
 
@@ -1490,7 +2101,11 @@ async def entrypoint(ctx: JobContext) -> None:
             AGENT_SWAP_TIMEOUT_SEC,
         )
 
-    greeting = GREETING_TEMPLATE[language].format(name=company_data["company"]["naziv"])
+    greeting = _render_greeting(
+        (settings_row or {}).get("greeting_text"),
+        language,
+        company_data["company"]["naziv"],
+    )
     try:
         await session.say(greeting)
     except Exception:
@@ -1503,10 +2118,25 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("greeting delivered, conversation active")
 
 
+def prewarm(proc: JobProcess) -> None:
+    """Runs once per worker process, before any call: loading Silero takes
+    ~1s and must not land on a caller's first second of silence."""
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        # Without VAD the call still works exactly as before (STT-only
+        # speech detection) — never refuse calls over it.
+        logger.exception("failed to load Silero VAD — running without it")
+
+
 if __name__ == "__main__":
     agents.cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            # Room for _on_shutdown: billing, the call row and the summary
+            # (default 10s would cut the summary — or worse — short).
+            shutdown_process_timeout=30.0,
             agent_name="receptionistplus-worker",
         )
     )

@@ -1,123 +1,144 @@
 # receptionistplus-worker
 
-A [LiveKit Agents](https://docs.livekit.io/agents/) Python worker that answers inbound SIP
-calls. Currently it does one thing on participant join: speak a fixed, configurable
-greeting via TTS, then wait silently. No STT and no LLM are wired up yet.
+The voice side of Receptionist+: a [LiveKit Agents](https://docs.livekit.io/agents/)
+Python worker that answers inbound phone calls for Jedro+ businesses, answers
+questions about their services, and books appointments.
 
-- STT/TTS: [Soniox](https://docs.livekit.io/agents/integrations/stt/soniox/) (`livekit-plugins-soniox`)
-- TTS (alternate): [ElevenLabs](https://docs.livekit.io/agents/integrations/tts/elevenlabs/) (`livekit-plugins-elevenlabs`)
-- Runtime: Python 3.12
+Dashboard, Stripe checkout and the credits UI live in the main Jedro+ repo
+(`app/api/receptionistplus/*`), not here.
 
-## Project layout
+## How a call works
+
+1. **Routing.** The dialled number (`sip.trunkPhoneNumber`) decides the company:
+   `company_slug` in the dispatch rule's job metadata, else a
+   `receptionist_phone_numbers` row, else `COMPANY_SLUG` from the env.
+2. **Gates.** `receptionist_settings.enabled` must be true and the credit balance
+   above zero, or the caller hears a short "can't take your call" line.
+3. **Disclosure first.** The EU AI Act notice plays (not interruptible) while the
+   company's services and staff load from the n8n `booking-v2` webhook (`init`).
+   Then the greeting: `receptionist_settings.greeting_text` if set, else
+   "Pozdravljeni, dobrodošli v {company}...".
+4. **Conversation.** Soniox STT → Claude Haiku 5.5 (thinking off, effort low;
+   gpt-5.4-mini fallback, `agent/llm_factory.py`) → Soniox TTS.
+   Prompt = `agent/static_prompt.py` (per language) + a 14-day date table +
+   the company block (`agent/company_prompt.py`).
+5. **Tools.** `get_slots`, `check_slots`, `create_booking` (booking-v2), `take_message`
+   (message / callback request for the owner), `end_call_abusive`.
+6. **Audio.** Caller audio goes through LiveKit noise cancellation (BVCTelephony)
+   and Silero VAD (fast barge-in); turn end is Soniox endpointing. While the
+   agent thinks you hear typing; tool calls that run long get a short spoken
+   line naming what is being checked. 9 s of silence → "Ste še na liniji?",
+   another 9 s → polite close.
+7. **Limits.** A call runs at most 15 minutes, less if the balance can't cover it
+   (`agent/call_policy.py`); the caller hears a closing line and the owner gets a
+   callback request.
+8. **After the call.** Credits are deducted atomically (`receptionist_deduct_credits`),
+   and a `receptionist_calls` row is written with outcome, transcript, caller number
+   and any message. A database trigger notifies the owner about messages.
+
+## Layout
 
 ```
 agent/
-  worker.py   # entrypoint: connects to LiveKit, speaks greeting, waits
-  config.py   # env-backed settings
-deploy/
-  receptionistplus-worker.service
-.env.example
-requirements.txt
+  worker.py          entrypoint: routing, gates, session, watchdogs, call logging
+  call_policy.py     pure rules: phone normalisation, time limit, billing/outcome
+  call_notes.py      take_message tool + callback requests from code paths
+  tools.py           booking tools and the business rules enforced in code
+  llm_factory.py     conversation LLM: Haiku 5.5 wrapper, fallback chain
+  booking_client.py  n8n booking-v2 webhook client (HMAC-signed)
+  supabase_client.py receptionist_* tables over PostgREST
+  static_prompt.py   SL/EN system prompts with rule IDs (stripped before use)
+  company_prompt.py  company data → prompt block
+  dates.py           spoken Slovenian/English dates
+evals/               conversation evals against a fake calendar (see below)
+migrations/          SQL to run by hand in the Supabase SQL editor
+scripts/             deploy.sh, purge_old_transcripts.py (GDPR, daily timer)
+deploy/              systemd units
+tests/               unit tests
+tools/tts_ab.py      offline TTS A/B (Soniox / ElevenLabs / Azure)
 ```
 
 ## Run locally
 
-Requires Python 3.12.
+Python 3.12 or 3.13.
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# fill in LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET and the
-# TTS_PROVIDER's API key (SONIOX_API_KEY or ELEVENLABS_API_KEY)
-
+python3.13 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env   # fill in the keys
 set -a; source .env; set +a
-python -m agent.worker dev
+.venv/bin/python -m agent.worker dev
 ```
 
-`dev` connects to LiveKit Cloud and prints logs to the console. Because the worker
-registers with `agent_name="receptionistplus-worker"`, it uses **explicit dispatch** —
-it will not join rooms until a dispatch rule/request targets that agent name (see
-step 0.6 of the project plan, not yet configured).
+The worker registers as `receptionistplus-worker` (explicit dispatch): it only
+joins rooms that a SIP dispatch rule sends to that agent name.
 
-## Deploy to the VPS (Ubuntu 24.04)
+## Tests and evals
 
-1. Install Python 3.12 and venv tooling:
+```bash
+.venv/bin/python -m unittest discover -s tests      # free, no network
+.venv/bin/python -m evals.run_evals                 # real LLM, fake calendar
+.venv/bin/python -m evals.run_evals --model claude-haiku-4-5 --repeat 3
+.venv/bin/python -m evals.latency                   # first-token latency per model
+```
 
-   ```bash
-   sudo apt update
-   sudo apt install -y python3.12 python3.12-venv
-   ```
+Evals run the real prompt and tools against `evals/fixtures/company_jedroplus.json`
+with booking-v2 replaced by an in-memory calendar — nothing is booked for real. A
+full run costs a few cents. Results go to `evals/results/` (gitignored) for
+before/after comparisons. Every real-call regression worth never seeing again
+belongs in `evals/scenarios.py`.
 
-2. Copy this repo to the server at `/opt/receptionist-plus`, then create the venv
-   and install dependencies:
+## n8n workflows this depends on
 
-   ```bash
-   cd /opt/receptionist-plus
-   python3.12 -m venv .venv
-   .venv/bin/pip install -r requirements.txt
-   ```
+| Workflow | ID | What the worker uses |
+|---|---|---|
+| Jedroplus Booking v2 | `XdrhufTyyypyYtey` | `init`, `slots`, `check-slots`, `create` (`source: "receptionist"` — email optional for this source only, since 2026-10-16) |
+| Receptionist+ – SMS stranki | `fjIke0d2r1d2m0Cm` | webhook `receptionist-sms`: booking confirmation and portal link SMS; HMAC enforced; quota and `message_outbox` like every other SMS |
+| sms-send (Jedro+) | `HC3rVZ6tVxp2YyVs` | called by the workflow above (BulkGate) |
 
-3. Create `/etc/receptionistplus/.env` from `.env.example` and fill in real credentials
-   (this file is loaded by the systemd unit and should be `chmod 600`, owned by the
-   service user):
+Backups of every workflow before a change: `~/n8n-backup/<timestamp>-<topic>/`.
+`scripts/send_test_sms.py --phone +386...` sends one real SMS through the
+whole chain (uses SMS quota).
 
-   ```bash
-   sudo mkdir -p /etc/receptionistplus
-   sudo cp .env.example /etc/receptionistplus/.env
-   sudo chmod 600 /etc/receptionistplus/.env
-   sudo $EDITOR /etc/receptionistplus/.env
-   ```
+## Deploy
 
-4. Install the systemd unit:
+```bash
+scripts/deploy.sh --dry-run
+scripts/deploy.sh            # add --units when deploy/*.service changed
+```
 
-   ```bash
-   sudo cp deploy/receptionistplus-worker.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable receptionistplus-worker
-   ```
-
-   The service runs as a dedicated `receptionistplus` user — create it first if it
-   doesn't exist (`sudo useradd --system --no-create-home receptionistplus`) and make
-   sure it owns `/opt/receptionist-plus`.
-
-5. Start it once SIP dispatch is configured:
-
-   ```bash
-   sudo systemctl start receptionistplus-worker
-   sudo systemctl status receptionistplus-worker
-   journalctl -u receptionistplus-worker -f
-   ```
+The script refuses uncommitted changes, runs the tests, rsyncs to
+`root@178.105.39.138:/opt/receptionist-plus`, installs requirements, restarts
+`receptionistplus-worker` and prints its log. Env lives in
+`/etc/receptionistplus/.env` on the server. **Migrations are not applied by the
+script** — run new files from `migrations/` in the Supabase SQL editor first.
 
 ## Configuration
 
-All settings are read from the environment (see `.env.example`):
-
-| Variable | Required | Description |
+| Variable | Required | |
 |---|---|---|
-| `LIVEKIT_URL` | yes | LiveKit Cloud project URL (`wss://...`) |
-| `LIVEKIT_API_KEY` | yes | LiveKit API key |
-| `LIVEKIT_API_SECRET` | yes | LiveKit API secret |
-| `SONIOX_API_KEY` | if `TTS_PROVIDER=soniox` | Soniox API key |
-| `ELEVENLABS_API_KEY` | if `TTS_PROVIDER=elevenlabs` | ElevenLabs API key |
-| `TTS_PROVIDER` | no (default `soniox`) | `soniox` or `elevenlabs` |
-| `TTS_VOICE_ID` | no | Provider-specific voice id/name; falls back to provider default |
+| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | yes | LiveKit Cloud project |
+| `ANTHROPIC_API_KEY` | yes | primary LLM |
+| `OPENAI_API_KEY` | no | fallback LLM if the primary fails |
+| `LLM_MODEL` | no (`claude-haiku-5-5`) | primary model; `openai:<id>` for OpenAI |
+| `LLM_EFFORT` | no (`low`) | effort for Claude 5.x models; empty = model default |
+| `LLM_FALLBACK_MODEL` | no (`openai:gpt-5.4-mini`) | empty = no fallback |
+| `SONIOX_API_KEY` | yes | STT, and TTS when `TTS_PROVIDER=soniox` |
+| `ELEVENLABS_API_KEY` | if `TTS_PROVIDER=elevenlabs` | |
+| `TTS_PROVIDER` | no (`soniox`) | `soniox` or `elevenlabs` |
+| `TTS_VOICE_ID` | no | provider voice; Soniox default `Maya` |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes | receptionist_* tables |
+| `BOOKING_V2_HMAC_SECRET` | yes in prod | signs booking-v2 requests |
+| `COMPANY_SLUG` | no | fallback company for numbers with no mapping |
+| `NOISE_CANCELLATION` | no (on) | BVCTelephony on caller audio; `off` if the trunk already does it |
+| `THINKING_SOUND` | no (on) | keyboard typing while the agent thinks |
+| `AMBIENT_SOUND` | no (on) | quiet office ambience under the call |
+| `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` | no | only for `tools/tts_ab.py` |
 
-## Comparing TTS providers (`tools/tts_ab.py`)
+To give a company a number, add a row (E.164) — or set `{"company_slug": "..."}`
+as the agent metadata on that number's LiveKit dispatch rule:
 
-A standalone script (no LiveKit runtime needed) that synthesizes a fixed set of
-Slovenian test sentences through both Soniox TTS and ElevenLabs Flash v2.5, so you
-can listen and compare quality on declension, dual forms, names, times, prices, and
-digit read-out:
-
-```bash
-export SONIOX_API_KEY=...
-export ELEVENLABS_API_KEY=...
-python tools/tts_ab.py
+```sql
+insert into receptionist_phone_numbers (phone_number, company_slug)
+values ('+38612345678', 'salon-x');
 ```
-
-Output goes to `tts_out/soniox/<n>.wav` and `tts_out/elevenlabs/<n>.mp3` (gitignored).
-Optional overrides: `SONIOX_TTS_VOICE` (default `Maya`), `SONIOX_TTS_MODEL` (default
-`tts-rt-v1`), `ELEVENLABS_VOICE_ID` (default Rachel, `21m00Tcm4TlvDq8ikWAM`).

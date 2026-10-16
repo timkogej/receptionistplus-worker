@@ -22,13 +22,9 @@ logger = logging.getLogger("receptionistplus-worker.booking")
 
 BOOKING_WEBHOOK_URL = "https://n8n.jedroplus.com/webhook/booking-v2"
 
-# Phase 5 Part A prep: HMAC-signs requests once the n8n side verifies them.
-# NOT ACTIVE YET — BOOKING_V2_HMAC_SECRET is intentionally unset in every
-# environment right now. n8n is being rolled out in log-only (non-enforcing)
-# mode first, to surface any callers of booking-v2 other than this worker
-# before signatures become mandatory. Do not set this env var until that
-# rollout is confirmed complete and we're ready to flip signing on here too.
-# The n8n Code node rejects timestamps more than 300s old — keep in sync.
+# HMAC-signs every request when BOOKING_V2_HMAC_SECRET is set (it is, in
+# production). The n8n side verifies the signature on the "Raw Body" and
+# rejects timestamps more than 300s old — keep the two in sync.
 _HMAC_SECRET_ENV = "BOOKING_V2_HMAC_SECRET"
 
 

@@ -12,6 +12,10 @@ EnvironmentFile=/etc/receptionistplus/.env
 ExecStart=/opt/receptionist-plus/.venv/bin/python -m agent.worker start
 Restart=on-failure
 RestartSec=5
+# On stop/restart the worker stops taking new calls and lets the ones in
+# progress finish (LiveKit drain). systemd's default 90s would SIGKILL a
+# call mid-booking; a call is capped at 15 min (agent/call_policy.py).
+TimeoutStopSec=960
 StandardOutput=journal
 StandardError=journal
 

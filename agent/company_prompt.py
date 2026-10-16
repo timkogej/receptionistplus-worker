@@ -30,13 +30,17 @@ def spoken_employee_names(employees: list[dict]) -> dict[str, str]:
     }
 
 
-def render_company_prompt(init_data: dict, language: str = "sl") -> str:
+def render_company_prompt(
+    init_data: dict, language: str = "sl", *, hours_known: bool = False
+) -> str:
+    """hours_known: the business block (business_info.py) carries real
+    opening hours, so the "you don't know the hours" line is left out."""
     if language == "en":
-        return _render_company_prompt_en(init_data)
-    return _render_company_prompt_sl(init_data)
+        return _render_company_prompt_en(init_data, hours_known)
+    return _render_company_prompt_sl(init_data, hours_known)
 
 
-def _render_company_prompt_sl(init_data: dict) -> str:
+def _render_company_prompt_sl(init_data: dict, hours_known: bool = False) -> str:
     company = init_data["company"]
     services = init_data.get("services", [])
     employees = init_data.get("employees_ui", [])
@@ -149,16 +153,17 @@ def _render_company_prompt_sl(init_data: dict) -> str:
         "storitev, to presodi znova za novo storitev."
     )
 
-    lines.append(
-        "\nZa delovni čas nimaš točnih podatkov — če te vprašajo po urniku, "
-        "ponudi namesto tega preverjanje prostih terminov za konkreten dan, "
-        "ali povej, da bo lastnik poklical nazaj."
-    )
+    if not hours_known:
+        lines.append(
+            "\nZa delovni čas nimaš točnih podatkov — če te vprašajo po urniku, "
+            "ponudi namesto tega preverjanje prostih terminov za konkreten dan, "
+            "ali ponudi, da vprašanje posreduješ lastniku (take_message)."
+        )
 
     return "\n".join(lines)
 
 
-def _render_company_prompt_en(init_data: dict) -> str:
+def _render_company_prompt_en(init_data: dict, hours_known: bool = False) -> str:
     company = init_data["company"]
     services = init_data.get("services", [])
     employees = init_data.get("employees_ui", [])
@@ -248,10 +253,11 @@ def _render_company_prompt_en(init_data: dict) -> str:
         "again for the new one."
     )
 
-    lines.append(
-        "\nYou don't have exact opening hours — if asked about the schedule, "
-        "offer to check available slots for a specific day instead, or say "
-        "the owner will call back."
-    )
+    if not hours_known:
+        lines.append(
+            "\nYou don't have exact opening hours — if asked about the schedule, "
+            "offer to check available slots for a specific day instead, or say "
+            "offer to pass the question on to the owner (take_message)."
+        )
 
     return "\n".join(lines)

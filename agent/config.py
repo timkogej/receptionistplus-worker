@@ -31,7 +31,10 @@ class Settings:
     tts_provider: str
     tts_voice_id: str | None
 
-    company_slug: str
+    # Fallback only: calls are routed by the dialled number (see
+    # worker._resolve_company_slug). Unset = numbers with no mapping are
+    # rejected.
+    company_slug: str | None
 
     supabase_url: str
     supabase_service_role_key: str
@@ -62,7 +65,7 @@ class Settings:
             openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
             tts_provider=tts_provider,
             tts_voice_id=os.environ.get("TTS_VOICE_ID") or None,
-            company_slug=_require("COMPANY_SLUG"),
+            company_slug=os.environ.get("COMPANY_SLUG") or None,
             supabase_url=_require("SUPABASE_URL"),
             supabase_service_role_key=_require("SUPABASE_SERVICE_ROLE_KEY"),
         )

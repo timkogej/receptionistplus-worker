@@ -45,7 +45,7 @@ still take several seconds — the workflow's confirmation-email/SMS tail runs
 before responding — create_booking wraps the webhook call in
 `context.with_filler(...)`, the framework's built-in mechanism for exactly
 this: if the session has been continuously idle for 4.5s, it speaks a filler
-line ("Super, urejam rezervacijo, samo trenutek prosim.") without blocking the underlying
+line ("Super, vas vpisujem, samo trenutek.") without blocking the underlying
 call. This does not change the 45s timeout — it just fills dead air.
 
 Timeout handling for create_booking specifically: a client-side timeout on
@@ -75,17 +75,19 @@ this retry pattern, not to any staleness in n8n's check-slots query.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time as time_module
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
+from agent.business_info import booking_window_days
 from agent.company_prompt import spoken_employee_names
-from agent.dates import spoken_date_label
+from agent.dates import SLOVENIAN_WEEKDAYS_ACCUSATIVE, spoken_date_label
 from agent.booking_client import (
     BookingError,
     BookingMalformedResponseError,
@@ -284,20 +286,38 @@ def _day_labels(dates, language: str) -> dict:
     return labels
 
 
-# Named (not inline) so worker.py's promise-follow-up watchdog can recognize
-# and exclude these specific utterances — they're paired with an actual
-# in-flight tool call that already has its own real timeout, so the
-# watchdog's shorter window must not treat them as an unfulfilled promise.
-GET_SLOTS_FILLER_TEXT = {
+# Filler lines, spoken only if a tool call is still running after its delay
+# (context.with_filler). Rewritten 2026-10-16 to sound like a person at a
+# desk rather than a status message: they say what is being looked at ("v
+# sredo") instead of announcing a process, and the booking one uses the
+# receptionist's own verb ("vpisujem vas"). Each spoken line is recorded in
+# BookingTools.spoken_fillers so worker.py's promise watchdog can tell them
+# apart from a model turn that promised a check and then stopped — the line
+# is paired with a real in-flight call that has its own timeout.
+#
+# get_slots for ONE day: {day} is the weekday after "v" (accusative).
+GET_SLOTS_DAY_FILLERS = {
     "sl": [
-        "Super, preverjam proste termine, samo trenutek prosim.",
-        "Seveda, preverjam proste termine, samo trenutek prosim.",
-        "V redu, preverjam proste termine, samo trenutek prosim.",
+        "Trenutek, pogledam, kaj imamo prosto v {day}.",
+        "Samo trenutek, pogledam koledar za {day}.",
+        "Pogledam {day}, trenutek prosim.",
     ],
     "en": [
-        "Great, checking available times, just a moment please.",
-        "Sure, checking available times, just a moment please.",
-        "Alright, checking available times, just a moment please.",
+        "One moment, let me look at {day}.",
+        "Just a second, I'm checking {day}.",
+        "Let me pull up {day}, one moment.",
+    ],
+}
+GET_SLOTS_RANGE_FILLERS = {
+    "sl": [
+        "Trenutek, pogledam, kaj imamo prosto.",
+        "Samo trenutek, pogledam v koledar.",
+        "Pogledam koledar, trenutek prosim.",
+    ],
+    "en": [
+        "One moment, let me see what we have.",
+        "Just a second, I'm looking at the calendar.",
+        "Let me check the calendar, one moment.",
     ],
 }
 # check_slots runs as the last step before create_booking, right after the
@@ -308,61 +328,97 @@ GET_SLOTS_FILLER_TEXT = {
 # callers heard "rezerviram" while only the availability check was running).
 CHECK_SLOTS_FILLER_TEXT = {
     "sl": [
-        "Samo trenutek, termin še preverjam.",
-        "Še trenutek, prosim — preverjam, ali je termin prost.",
+        "Še trenutek, prosim.",
+        "Samo še sekundo, prosim.",
     ],
     "en": [
-        "Just a moment, still checking that slot.",
-        "One moment please — checking the slot is still free.",
+        "Just a moment longer.",
+        "One more second, please.",
     ],
 }
 CREATE_BOOKING_FILLER_TEXT = {
     "sl": [
-        "Super, urejam rezervacijo, samo trenutek prosim.",
-        "Odlično, urejam rezervacijo, samo trenutek prosim.",
-        "Z veseljem urejam rezervacijo, samo trenutek prosim.",
+        "Super, vas vpisujem, samo trenutek.",
+        "Odlično, vpisujem vas, trenutek prosim.",
+        "Vpisujem rezervacijo, samo trenutek.",
     ],
     "en": [
-        "Great, I'm processing your booking, just a moment please.",
-        "Wonderful, processing your booking now, just a moment please.",
-        "Perfect, I'm setting up your booking, just a moment please.",
+        "Great, I'm putting you in now, one moment.",
+        "Perfect, I'm booking that in, just a moment.",
+        "Writing that in for you now, one moment.",
     ],
 }
 
+_EN_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _weekday_for_filler(iso_date: str, language: str) -> str | None:
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    if language == "en":
+        return _EN_WEEKDAYS[d.weekday()]
+    return SLOVENIAN_WEEKDAYS_ACCUSATIVE[d.weekday()]
+
 
 class BookingTools:
-    def __init__(self, company_slug: str, company_data: dict, language: str = "sl") -> None:
+    def __init__(
+        self,
+        company_slug: str,
+        company_data: dict,
+        language: str = "sl",
+        *,
+        on_booked=None,
+    ) -> None:
         self._company_slug = company_slug
         self._company_data = company_data
         self._language = language
+        # Same window as the online booking page (max_dnevi_rezervacija):
+        # get_slots won't look past it, so the phone can't book further
+        # ahead than the web.
+        self._window_days = booking_window_days(company_data.get("company"))
         self._last_check_key: tuple | None = None
         self._last_check_at: float = 0.0
         # Set on the first successful create_booking this session, for
         # receptionist_calls.created_termin_id / outcome (Phase 3 call logging).
         self.created_termin_id: str | None = None
-        # Round-robin step counters for filler-text variety within one call
-        # (same pattern as worker.py's _generic_filler_loop).
-        self._get_slots_filler_step = 0
-        self._check_slots_filler_step = 0
-        self._create_booking_filler_step = 0
+        # Set when the caller was told the owner will check/follow up (an
+        # ambiguous create_booking outcome). worker.py turns it into a
+        # callback request on the call row, so the owner actually hears.
+        self.owner_followup_reason: str | None = None
+        # Round-robin step for filler variety within one call, and every
+        # filler line actually handed to with_filler (see the note above
+        # GET_SLOTS_DAY_FILLERS).
+        self._filler_step = 0
+        self.spoken_fillers: set[str] = set()
+        # async callback(booking: dict) after a successful create_booking —
+        # worker.py sends the SMS confirmation from it. Runs in the
+        # background so the caller hears the confirmation straight away.
+        self._on_booked = on_booked
+        self.background_tasks: set = set()
 
-    def _next_get_slots_filler(self) -> str:
-        variants = GET_SLOTS_FILLER_TEXT[self._language]
-        text = variants[self._get_slots_filler_step % len(variants)]
-        self._get_slots_filler_step += 1
+    def _next_filler(self, variants: list[str], **fmt) -> str:
+        text = variants[self._filler_step % len(variants)].format(**fmt)
+        self._filler_step += 1
+        self.spoken_fillers.add(text)
         return text
 
-    def _next_check_slots_filler(self) -> str:
-        variants = CHECK_SLOTS_FILLER_TEXT[self._language]
-        text = variants[self._check_slots_filler_step % len(variants)]
-        self._check_slots_filler_step += 1
-        return text
+    def _get_slots_filler(self, start_date: str, end_date: str) -> str:
+        day = _weekday_for_filler(start_date, self._language) if start_date == end_date else None
+        if day:
+            return self._next_filler(GET_SLOTS_DAY_FILLERS[self._language], day=day)
+        return self._next_filler(GET_SLOTS_RANGE_FILLERS[self._language])
 
-    def _next_create_booking_filler(self) -> str:
-        variants = CREATE_BOOKING_FILLER_TEXT[self._language]
-        text = variants[self._create_booking_filler_step % len(variants)]
-        self._create_booking_filler_step += 1
-        return text
+    def _note_ambiguous_booking(
+        self, date: str, time: str, first_name: str, last_name: str
+    ) -> None:
+        name = " ".join(p for p in (first_name, last_name) if p).strip()
+        self.owner_followup_reason = (
+            f"Rezervacija za {name or 'stranko'} ({date} ob {time}) morda ni bila "
+            "potrjena — rezervacijski sistem ni vrnil jasnega odgovora. Preverite "
+            "v koledarju in po potrebi pokličite stranko."
+        )
 
     def _eligible_employee_ids(self, service_ids: list[str]) -> list[str]:
         by_service = self._company_data.get("employeesByServiceId", {})
@@ -521,12 +577,33 @@ class BookingTools:
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
             return refusal
+        window_note = None
+        last_day = (
+            datetime.now(_TIMEZONE).date() + timedelta(days=self._window_days - 1)
+        ).isoformat()
+        if start_date > last_day:
+            return {
+                "success": False,
+                "error": "beyond_booking_window",
+                "message": (
+                    f"Bookings are only possible up to {self._window_days} days "
+                    f"ahead (last bookable day {last_day}). Tell the caller and "
+                    "offer either a date within that window or to pass the "
+                    "request on to the owner with take_message."
+                ),
+            }
+        if end_date > last_day:
+            end_date = last_day
+            window_note = (
+                f"Only dates up to {last_day} were checked: bookings are open "
+                f"{self._window_days} days ahead."
+            )
         employee_id, any_person, eligible = self._resolve_person(
             service_ids, employee_id, any_person
         )
         try:
             async with context.with_filler(
-                self._next_get_slots_filler(), delay=2.5
+                self._get_slots_filler(start_date, end_date), delay=2.5
             ):
                 result = await booking_client.get_slots(
                     company_slug=self._company_slug,
@@ -544,6 +621,8 @@ class BookingTools:
             _filter_elapsed_times_today(result["slots"])
             result["time_of_day"] = _time_of_day_summary(result["slots"])
             result["day_labels"] = _day_labels(result["slots"], self._language)
+        if window_note and isinstance(result, dict):
+            result["note"] = window_note
         return result
 
     @function_tool
@@ -559,8 +638,8 @@ class BookingTools:
         """Check whether one exact date/time is still free right now.
 
         Call this as the LAST step before create_booking — after the caller
-        has confirmed the slot AND you have collected their name, email and
-        phone — with the exact same service_ids/employee_id/any_person/
+        has confirmed the slot AND you have collected their details (see
+        your instructions: name, phone, and email only when asked for) — with the exact same service_ids/employee_id/any_person/
         date/time, and then call create_booking straight away in the same
         turn. Never call it before collecting the caller's details: a check
         that old is stale, and create_booking rejects checks older than a
@@ -586,7 +665,7 @@ class BookingTools:
         )
         try:
             async with context.with_filler(
-                self._next_check_slots_filler(), delay=2.5
+                self._next_filler(CHECK_SLOTS_FILLER_TEXT[self._language]), delay=2.5
             ):
                 result = await booking_client.check_slots(
                     company_slug=self._company_slug,
@@ -626,8 +705,8 @@ class BookingTools:
         date: str,
         time: str,
         first_name: str,
-        email: str,
         phone: str,
+        email: str = "",
         last_name: str = "",
         employee_id: str | None = None,
         any_person: bool = False,
@@ -636,7 +715,7 @@ class BookingTools:
         """Actually reserve the appointment. Requires a just-completed check_slots.
 
         Call it right after check_slots, in the same turn, once the caller
-        has confirmed the slot and you have their name, email and phone. A
+        has confirmed the slot and you have their details. A
         check_slots result older than a minute is rejected
         (must_check_slots_first) — then just check again and retry.
 
@@ -654,8 +733,11 @@ class BookingTools:
             date: YYYY-MM-DD.
             time: HH:MM, 24-hour.
             first_name: Caller's first name.
-            email: Caller's email address.
-            phone: Caller's phone number.
+            phone: Caller's phone number (the number they call from, when
+                the caller line says so and they agreed).
+            email: Caller's email address — only if they gave one or it is
+                on file for a confirmed existing customer; may be empty
+                when confirmations go by SMS.
             last_name: Caller's last name, if given.
             employee_id: Employee ID, if any_person is False. Must be
                 someone who performs this service — anyone else is refused.
@@ -722,7 +804,7 @@ class BookingTools:
         self._last_check_key = None  # single use — force a fresh check per booking
         try:
             async with context.with_filler(
-                self._next_create_booking_filler(), delay=4.5
+                self._next_filler(CREATE_BOOKING_FILLER_TEXT[self._language]), delay=4.5
             ):
                 result = await booking_client.create_booking(
                     company_slug=self._company_slug,
@@ -740,6 +822,7 @@ class BookingTools:
                 )
         except BookingTimeoutError as exc:
             logger.error("create_booking timed out (ambiguous outcome): %s", exc)
+            self._note_ambiguous_booking(date, time, first_name, last_name)
             return _ambiguous_outcome_result(
                 any_person, error="ambiguous_timeout", language=self._language
             )
@@ -749,6 +832,7 @@ class BookingTools:
                 "outcome): %s",
                 exc,
             )
+            self._note_ambiguous_booking(date, time, first_name, last_name)
             return _ambiguous_outcome_result(
                 any_person,
                 error="ambiguous_malformed_response",
@@ -769,6 +853,24 @@ class BookingTools:
         logger.info("create_booking outcome: %s", result)
         if result.get("success") and result.get("terminId"):
             self.created_termin_id = result["terminId"]
+            # A retry after an ambiguous outcome went through cleanly.
+            self.owner_followup_reason = None
+            if self._on_booked is not None:
+                task = asyncio.create_task(
+                    self._on_booked(
+                        {
+                            "terminId": result["terminId"],
+                            "service_ids": list(service_ids),
+                            "date": date,
+                            "time": time,
+                            "phone": phone,
+                            "email": email,
+                        }
+                    ),
+                    name="on_booked",
+                )
+                self.background_tasks.add(task)
+                task.add_done_callback(self.background_tasks.discard)
         # Same label as get_slots/check_slots, for the final confirmation.
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):

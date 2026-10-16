@@ -23,6 +23,17 @@ SLOVENIAN_WEEKDAYS = [
     "nedelja",
 ]
 
+# "v <weekday>" takes the accusative: v ponedeljek, v sredo, v soboto.
+SLOVENIAN_WEEKDAYS_ACCUSATIVE = [
+    "ponedeljek",
+    "torek",
+    "sredo",
+    "četrtek",
+    "petek",
+    "soboto",
+    "nedeljo",
+]
+
 SLOVENIAN_MONTHS_GENITIVE = {
     1: "januarja",
     2: "februarja",

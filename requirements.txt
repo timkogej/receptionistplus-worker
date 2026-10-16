@@ -3,4 +3,11 @@ livekit-plugins-soniox==1.6.9
 livekit-plugins-elevenlabs==1.6.9
 livekit-plugins-anthropic==1.6.9
 livekit-plugins-openai==1.6.9
+livekit-plugins-silero==1.6.9
+# Versioned separately from livekit-agents; BVCTelephony needs LiveKit Cloud.
+livekit-plugins-noise-cancellation==0.3.2
+# livekit-plugins-anthropic 1.6.9 passes an httpx client to the SDK, which
+# anthropic>=1.0 (httpx2) rejects at construction: every call would fail
+# before saying a word. Pinned to the last 0.x until the plugin catches up.
+anthropic==0.125.0
 requests==2.34.2
