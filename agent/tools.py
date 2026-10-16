@@ -78,12 +78,13 @@ from __future__ import annotations
 import logging
 import re
 import time as time_module
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
+from agent.business_info import booking_window_days
 from agent.company_prompt import spoken_employee_names
 from agent.dates import SLOVENIAN_WEEKDAYS_ACCUSATIVE, spoken_date_label
 from agent.booking_client import (
@@ -365,6 +366,10 @@ class BookingTools:
         self._company_slug = company_slug
         self._company_data = company_data
         self._language = language
+        # Same window as the online booking page (max_dnevi_rezervacija):
+        # get_slots won't look past it, so the phone can't book further
+        # ahead than the web.
+        self._window_days = booking_window_days(company_data.get("company"))
         self._last_check_key: tuple | None = None
         self._last_check_at: float = 0.0
         # Set on the first successful create_booking this session, for
@@ -559,6 +564,27 @@ class BookingTools:
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
             return refusal
+        window_note = None
+        last_day = (
+            datetime.now(_TIMEZONE).date() + timedelta(days=self._window_days - 1)
+        ).isoformat()
+        if start_date > last_day:
+            return {
+                "success": False,
+                "error": "beyond_booking_window",
+                "message": (
+                    f"Bookings are only possible up to {self._window_days} days "
+                    f"ahead (last bookable day {last_day}). Tell the caller and "
+                    "offer either a date within that window or to pass the "
+                    "request on to the owner with take_message."
+                ),
+            }
+        if end_date > last_day:
+            end_date = last_day
+            window_note = (
+                f"Only dates up to {last_day} were checked: bookings are open "
+                f"{self._window_days} days ahead."
+            )
         employee_id, any_person, eligible = self._resolve_person(
             service_ids, employee_id, any_person
         )
@@ -582,6 +608,8 @@ class BookingTools:
             _filter_elapsed_times_today(result["slots"])
             result["time_of_day"] = _time_of_day_summary(result["slots"])
             result["day_labels"] = _day_labels(result["slots"], self._language)
+        if window_note and isinstance(result, dict):
+            result["note"] = window_note
         return result
 
     @function_tool

@@ -104,6 +104,7 @@ def bill_call(
     *,
     created_termin_id: str | None,
     abusive: bool = False,
+    transferred: bool = False,
     message_taken: bool = False,
 ) -> tuple[float, str]:
     """(billed_credits, outcome) for a finished call.
@@ -111,7 +112,8 @@ def bill_call(
     One credit per minute, to two decimals. Outcome precedence: a call the
     agent ended for abuse is reported as such whatever else happened (a
     booking made before that is still kept in created_termin_id); then a
-    booking; then a message/callback request; otherwise info_only. Calls
+    booking; then a transfer to a person; then a message/callback request;
+    otherwise info_only. Calls
     under ABANDONED_CALL_THRESHOLD_SEC are free and reported as abandoned.
     Billing never depends on the outcome — only on how long the line was
     open — so the agent's own judgement (e.g. calling someone abusive) can't
@@ -124,6 +126,8 @@ def bill_call(
         return billed, "ended_abusive"
     if created_termin_id:
         return billed, "booked"
+    if transferred:
+        return billed, "transferred"
     if message_taken:
         return billed, "message_taken"
     return billed, "info_only"

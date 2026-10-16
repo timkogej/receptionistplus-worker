@@ -77,6 +77,10 @@ class BillCall(unittest.TestCase):
         self.assertEqual(
             cp.bill_call(60, created_termin_id="OB-1", message_taken=True)[1], "booked"
         )
+        self.assertEqual(
+            cp.bill_call(60, created_termin_id=None, transferred=True, message_taken=True)[1],
+            "transferred",
+        )
 
     def test_outcome_never_changes_the_price(self):
         prices = {

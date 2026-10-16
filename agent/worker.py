@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from livekit import agents, rtc
+from livekit import agents, api, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -57,7 +57,16 @@ from agent.config import Settings
 from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, spoken_date_phrase
 from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL
 from agent.supabase_client import SupabaseClient
+from agent.business_info import (
+    booking_window_days,
+    is_open,
+    parse_urnik,
+    render_business_block,
+    render_caller_block,
+)
 from agent.call_notes import CallNotes
+from agent.call_summary import summarize_call
+from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
 
@@ -151,6 +160,12 @@ TIME_LIMIT_CLOSING_MESSAGE = {
 # How long to wait, once the time limit is reached, for an in-flight turn
 # (e.g. create_booking, up to 45s) to finish before closing anyway.
 TIME_LIMIT_IDLE_WAIT_SEC = 50.0
+
+# Spoken right before a SIP transfer to a person (transfer_to_person tool).
+TRANSFER_MESSAGE = {
+    "sl": "Povezujem vas, trenutek prosim.",
+    "en": "I'm putting you through now, one moment please.",
+}
 
 # SIP participant attributes set by LiveKit for telephony calls.
 SIP_DIALED_NUMBER_ATTR = "sip.trunkPhoneNumber"
@@ -345,7 +360,7 @@ TIMEZONE = ZoneInfo("Europe/Ljubljana")
 _RELATIVE_DAY_LABELS = {0: "DANES", 1: "JUTRI", 2: "POJUTRIŠNJEM"}
 _RELATIVE_DAY_LABELS_EN = {0: "TODAY", 1: "TOMORROW", 2: "DAY AFTER TOMORROW"}
 
-def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
+def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str:
     """Build the date-lookup table given to the LLM each turn.
 
     Bug fixed 2026-08-14: the table used to only give each row's absolute
@@ -372,7 +387,7 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
     time_str = now.strftime("%H:%M")
 
     # ISO week: Monday=0..Sunday=6. Next week starts this many days out —
-    # always lands within the 14-row table (max is 7, when today is Monday).
+    # always lands within a 14-row table (max is 7, when today is Monday).
     next_monday_offset = 7 - now.weekday()
     next_week_offsets = range(next_monday_offset, next_monday_offset + 7)
 
@@ -386,7 +401,10 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         next_week_tag = "NASLEDNJI TEDEN"
 
     rows = []
-    for offset in range(14):
+    # One row per bookable day: the company's booking window
+    # (max_dnevi_rezervacija, see business_info.booking_window_days), at
+    # least 14 so "naslednji teden" always resolves.
+    for offset in range(max(14, days)):
         d = now + timedelta(days=offset)
         iso_date = d.strftime("%Y-%m-%d")
         weekday = weekday_names[d.weekday()]
@@ -405,7 +423,7 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
     if language == "en":
         return (
             f"Current time is {time_str}, timezone Europe/Ljubljana. Below is "
-            f"a pre-computed table of the next 14 days: ISO date, weekday, and "
+            f"a pre-computed table of the next {max(14, days)} days: ISO date, weekday, and "
             f"the exact spoken date phrase. The first three rows are tagged "
             f"[TODAY], [TOMORROW], and [DAY AFTER TOMORROW] directly — use "
             f"these tags as-is to resolve those specific words, do NOT count "
@@ -459,14 +477,16 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         "whichever date you were just looking at. Only if nothing earlier "
         "narrows it down and the weekday matches two rows, ask which one "
         "they mean (\"This Tuesday, or Tuesday next week?\").\n"
-            f"If a caller's requested date falls outside this table, tell "
-            f"them you'll pass the request on so someone calls back to "
-            f"confirm (take_message) — never guess."
+            f"Bookings are open only {days} days ahead — the bookable days "
+            f"are the first {days} rows. If a caller asks for a date beyond "
+            f"that, say plainly that bookings are open only that far ahead, "
+            f"and offer a date within it or to pass the request on so "
+            f"someone calls back (take_message) — never guess."
         )
 
     return (
         f"Current time is {time_str}, timezone Europe/Ljubljana. Below is a "
-        f"pre-computed table of the next 14 days: ISO date, Slovenian weekday, "
+        f"pre-computed table of the next {max(14, days)} days: ISO date, Slovenian weekday, "
         f"and the exact spoken date phrase. The first three rows are tagged "
         f"[DANES] (today), [JUTRI] (tomorrow), and [POJUTRIŠNJEM] (the day "
         f"after tomorrow) directly — use these tags as-is to resolve those "
@@ -517,26 +537,40 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE) -> str:
         "whichever date you were just looking at. Only if nothing earlier "
         "narrows it down and the weekday matches two rows, ask which one "
         "they mean (\"Mislite ta torek ali torek naslednji teden?\").\n"
-        f"If a caller's requested date falls outside this table, tell them "
-        f"you'll pass the request on so someone calls back to confirm "
-        f"(take_message) — never guess."
+        f"Rezervacije so odprte samo {days} dni vnaprej — rezervirati se da "
+        f"prvih {days} vrstic. Če klicatelj želi datum dlje od tega, mu "
+        f"preprosto povej, da so termini odprti samo toliko dni vnaprej, in "
+        f"ponudi datum znotraj tega ali da prošnjo posreduješ lastniku "
+        f"(take_message) — nikoli ne ugibaj."
     )
 
 
-def _build_system_prompt(company_data: dict, language: str = DEFAULT_LANGUAGE) -> str:
+def _build_system_prompt(
+    company_data: dict,
+    language: str = DEFAULT_LANGUAGE,
+    *,
+    profile: dict | None = None,
+    instructions: str | None = None,
+    caller_phone: str | None = None,
+    customer: dict | None = None,
+) -> str:
     static_prompt = STATIC_PROMPT_EN if language == "en" else STATIC_PROMPT_SL
     logger.info(
         "language pack loaded: language=%s static_prompt=%s",
         language,
         "STATIC_PROMPT_EN" if language == "en" else "STATIC_PROMPT_SL",
     )
-    return (
-        static_prompt
-        + "\n\n"
-        + _build_date_context(language)
-        + "\n\n"
-        + render_company_prompt(company_data, language)
-    )
+    business_block, hours_known = render_business_block(profile, instructions, language)
+    window = booking_window_days(company_data.get("company"))
+    parts = [
+        static_prompt,
+        _build_date_context(language, window),
+        render_company_prompt(company_data, language, hours_known=hours_known),
+    ]
+    if business_block:
+        parts.append(business_block)
+    parts.append(render_caller_block(caller_phone, customer, language))
+    return "\n\n".join(parts)
 
 
 class BootstrapAgent(Agent):
@@ -698,6 +732,10 @@ def build_receptionist_agent(
     notes: CallNotes,
     extra_tools: list | tuple = (),
     on_suppressed_user_turn=None,
+    profile: dict | None = None,
+    instructions: str | None = None,
+    caller_phone: str | None = None,
+    customer: dict | None = None,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -706,7 +744,14 @@ def build_receptionist_agent(
     return ReceptionistAgent(
         language=language,
         on_suppressed_user_turn=on_suppressed_user_turn,
-        instructions=_build_system_prompt(company_data, language),
+        instructions=_build_system_prompt(
+            company_data,
+            language,
+            profile=profile,
+            instructions=instructions,
+            caller_phone=caller_phone,
+            customer=customer,
+        ),
         tools=[
             booking_tools.get_slots,
             booking_tools.check_slots,
@@ -1083,6 +1128,31 @@ async def entrypoint(ctx: JobContext) -> None:
         _timed("booking-v2 init", _init_company_with_retry(company_slug))
     )
 
+    # Opening hours, address, owner's notes, and whether the caller is an
+    # existing customer (by caller ID). Runs alongside init; needed only
+    # when the real agent is built, after the disclosure. Best effort: any
+    # failure leaves the agent without those extras, never drops the call.
+    async def _load_caller_context() -> tuple[dict | None, dict | None]:
+        try:
+            profile = await supabase.get_company_profile(company_slug)
+        except Exception:
+            logger.exception("company profile lookup failed for %s", company_slug)
+            return None, None
+        customer = None
+        if caller_phone and profile and profile.get("ID Podjetja"):
+            try:
+                customer = await supabase.find_customer_by_phone(
+                    profile["ID Podjetja"], caller_phone
+                )
+            except Exception:
+                logger.exception("customer lookup by phone failed")
+        logger.info("caller context: known_customer=%s", customer is not None)
+        return profile, customer
+
+    caller_context_task = asyncio.create_task(
+        _timed("caller context", _load_caller_context())
+    )
+
     settings_fetch_failed = False
     try:
         settings_row = await settings_task
@@ -1165,6 +1235,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # never needed on this path — cancel it rather than let it keep
         # running an unnecessary webhook call in the background.
         init_task.cancel()
+        caller_context_task.cancel()
         await _speak_and_close(ctx, settings, language, NO_CREDITS_MESSAGE[language])
         try:
             await supabase.insert_call(
@@ -1224,13 +1295,71 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # Set by the end_call_abusive tool so _on_shutdown can log the call as
     # "ended_abusive" rather than the duration/booking-derived outcome.
-    call_end_state = {"abusive": False, "logged_directly": False}
+    call_end_state = {"abusive": False, "logged_directly": False, "transferred": False}
 
     # Message / callback request for the owner: set by the take_message tool
     # and by every code path that tells the caller "we'll call you back", so
     # that promise always reaches the owner (a trigger on receptionist_calls
     # notifies them; see migrations/phase6).
     notes = CallNotes()
+
+    transfer_number = (settings_row or {}).get("transfer_number")
+    transfer_enabled = bool((settings_row or {}).get("transfer_enabled")) and bool(
+        transfer_number
+    )
+    call_profile: dict = {"profile": None}
+
+    @function_tool
+    async def transfer_to_person(context: RunContext, reason: str) -> dict:
+        """Put the caller through to a person at the business.
+
+        Use when the caller asks for a person, or for something you can't
+        handle. A short "putting you through" line is spoken automatically;
+        say nothing after calling this.
+
+        Args:
+            reason: One short sentence for the person who answers, in the
+                caller's language — what the caller needs.
+        """
+        schedule = parse_urnik((call_profile["profile"] or {}).get("urnik"))
+        if schedule and not is_open(schedule, datetime.now(TIMEZONE)):
+            return {
+                "success": False,
+                "error": "closed",
+                "message": (
+                    "The business is closed right now, so nobody can take the "
+                    "call. Tell the caller and offer take_message instead."
+                ),
+            }
+        if caller is None:
+            return {"success": False, "error": "no_caller", "message": "Offer take_message."}
+
+        logger.info("transferring call to a person: reason=%r", reason)
+        await context.wait_for_playout()
+        await session.say(TRANSFER_MESSAGE[language], allow_interruptions=False)
+        try:
+            await ctx.api.sip.transfer_sip_participant(
+                api.TransferSIPParticipantRequest(
+                    room_name=ctx.room.name,
+                    participant_identity=caller.identity,
+                    transfer_to=f"tel:{transfer_number}",
+                    play_dialtone=False,
+                )
+            )
+        except Exception:
+            logger.exception("SIP transfer failed")
+            return {
+                "success": False,
+                "error": "transfer_failed",
+                "message": (
+                    "The transfer didn't go through. Apologise briefly and "
+                    "offer to have someone call them back (take_message)."
+                ),
+            }
+        call_end_state["transferred"] = True
+        notes.message = notes.message or f"Klic prenesen na {transfer_number}. {_sanitize(reason)}"
+        # The caller has left the room; nothing more to say.
+        raise StopResponse
 
     @function_tool
     async def end_call_abusive(context: RunContext) -> None:
@@ -1652,7 +1781,8 @@ async def entrypoint(ctx: JobContext) -> None:
             duration_sec,
             created_termin_id=created_termin_id,
             abusive=call_end_state["abusive"],
-            message_taken=notes.has_note,
+            transferred=call_end_state["transferred"],
+            message_taken=notes.has_note and not call_end_state["transferred"],
         )
 
         if billed_credits > 0:
@@ -1679,6 +1809,20 @@ async def entrypoint(ctx: JobContext) -> None:
                         new_balance,
                     )
 
+        # The job process gets shutdown_process_timeout (30s, see
+        # WorkerOptions) for all of this, and billing + the call row come
+        # first. Only when the owner will be NOTIFIED (message/callback) is a
+        # quick summary made before the insert, so the notification carries
+        # it; otherwise it is written afterwards.
+        summary = None
+        if notes.has_note:
+            summary = await summarize_call(
+                transcript,
+                language,
+                anthropic_api_key=settings.anthropic_api_key,
+                timeout=6.0,
+            )
+
         try:
             await supabase.insert_call(
                 {
@@ -1696,10 +1840,25 @@ async def entrypoint(ctx: JobContext) -> None:
                     "dialed_number": dialed_number,
                     "message": notes.message,
                     "callback_requested": notes.callback_requested,
+                    "summary": summary,
                 }
             )
         except Exception:
             logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
+            return
+
+        if summary is None:
+            summary = await summarize_call(
+                transcript,
+                language,
+                anthropic_api_key=settings.anthropic_api_key,
+                timeout=12.0,
+            )
+            if summary:
+                try:
+                    await supabase.update_call_summary(call_id, summary)
+                except Exception:
+                    logger.exception("failed to store call summary for %s", call_id)
 
     ctx.add_shutdown_callback(_on_shutdown)
 
@@ -1820,13 +1979,27 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("bootstrap: call ended before the agent was ready t=+%.3fs", _t())
         return
 
+    try:
+        profile, customer = await asyncio.wait_for(caller_context_task, timeout=3.0)
+    except Exception:
+        logger.warning("caller context not ready — continuing without it")
+        profile, customer = None, None
+    call_profile["profile"] = profile
+
+    extra_tools = [end_call_abusive]
+    if transfer_enabled:
+        extra_tools.insert(0, transfer_to_person)
     receptionist_agent = build_receptionist_agent(
         company_data,
         language,
         booking_tools=booking_tools,
         notes=notes,
-        extra_tools=[end_call_abusive],
+        extra_tools=extra_tools,
         on_suppressed_user_turn=_record_suppressed_user_turn,
+        profile=profile,
+        instructions=(settings_row or {}).get("instructions"),
+        caller_phone=caller_phone,
+        customer=customer,
     )
     agent_ref["receptionist"] = receptionist_agent
 
@@ -1878,6 +2051,9 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
+            # Room for _on_shutdown: billing, the call row and the summary
+            # (default 10s would cut the summary — or worse — short).
+            shutdown_process_timeout=30.0,
             agent_name="receptionistplus-worker",
         )
     )
