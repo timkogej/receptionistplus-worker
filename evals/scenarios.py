@@ -14,7 +14,8 @@ Company data: evals/fixtures/company_jedroplus.json (Jedro Kozmetika).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -35,6 +36,9 @@ class Scripted:
     id: str
     language: str
     turns: list[Turn]
+    # Extra build_receptionist_agent kwargs: profile, instructions,
+    # caller_phone, customer.
+    context: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -45,6 +49,7 @@ class Simulated:
     check: Callable[[object, object], list[str]]
     max_turns: int = 22
     opening: str = "Pozdravljeni."
+    context: dict = field(default_factory=dict)
 
 
 def _next_week_weekday(weekday: int) -> str:
@@ -75,6 +80,33 @@ def _check_full_booking(fake, notes) -> list[str]:
     i = names.index("create_booking")
     if i == 0 or names[i - 1] != "check_slots":
         failures.append(f"create_booking not directly after check_slots: {names}")
+    return failures
+
+
+URNIK = json.dumps({
+    **{d: {"enabled": True, "intervals": [{"start": "08:00", "end": "16:00"}]}
+       for d in ("Ponedeljek", "Torek", "Sreda", "Četrtek", "Petek")},
+    "Sobota": {"enabled": False, "intervals": []},
+    "Nedelja": {"enabled": False, "intervals": []},
+})
+PROFILE = {"urnik": URNIK, "Naslov podjetja": "Ljubljanska cesta 505", "Navodila chatbot": ""}
+KNOWN_CALLER = {
+    "caller_phone": "+38641555123",
+    "customer": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
+}
+
+
+def _check_known_customer_booking(fake, notes) -> list[str]:
+    if len(fake.created) != 1:
+        return [f"expected exactly 1 booking, got {len(fake.created)}"]
+    b = fake.created[0]
+    failures = []
+    if b["phone"] != "+38641555123":
+        failures.append(f"phone {b['phone']!r} — should be the caller's number")
+    if b["email"].lower() != "ana.novak@primer.si":
+        failures.append(f"email {b['email']!r} — should be the stored one")
+    if (b.get("first_name") or "").lower() != "ana":
+        failures.append(f"first_name {b.get('first_name')!r}")
     return failures
 
 
@@ -203,5 +235,86 @@ SCENARIOS: list[Scripted | Simulated] = [
             "izberi prvo popoldansko. Potrdi, ko ti preberejo rezervacijo."
         ),
         check=_check_full_booking,
+    ),
+    Scripted(
+        "sl-delovni-cas",
+        "sl",
+        [
+            Turn(
+                "Kdaj imate odprto v soboto?",
+                judge=(
+                    "Says the business is closed on Saturday (per its opening "
+                    "hours: Monday to Friday 8-16, weekend closed). May mention "
+                    "the weekday hours. Times, if any, as words."
+                ),
+                forbid_tools=("take_message",),
+            )
+        ],
+        context={"profile": PROFILE},
+    ),
+    Scripted(
+        "sl-navodila-podjetja",
+        "sl",
+        [
+            Turn(
+                "Ali imate kje parkirati?",
+                judge=(
+                    "Says parking is free in the courtyard behind the building "
+                    "(from the owner's notes). Must not offer to forward the "
+                    "question to the owner, since it has the answer (asking "
+                    "whether it can help with anything else is fine)."
+                ),
+                forbid_tools=("take_message",),
+            )
+        ],
+        context={
+            "profile": PROFILE,
+            "instructions": "Parkiranje je brezplačno na dvorišču za stavbo.",
+        },
+    ),
+    Scripted(
+        "sl-clovek-brez-prenosa",
+        "sl",
+        [
+            Turn(
+                "Lahko govorim z lastnikom?",
+                judge=(
+                    "Does not claim it will connect or transfer the caller. "
+                    "Offers to leave the owner a message / have them call back, "
+                    "or asks how it can help."
+                ),
+            )
+        ],
+    ),
+    Scripted(
+        "sl-izven-okna",
+        "sl",
+        [
+            Turn(
+                "Imate kaj prosto čez dva meseca, sredi decembra, za pedikuro? "
+                "Vseeno mi je, kdo.",
+                judge=(
+                    "Explains that bookings are only possible a limited number "
+                    "of days ahead (about two weeks) and offers a nearer date "
+                    "or to pass the request on. Does not offer any December "
+                    "time slot."
+                ),
+                forbid_tools=("create_booking",),
+            )
+        ],
+    ),
+    Simulated(
+        "sl-znana-stranka-rezervacija",
+        "sl",
+        persona=(
+            "Si Ana Novak, stalna stranka kozmetičnega salona; kličeš s "
+            "svojega telefona. Želiš pedikuro naslednji teden v sredo "
+            "popoldan, vseeno ti je, kdo. Na vprašanje, ali govorijo s tabo, "
+            "reci ja. Na vprašanje, ali te lahko kontaktirajo na to številko, "
+            "reci ja. Svojega e-naslova ne povej, razen če te izrecno vprašajo. "
+            "Izberi prvo popoldansko uro in potrdi rezervacijo."
+        ),
+        check=_check_known_customer_booking,
+        context=KNOWN_CALLER,
     ),
 ]

@@ -29,6 +29,7 @@ from pathlib import Path
 
 import anthropic as anthropic_sdk
 from livekit.agents import AgentSession
+from livekit.agents import llm as llm_mod
 from livekit.agents.voice.run_result import ChatMessageEvent, FunctionCallEvent
 from livekit.plugins import anthropic
 
@@ -80,6 +81,32 @@ def _text_failures(language: str, turn_no: int, text: str) -> list[str]:
     ]
 
 
+_JUDGE_SYSTEM = (
+    "You grade one reply of an AI phone receptionist against an intent. The "
+    "reply may be in Slovenian; read it carefully in that language. First "
+    "reason in two to four sentences, checking each requirement of the "
+    "intent against the reply. Then end with exactly one final line: "
+    "VERDICT: PASS or VERDICT: FAIL."
+)
+
+
+async def _judge(judge_llm, reply: str, intent: str) -> tuple[bool, str]:
+    """Reason first, verdict last. LiveKit's built-in judge() forces a tool
+    call, which makes Claude 5.x decide before reasoning — it then failed
+    correct replies and argued itself back to "success" in the reason."""
+    ctx = llm_mod.ChatContext()
+    ctx.add_message(role="system", content=_JUDGE_SYSTEM)
+    ctx.add_message(role="user", content=f"Intent:\n{intent}\n\nReply:\n{reply}")
+    parts = []
+    async with judge_llm.chat(chat_ctx=ctx) as stream:
+        async for chunk in stream:
+            if chunk.delta and chunk.delta.content:
+                parts.append(chunk.delta.content)
+    text = "".join(parts).strip()
+    verdict = text.rsplit("VERDICT:", 1)[-1].strip().upper() if "VERDICT:" in text else ""
+    return verdict.startswith("PASS"), text
+
+
 def _load_env() -> None:
     env = ROOT.parent / ".env"
     if not env.exists():
@@ -91,12 +118,12 @@ def _load_env() -> None:
             os.environ.setdefault(key, value)
 
 
-def _build(language: str, model: str):
+def _build(language: str, model: str, context: dict | None = None):
     company = json.loads(FIXTURE.read_text())
     booking_tools = BookingTools("eval-company", company, language=language)
     notes = CallNotes()
     agent = build_receptionist_agent(
-        company, language, booking_tools=booking_tools, notes=notes
+        company, language, booking_tools=booking_tools, notes=notes, **(context or {})
     )
     name, _, effort = model.partition("@")
     llm = build_single_llm(name, effort=effort or None)
@@ -105,14 +132,6 @@ def _build(language: str, model: str):
 
 def _tool_names(result) -> list[str]:
     return [e.item.name for e in result.events if isinstance(e, FunctionCallEvent)]
-
-
-def _last_assistant_index(result) -> int | None:
-    idx = None
-    for i, e in enumerate(result.events):
-        if isinstance(e, ChatMessageEvent) and e.item.role == "assistant":
-            idx = i
-    return idx
 
 
 def _assistant_text(result) -> str:
@@ -124,7 +143,7 @@ def _assistant_text(result) -> str:
 
 
 async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
-    agent, llm, _tools, _notes = _build(sc.language, model)
+    agent, llm, _tools, _notes = _build(sc.language, model, sc.context)
     fake = FakeBooking()
     failures: list[str] = []
     transcript: list[dict] = []
@@ -144,21 +163,17 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
                     if t in names:
                         failures.append(f"turn {n}: forbidden tool {t} was called")
                 if turn.judge:
-                    idx = _last_assistant_index(result)
-                    if idx is None:
+                    if not reply:
                         failures.append(f"turn {n}: no assistant reply to judge")
                     else:
-                        try:
-                            await result.expect[idx].is_message(role="assistant").judge(
-                                judge_llm, intent=turn.judge
-                            )
-                        except AssertionError as exc:
-                            failures.append(f"turn {n}: judge: {str(exc).splitlines()[0]}")
+                        ok, reasoning = await _judge(judge_llm, reply, turn.judge)
+                        if not ok:
+                            failures.append(f"turn {n}: judge: {' '.join(reasoning.split())}")
     return {"failures": failures, "transcript": transcript}
 
 
 async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
-    agent, llm, _tools, notes = _build(sc.language, model)
+    agent, llm, _tools, notes = _build(sc.language, model, sc.context)
     fake = FakeBooking()
     caller = anthropic_sdk.AsyncAnthropic()
     # From the simulated caller's side, the receptionist is the "user".
@@ -175,6 +190,9 @@ async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
                 reply = _assistant_text(result) or "(tišina)"
                 transcript.append({"user": user_line, "tools": _tool_names(result), "agent": reply})
                 text_failures += _text_failures(sc.language, len(transcript), reply)
+                stored = ((sc.context.get("customer") or {}).get("Email stranke") or "").lower()
+                if stored and stored.split("@")[0] in reply.lower():
+                    text_failures.append(f"turn {len(transcript)}: read the stored email out loud")
                 caller_msgs.append({"role": "user", "content": reply})
                 if fake.created and any(
                     w in reply.lower() for w in ("lep dan", "nasvidenje", "goodbye", "have a")
