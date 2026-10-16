@@ -340,6 +340,10 @@ class BookingTools:
         # Set on the first successful create_booking this session, for
         # receptionist_calls.created_termin_id / outcome (Phase 3 call logging).
         self.created_termin_id: str | None = None
+        # Set when the caller was told the owner will check/follow up (an
+        # ambiguous create_booking outcome). worker.py turns it into a
+        # callback request on the call row, so the owner actually hears.
+        self.owner_followup_reason: str | None = None
         # Round-robin step counters for filler-text variety within one call
         # (same pattern as worker.py's _generic_filler_loop).
         self._get_slots_filler_step = 0
@@ -363,6 +367,16 @@ class BookingTools:
         text = variants[self._create_booking_filler_step % len(variants)]
         self._create_booking_filler_step += 1
         return text
+
+    def _note_ambiguous_booking(
+        self, date: str, time: str, first_name: str, last_name: str
+    ) -> None:
+        name = " ".join(p for p in (first_name, last_name) if p).strip()
+        self.owner_followup_reason = (
+            f"Rezervacija za {name or 'stranko'} ({date} ob {time}) morda ni bila "
+            "potrjena — rezervacijski sistem ni vrnil jasnega odgovora. Preverite "
+            "v koledarju in po potrebi pokličite stranko."
+        )
 
     def _eligible_employee_ids(self, service_ids: list[str]) -> list[str]:
         by_service = self._company_data.get("employeesByServiceId", {})
@@ -740,6 +754,7 @@ class BookingTools:
                 )
         except BookingTimeoutError as exc:
             logger.error("create_booking timed out (ambiguous outcome): %s", exc)
+            self._note_ambiguous_booking(date, time, first_name, last_name)
             return _ambiguous_outcome_result(
                 any_person, error="ambiguous_timeout", language=self._language
             )
@@ -749,6 +764,7 @@ class BookingTools:
                 "outcome): %s",
                 exc,
             )
+            self._note_ambiguous_booking(date, time, first_name, last_name)
             return _ambiguous_outcome_result(
                 any_person,
                 error="ambiguous_malformed_response",
@@ -769,6 +785,8 @@ class BookingTools:
         logger.info("create_booking outcome: %s", result)
         if result.get("success") and result.get("terminId"):
             self.created_termin_id = result["terminId"]
+            # A retry after an ambiguous outcome went through cleanly.
+            self.owner_followup_reason = None
         # Same label as get_slots/check_slots, for the final confirmation.
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):

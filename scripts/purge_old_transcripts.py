@@ -1,9 +1,10 @@
 """Phase 5 Part B: GDPR transcript retention.
 
-Anonymizes receptionist_calls.transcript for calls older than
-RETENTION_DAYS by clearing it to an empty array. The rest of the row
-(billing, outcome, duration) is kept — those aren't the PII this policy
-targets, and the business still needs them for billing history.
+Anonymizes receptionist_calls for calls older than RETENTION_DAYS: the
+transcript is cleared to an empty array, and the caller's phone number and
+message (phase6 columns) to null. The rest of the row (billing, outcome,
+duration) is kept — those aren't the PII this policy targets, and the
+business still needs them for billing history.
 
 Run daily via the receptionistplus-transcript-retention systemd timer
 (deploy/receptionistplus-transcript-retention.{service,timer}). Safe to
@@ -39,25 +40,32 @@ def main() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
     cutoff_iso = cutoff.isoformat()
 
-    response = requests.patch(
-        f"{supabase_url}/rest/v1/receptionist_calls",
-        headers={
-            "apikey": api_key,
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        },
-        params={
-            "started_at": f"lt.{cutoff_iso}",
-            "select": "id",
-        },
-        json={"transcript": []},
-        timeout=30,
-    )
+    def _patch(body: dict) -> requests.Response:
+        return requests.patch(
+            f"{supabase_url}/rest/v1/receptionist_calls",
+            headers={
+                "apikey": api_key,
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            params={
+                "started_at": f"lt.{cutoff_iso}",
+                "select": "id",
+            },
+            json=body,
+            timeout=30,
+        )
+
+    response = _patch({"transcript": [], "caller_phone": None, "message": None})
+    if response.status_code == 400:
+        # phase6 columns not there yet — clear what exists.
+        logger.warning("phase6 columns missing, clearing transcript only: %s", response.text[:200])
+        response = _patch({"transcript": []})
     response.raise_for_status()
     purged = response.json()
     logger.info(
-        "anonymized transcript for %d call(s) started before %s",
+        "anonymized %d call(s) started before %s",
         len(purged),
         cutoff_iso,
     )

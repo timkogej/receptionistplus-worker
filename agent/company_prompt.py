@@ -152,7 +152,7 @@ def _render_company_prompt_sl(init_data: dict) -> str:
     lines.append(
         "\nZa delovni čas nimaš točnih podatkov — če te vprašajo po urniku, "
         "ponudi namesto tega preverjanje prostih terminov za konkreten dan, "
-        "ali povej, da bo lastnik poklical nazaj."
+        "ali ponudi, da vprašanje posreduješ lastniku (take_message)."
     )
 
     return "\n".join(lines)
@@ -251,7 +251,7 @@ def _render_company_prompt_en(init_data: dict) -> str:
     lines.append(
         "\nYou don't have exact opening hours — if asked about the schedule, "
         "offer to check available slots for a specific day instead, or say "
-        "the owner will call back."
+        "offer to pass the question on to the owner (take_message)."
     )
 
     return "\n".join(lines)
