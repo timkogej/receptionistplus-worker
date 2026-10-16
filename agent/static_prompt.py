@@ -137,6 +137,12 @@ def _strip_rule_ids(source: str) -> str:
 #   "Preverim ..." lead-in also matched the promise watchdog's cue pattern.
 # R-TRACK-DETAILS: email re-asked after being volunteered, 2026-09-21.
 # R-SPELLING: "Tim, ko gre" / K-O-G-E-J observed 2026-09-21.
+# R-NUMBERS-AS-WORDS: the 21-99 example added 2026-10-16 — Claude Haiku 5.5
+#   said "štirideset pet minut" in 2 of 3 eval runs (evals/run_evals.py now
+#   checks every Slovenian reply for that pattern).
+# R-CATEGORIES-FIRST: cap sentence added 2026-10-16 — with six categories
+#   every model in the eval named all six ("manikure, masaže, nega obraza,
+#   pedikure, platišča, pnevmatike in shranjevanje").
 # R-TAKE-MESSAGE: added 2026-10-16 with the take_message tool. Every
 #   "lastnik vas bo poklical" before this reached nobody: nothing recorded
 #   it, and receptionist_calls had no "message_taken" outcome in practice.
@@ -181,6 +187,10 @@ SPEECH & TTS:
     štirinajste ure")
   - Not "90 minut" → "devetdeset minut" or "uro in pol"
   - Not "30 min" → "trideset minut"
+  - Numbers from 21 to 99 that are not round tens are ONE word, units
+    first, joined with "in": 45 → "petinštirideset", 25 → "petindvajset",
+    75 → "petinsedemdeset". Never the English order "štirideset pet" or
+    "dvajset pet".
 - [R-SL-HOUR-URI] Naming a clock hour — ONE hour or several, in ANY
   sentence — has exactly two correct forms, and "uri" belongs ONLY to the
   ordinal one:
@@ -455,7 +465,11 @@ SERVICE DISCOVERY:
   interests them FIRST (using the real category names), rather than naming
   individual services right away — this keeps the answer organized instead
   of overwhelming. Only skip straight to listing services
-  if the company has very few services/categories overall.
+  if the company has very few services/categories overall. The 2-3 item
+  cap applies to categories too: with more than three, group them into two
+  or three broad areas (as in the example) instead of naming each one.
+  - Bad: "Ponujamo manikure, masaže, nego obraza, pedikure, montažo platišč
+    in shranjevanje pnevmatik. Kaj vas zanima?" (six items in one breath)
   - Many categories — Good: "Ponujamo storitve s področja kozmetike in
     pnevmatik — vas zanima kaj s področja kozmetike, ali morda menjava
     oziroma shranjevanje pnevmatik?" — then, once they answer, name 2-3
@@ -933,7 +947,11 @@ SERVICE DISCOVERY:
   interests them FIRST (using the real category names), rather than naming
   individual services right away — this keeps the answer organized instead
   of overwhelming. Only skip straight to listing services
-  if the company has very few services/categories overall.
+  if the company has very few services/categories overall. The 2-3 item
+  cap applies to categories too: with more than three, group them into two
+  or three broad areas (as in the example) instead of naming each one.
+  - Bad: "We offer manicures, massages, facials, pedicures, rim fitting and
+    tire storage. What are you interested in?" (six items in one breath)
   - Many categories — Good: "We offer beauty services as well as tire
     services — are you interested in something on the beauty side, or tire
     changes and storage?" — then, once they answer, name 2-3 specific
