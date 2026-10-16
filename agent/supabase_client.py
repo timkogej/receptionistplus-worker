@@ -23,9 +23,19 @@ import requests
 logger = logging.getLogger("receptionistplus-worker.supabase")
 
 
-# receptionist_calls columns added by migrations/phase6_routing_credits_messages.sql.
+# receptionist_calls columns added by later migrations (phase6, phase7). An
+# insert that PostgREST rejects for an unknown column is retried without
+# them, so a deploy that runs ahead of its migration still logs the call.
 PHASE6_CALL_COLUMNS = frozenset(
-    {"caller_phone", "dialed_number", "message", "callback_requested"}
+    {"caller_phone", "dialed_number", "message", "callback_requested", "summary"}
+)
+
+_SETTINGS_BASE = "company_slug,enabled,low_balance_threshold,language,greeting_text"
+_SETTINGS_PHASE7 = _SETTINGS_BASE + ",instructions,transfer_enabled,transfer_number"
+
+_PROFILE_SELECT = (
+    '"ID Podjetja","Naziv Podjetja","Naslov podjetja","Kontaktni telefon",'
+    '"Spletna stran",urnik,"Navodila chatbot"'
 )
 
 
@@ -68,17 +78,22 @@ class SupabaseClient:
     async def get_settings(self, company_slug: str) -> dict | None:
         """Fetch receptionist_settings for a company, or None if no row exists."""
 
-        def _do() -> dict | None:
-            resp = _request(
+        def _get(select: str) -> list:
+            return _request(
                 "GET",
                 f"{self._rest_url}/receptionist_settings",
                 self._api_key,
-                params={
-                    "company_slug": f"eq.{company_slug}",
-                    "select": "company_slug,enabled,low_balance_threshold,language,greeting_text",
-                },
-            )
-            rows = resp.json()
+                params={"company_slug": f"eq.{company_slug}", "select": select},
+            ).json()
+
+        def _do() -> dict | None:
+            try:
+                rows = _get(_SETTINGS_PHASE7)
+            except requests.HTTPError as exc:
+                if exc.response is None or exc.response.status_code != 400:
+                    raise
+                # phase7 columns not there yet: the features they drive stay off.
+                rows = _get(_SETTINGS_BASE)
             return rows[0] if rows else None
 
         try:
@@ -108,6 +123,52 @@ class SupabaseClient:
             return await asyncio.to_thread(_do)
         except requests.RequestException as exc:
             raise SupabaseError(f"get_balance failed for {company_slug!r}: {exc}") from exc
+
+    async def get_company_profile(self, company_slug: str) -> dict | None:
+        """The company's row in "Podatki podjetij" (shared with the rest of
+        Jedro+): its "ID Podjetja", address, phone, website, opening hours
+        (urnik, JSON) and Chatbot+ instructions."""
+
+        def _do() -> dict | None:
+            rows = _request(
+                "GET",
+                f"{self._rest_url}/Podatki podjetij",
+                self._api_key,
+                params={"slug": f"eq.{company_slug}", "select": _PROFILE_SELECT, "limit": "1"},
+            ).json()
+            return rows[0] if rows else None
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"get_company_profile failed for {company_slug!r}: {exc}") from exc
+
+    async def find_customer_by_phone(self, company_id: str, phone_e164: str) -> dict | None:
+        """An existing customer of this company with this number, or None.
+
+        Only what the call needs: name, whether an email is on file, and
+        their preferred language. Nothing from here is stored by the worker.
+        """
+
+        def _do() -> dict | None:
+            rows = _request(
+                "GET",
+                f"{self._rest_url}/Stranke",
+                self._api_key,
+                params={
+                    "ID Podjetja": f"eq.{company_id}",
+                    "phone_e164": f"eq.{phone_e164}",
+                    "select": '"ID stranke",Ime,Priimek,"Email stranke",language',
+                    "order": '"Zadnja interakcija".desc.nullslast',
+                    "limit": "1",
+                },
+            ).json()
+            return rows[0] if rows else None
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"find_customer_by_phone failed: {exc}") from exc
 
     async def lookup_company_by_number(self, phone_number: str) -> str | None:
         """company_slug for a dialled E.164 number, or None if unmapped.
@@ -184,6 +245,31 @@ class SupabaseClient:
             return await asyncio.to_thread(_do)
         except requests.RequestException as exc:
             raise SupabaseError(f"deduct_credits failed for {company_slug!r}: {exc}") from exc
+
+    async def update_call_summary(self, call_id: str, summary: str) -> None:
+        """Add the post-call summary to an already written call row. A
+        missing summary column (phase7 not applied) is ignored."""
+
+        def _do() -> None:
+            try:
+                _request(
+                    "PATCH",
+                    f"{self._rest_url}/receptionist_calls",
+                    self._api_key,
+                    params={"id": f"eq.{call_id}"},
+                    json_body={"summary": summary},
+                    prefer="return=minimal",
+                )
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 400:
+                    logger.warning("summary column missing (phase7 not applied?)")
+                    return
+                raise
+
+        try:
+            await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"update_call_summary failed: {exc}") from exc
 
     def _deduct_credits_legacy(
         self, company_slug: str, call_id: str, billed_credits: float

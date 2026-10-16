@@ -198,7 +198,8 @@ class ToolAndDateIntegration(unittest.TestCase):
             self.worker_src,
         )
         self.assertNotIn('STATIC_PROMPT_SL = """', self.worker_src)
-        self.assertIn("static_prompt\n        + \"\\n\\n\"\n        + _build_date_context", self.worker_src)
+        # Order matters: static rules first, then the date table.
+        self.assertIn("        static_prompt,\n        _build_date_context(", self.worker_src)
 
 
 if __name__ == "__main__":
