@@ -18,7 +18,8 @@ Dashboard, Stripe checkout and the credits UI live in the main Jedro+ repo
    company's services and staff load from the n8n `booking-v2` webhook (`init`).
    Then the greeting: `receptionist_settings.greeting_text` if set, else
    "Pozdravljeni, dobrodošli v {company}...".
-4. **Conversation.** Soniox STT → Claude (Haiku; GPT-4o-mini fallback) → Soniox TTS.
+4. **Conversation.** Soniox STT → Claude Haiku 5.5 (thinking off, effort low;
+   gpt-5.4-mini fallback, `agent/llm_factory.py`) → Soniox TTS.
    Prompt = `agent/static_prompt.py` (per language) + a 14-day date table +
    the company block (`agent/company_prompt.py`).
 5. **Tools.** `get_slots`, `check_slots`, `create_booking` (booking-v2), `take_message`
@@ -38,6 +39,7 @@ agent/
   call_policy.py     pure rules: phone normalisation, time limit, billing/outcome
   call_notes.py      take_message tool + callback requests from code paths
   tools.py           booking tools and the business rules enforced in code
+  llm_factory.py     conversation LLM: Haiku 5.5 wrapper, fallback chain
   booking_client.py  n8n booking-v2 webhook client (HMAC-signed)
   supabase_client.py receptionist_* tables over PostgREST
   static_prompt.py   SL/EN system prompts with rule IDs (stripped before use)
@@ -72,6 +74,7 @@ joins rooms that a SIP dispatch rule sends to that agent name.
 .venv/bin/python -m unittest discover -s tests      # free, no network
 .venv/bin/python -m evals.run_evals                 # real LLM, fake calendar
 .venv/bin/python -m evals.run_evals --model claude-haiku-4-5 --repeat 3
+.venv/bin/python -m evals.latency                   # first-token latency per model
 ```
 
 Evals run the real prompt and tools against `evals/fixtures/company_jedroplus.json`
@@ -99,7 +102,10 @@ script** — run new files from `migrations/` in the Supabase SQL editor first.
 |---|---|---|
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | yes | LiveKit Cloud project |
 | `ANTHROPIC_API_KEY` | yes | primary LLM |
-| `OPENAI_API_KEY` | no | GPT-4o-mini fallback if Anthropic fails |
+| `OPENAI_API_KEY` | no | fallback LLM if the primary fails |
+| `LLM_MODEL` | no (`claude-haiku-5-5`) | primary model; `openai:<id>` for OpenAI |
+| `LLM_EFFORT` | no (`low`) | effort for Claude 5.x models; empty = model default |
+| `LLM_FALLBACK_MODEL` | no (`openai:gpt-5.4-mini`) | empty = no fallback |
 | `SONIOX_API_KEY` | yes | STT, and TTS when `TTS_PROVIDER=soniox` |
 | `ELEVENLABS_API_KEY` | if `TTS_PROVIDER=elevenlabs` | |
 | `TTS_PROVIDER` | no (`soniox`) | `soniox` or `elevenlabs` |

@@ -33,7 +33,7 @@ from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.utils.audio import audio_frames_from_file
 from livekit.agents.voice.turn import InterruptionOptions
-from livekit.plugins import anthropic, elevenlabs, openai, soniox
+from livekit.plugins import elevenlabs, soniox
 
 from agent.booking_client import BookingError, init_company
 from agent.call_policy import (
@@ -50,6 +50,7 @@ from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, spoken_date_phrase
 from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL
 from agent.supabase_client import SupabaseClient
 from agent.call_notes import CallNotes
+from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import (
     CHECK_SLOTS_FILLER_TEXT,
     CREATE_BOOKING_FILLER_TEXT,
@@ -754,25 +755,24 @@ async def _init_company_with_retry(
 
 
 def _build_llm(settings: Settings) -> llm.LLM:
-    # caching="ephemeral" prompt-caches the system prompt, tool schemas, and
-    # (incrementally, as it grows) the chat history — see the plugin's
-    # cache_control handling in llm.py. The system prompt alone (STATIC_PROMPT
-    # + date context + company data) runs ~2.7-3.1k tokens, comfortably over
-    # Haiku's 2048-token minimum cacheable length (higher than Sonnet/Opus's
-    # 1024) — measured 2026-08-29, see latency baseline investigation.
-    primary = anthropic.LLM(
-        model="claude-haiku-4-5",
-        api_key=settings.anthropic_api_key,
-        caching="ephemeral",
+    # Model, effort and fallback come from LLM_MODEL / LLM_EFFORT /
+    # LLM_FALLBACK_MODEL (agent/llm_factory.py). Default since 2026-10-16:
+    # Claude Haiku 5.5 at effort "low" with thinking off, falling back to
+    # gpt-5.4-mini — chosen on evals/run_evals.py (5.5: 21-23/24 per run vs
+    # 18/24 for Haiku 4.5 with the same judge; gpt-4o-mini, the previous
+    # fallback, 16/24 and once quoted a wrong price).
+    config = LLMConfig.from_env()
+    logger.info(
+        "llm: primary=%s effort=%s fallback=%s",
+        config.primary_model,
+        config.effort,
+        config.fallback_model,
     )
-    if not settings.openai_api_key:
-        return primary
-
-    # Phase 5 Part C: falls back to GPT-4o-mini if Anthropic is down. Only
-    # kicks in after Anthropic's own attempt fails outright — this is not a
-    # cost-saving load-balance, just an outage safety net.
-    fallback = openai.LLM(model="gpt-4o-mini", api_key=settings.openai_api_key)
-    return llm.FallbackAdapter([primary, fallback])
+    return build_llm(
+        config,
+        anthropic_api_key=settings.anthropic_api_key,
+        openai_api_key=settings.openai_api_key,
+    )
 
 
 def _render_greeting(custom: str | None, language: str, company_name: str) -> str:
