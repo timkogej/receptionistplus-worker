@@ -15,6 +15,7 @@ Company data: evals/fixtures/company_jedroplus.json (Jedro Kozmetika).
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable
@@ -53,6 +54,8 @@ class Simulated:
     max_turns: int = 22
     opening: str = "Pozdravljeni."
     context: dict = field(default_factory=dict)
+    # Optional check over the transcript (list of {"user", "agent", "tools"}).
+    transcript_check: Callable[[list], list[str]] | None = None
 
 
 def _next_week_weekday(weekday: int) -> str:
@@ -97,6 +100,21 @@ KNOWN_CALLER = {
     "caller_phone": "+38641555123",
     "customer": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
 }
+
+
+def _phone_before_name(transcript: list) -> list[str]:
+    """Withheld number: the phone comes first, so the lookup can find the
+    customer before a misheard name is collected (live call 2026-10-17)."""
+    phone_at = name_at = None
+    for i, t in enumerate(transcript):
+        a = (t.get("agent") or "").lower()
+        if phone_at is None and "telefonsk" in a:
+            phone_at = i
+        if name_at is None and re.search(r"\bime in priimek\b|\bkako vam je ime\b|\bvaše ime\b", a):
+            name_at = i
+    if name_at is not None and (phone_at is None or name_at < phone_at):
+        return [f"asked for the name (turn {name_at + 1}) before the phone number"]
+    return []
 
 
 def _check_spoken_known_customer(fake, notes) -> list[str]:
@@ -359,10 +377,36 @@ SCENARIOS: list[Scripted | Simulated] = [
             "prvo popoldansko uro in potrdi rezervacijo."
         ),
         check=_check_spoken_known_customer,
+        transcript_check=_phone_before_name,
+        # Like the live test call that asked for the name first: SMS
+        # confirmations and language detection on.
         context={
+            "sms_confirmation": True,
+            "switch_languages": ["sl", "en", "de", "hr", "it"],
             "spoken_customers": {
                 "+38641555123": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
-            }
+            },
+        },
+    ),
+    Simulated(
+        "sl-skrita-stevilka-ime-ze-povedano",
+        "sl",
+        opening="Pozdravljeni, tukaj Ana Nováková.",
+        persona=(
+            "Si Ana Novak, stalna stranka kozmetičnega salona; kličeš s skrito "
+            "številko in si se predstavila kot »Ana Nováková« (tako te pogosto "
+            "slišijo). Želiš pedikuro naslednji teden v sredo popoldan, vseeno "
+            "ti je, kdo. Ko te vprašajo za telefonsko številko, reci 041 555 "
+            "123. Če te vprašajo, ali si Ana Novak ali ali govorijo s tabo, "
+            "reci ja. Svojega e-naslova ne povej, razen če te izrecno vprašajo. "
+            "Izberi prvo popoldansko uro in potrdi rezervacijo."
+        ),
+        check=_check_spoken_known_customer,
+        context={
+            "sms_confirmation": True,
+            "spoken_customers": {
+                "+38641555123": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
+            },
         },
     ),
     Simulated(

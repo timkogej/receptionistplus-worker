@@ -168,6 +168,43 @@ class CreateBookingGate(unittest.TestCase):
         self.assertIs(self.created[0]["send_email_confirmation"], False)
         self.assertEqual(self.created[0]["email"], "ana@example.com")
 
+    def _with_customer(self):
+        async def lookup(phone):
+            return {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana@example.com"} if phone == "+38641555123" else None
+        self.tools.set_customer_lookup(lookup, caller_phone=None)
+
+    def test_spoken_number_of_existing_customer_with_other_name_is_held(self):
+        self._with_customer()
+        self._check()
+        result = self._create(first_name="Ana", last_name="Nováková", phone="041 555 123", email="")
+        self.assertEqual(result["error"], "existing_customer")
+        self.assertEqual(result["last_name"], "Novak")
+        self.assertEqual(self.created, [])
+        # Confirmed: retried with the stored details, the same check still counts.
+        result = self._create(first_name="Ana", last_name="Novak", phone="041 555 123", email="ana@example.com")
+        self.assertTrue(result["success"])
+        self.assertEqual(self.created[0]["phone"], "+38641555123")
+
+    def test_not_the_stored_customer_books_as_given(self):
+        self._with_customer()
+        self._check()
+        result = self._create(first_name="Eva", last_name="Kos", phone="041 555 123", not_the_stored_customer=True)
+        self.assertTrue(result["success"])
+        self.assertEqual(self.created[0]["last_name"], "Kos")
+
+    def test_same_name_fills_stored_email(self):
+        self._with_customer()
+        self._check()
+        self._create(first_name="ana", last_name="NOVAK", phone="+38641555123", email="")
+        self.assertEqual(self.created[0]["email"], "ana@example.com")
+
+    def test_caller_id_number_is_not_rechecked(self):
+        async def lookup(phone):
+            raise AssertionError("should not look up the caller-ID number")
+        self.tools.set_customer_lookup(lookup, caller_phone="+38640123456")
+        self._check()
+        self.assertTrue(self._create()["success"])
+
     def test_check_for_another_slot_does_not_count(self):
         self._check(time="11:00")
         self.assertEqual(self._create()["error"], "must_check_slots_first")

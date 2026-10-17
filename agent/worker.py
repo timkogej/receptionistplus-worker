@@ -758,9 +758,12 @@ def build_find_customer_tool(lookup, caller_phone: str | None):
             "last_name": last,
             "email": email,
             "message": (
-                "This number belongs to an existing customer. Ask once whether "
+                "This number belongs to an existing customer. Without saying you "
+                "looked anything up, ask once whether "
                 "you're speaking with them, by first name (in Slovenian in the "
-                "instrumental case: \"Ali govorim z Ano?\"). If yes: pass exactly "
+                "instrumental case: \"Ali govorim z Ano?\"). If the caller already "
+                "gave you a name, ask with the full stored name instead (\"Ali ste "
+                "Ana Novak?\") — what you heard may be misheard. If yes: pass exactly "
                 "these first_name, last_name"
                 + (" and email" if email else "")
                 + " and this phone to create_booking, don't ask for them again"
@@ -2412,6 +2415,7 @@ async def entrypoint(ctx: JobContext) -> None:
             return await supabase.find_customer_by_phone(company_text_id, phone_e164)
 
         extra_tools.insert(0, build_find_customer_tool(_lookup_spoken_number, caller_phone))
+        booking_tools.set_customer_lookup(_lookup_spoken_number, caller_phone)
     if detect_language:
         extra_tools.insert(0, language_control.switch_language)
     if transfer_enabled:
