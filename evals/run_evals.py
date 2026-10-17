@@ -36,7 +36,7 @@ from livekit.plugins import anthropic
 from agent.call_notes import CallNotes
 from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
-from agent.worker import LanguageControl, build_receptionist_agent
+from agent.worker import LanguageControl, build_find_customer_tool, build_receptionist_agent
 from evals.fake_booking import FakeBooking
 from evals.scenarios import SCENARIOS, Scripted, Simulated
 
@@ -132,6 +132,15 @@ def _build(language: str, model: str, context: dict | None = None):
     notes = CallNotes()
     control = None
     extra_tools = []
+    # "spoken_customers": {e164: "Stranke" row} — the call has find_customer
+    # (company id known), backed by this table instead of Supabase.
+    spoken = context.pop("spoken_customers", None)
+    if spoken is not None:
+        async def _lookup(phone_e164: str):
+            return spoken.get(phone_e164)
+
+        extra_tools.append(build_find_customer_tool(_lookup, context.get("caller_phone")))
+        context["customer_lookup"] = True
     if allowed:
         control = LanguageControl(
             call_lang={"code": language, "history": [language]},

@@ -99,6 +99,20 @@ KNOWN_CALLER = {
 }
 
 
+def _check_spoken_known_customer(fake, notes) -> list[str]:
+    if len(fake.created) != 1:
+        return [f"expected exactly 1 booking, got {len(fake.created)}"]
+    b = fake.created[0]
+    failures = []
+    if b["phone"] != "+38641555123":
+        failures.append(f"phone {b['phone']!r} — should be the spoken number in E.164")
+    if (b.get("last_name") or "") != "Novak":
+        failures.append(f"last_name {b.get('last_name')!r} — should be the stored 'Novak'")
+    if b["email"].lower() != "ana.novak@primer.si":
+        failures.append(f"email {b['email']!r} — should be the stored one")
+    return failures
+
+
 def _check_sms_confirmation_booking(fake, notes) -> list[str]:
     if len(fake.created) != 1:
         return [f"expected exactly 1 booking, got {len(fake.created)}"]
@@ -333,6 +347,25 @@ SCENARIOS: list[Scripted | Simulated] = [
         context=KNOWN_CALLER,
     ),
     Simulated(
+        "sl-skrita-stevilka-znana-stranka",
+        "sl",
+        persona=(
+            "Si Ana Novak, stalna stranka kozmetičnega salona, a kličeš s "
+            "skrito številko. Želiš pedikuro naslednji teden v sredo popoldan, "
+            "vseeno ti je, kdo. Ko te vprašajo za telefonsko številko, reci "
+            "041 555 123. Če te vprašajo, ali govorijo s tabo, reci ja. Če te "
+            "vprašajo za ime, reci »Ana Nováková« (tako te pogosto slišijo). "
+            "Svojega e-naslova ne povej, razen če te izrecno vprašajo. Izberi "
+            "prvo popoldansko uro in potrdi rezervacijo."
+        ),
+        check=_check_spoken_known_customer,
+        context={
+            "spoken_customers": {
+                "+38641555123": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
+            }
+        },
+    ),
+    Simulated(
         "sl-sms-potrdilo-brez-emaila",
         "sl",
         persona=(
@@ -342,7 +375,7 @@ SCENARIOS: list[Scripted | Simulated] = [
             "reci, da ga nočeš dati. Izberi prvo ponujeno uro in potrdi."
         ),
         check=_check_sms_confirmation_booking,
-        context={"sms_confirmation": True},
+        context={"sms_confirmation": True, "spoken_customers": {}},
     ),
     Scripted(
         "sl-odpoved-brez-orodja",

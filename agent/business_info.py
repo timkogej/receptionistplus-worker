@@ -126,21 +126,49 @@ def render_caller_block(
     caller_phone: str | None,
     customer: dict | None,
     language: str,
+    *,
+    can_lookup: bool = False,
 ) -> str:
+    """can_lookup: the call has find_customer, which matches a SPOKEN number
+    against existing customers the way caller ID does at call start."""
     en = language != "sl"
     if not caller_phone:
+        if not can_lookup:
+            return (
+                "Caller: the number is withheld — ask for a phone number as usual."
+                if en
+                else "Klicatelj: številka je skrita — telefonsko številko vprašaj kot običajno."
+            )
         return (
-            "Caller: the number is withheld — ask for a phone number as usual."
+            "Caller: the number is withheld. When booking, ask for the phone "
+            "number FIRST, before the name; read it back, and once they confirm "
+            "it, call find_customer with it and follow its answer — ask for the "
+            "name (and email) only if it finds nobody or they say it isn't them."
             if en
-            else "Klicatelj: številka je skrita — telefonsko številko vprašaj kot običajno."
+            else "Klicatelj: številka je skrita. Pri rezervaciji telefonsko "
+            "številko vprašaj NAJPREJ, pred imenom; preberi jo nazaj in, ko jo "
+            "potrdi, pokliči find_customer s to številko ter sledi odgovoru — "
+            "za ime (in e-naslov) vprašaj samo, če stranke ne najde ali če "
+            "klicatelj reče, da to ni on."
         )
+    other_number = (
+        (
+            " After they confirm that other number, call find_customer with it "
+            "unless this line already confirmed who they are."
+            if en
+            else " Ko drugo številko potrdi, pokliči find_customer z njo, razen "
+            "če si klicatelja po tej vrstici že potrdila."
+        )
+        if can_lookup
+        else ""
+    )
     if en:
         lines = [
             f"Caller: calling from {caller_phone}. Don't ask for a phone number "
             "and don't read this one out. Ask once: \"Can we reach you on the "
             "number you're calling from?\" If yes, pass exactly this number to "
             "create_booking; only if no, ask for another one (and read that "
-            "one back)."
+            "one back)." + other_number
         ]
     else:
         lines = [
@@ -148,7 +176,7 @@ def render_caller_block(
             "telefonsko številko in je ne beri na glas. Enkrat vprašaj: »Vas "
             "lahko kontaktiramo na številko, s katere kličete?« Če reče ja, pri "
             "create_booking uporabi točno to številko; šele če reče ne, vprašaj "
-            "za drugo (in to preberi nazaj)."
+            "za drugo (in to preberi nazaj)." + other_number
         ]
     if customer:
         first = _clean(customer.get("Ime"))
@@ -202,13 +230,15 @@ def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
     if language != "sl":
         return (
             "Confirmation: by SMS to the phone number of the booking — don't "
-            "ask for an email. After booking, mention they'll get a text."
+            "ask for an email, and don't explain that you don't need one: just "
+            "ask for the next detail. After booking, mention they'll get a text."
             if sms_confirmation
             else "Confirmation: by email — ask for the caller's email address."
         )
     return (
         "Potrdilo: pride po SMS na telefonsko številko rezervacije — za "
-        "e-naslov ne sprašuj. Po rezervaciji omeni, da bodo dobili SMS."
+        "e-naslov ne sprašuj in ne razlagaj, da ga ne potrebuješ: preprosto "
+        "vprašaj za naslednji podatek. Po rezervaciji omeni, da bodo dobili SMS."
         if sms_confirmation
         else "Potrdilo: pride po e-pošti — vprašaj za e-poštni naslov."
     )

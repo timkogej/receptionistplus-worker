@@ -54,7 +54,7 @@ from agent.call_policy import (
 )
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
-from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, WEEKDAYS, spoken_date_phrase
+from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, WEEKDAYS, slovenian_number, spoken_date_phrase
 from agent.static_prompt import ALL_FEATURES, build_static_prompt
 from agent.supabase_client import SupabaseClient
 from agent.business_info import (
@@ -402,7 +402,8 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str
             # Kept in Slovenian on purpose: written in English (2026-10-17
             # trim) the model echoed it aloud as English narration.
             "window": (
-                f"Rezervacije so odprte samo {days} dni vnaprej (prvih {days} "
+                # In words too: "14 dni" was copied into speech as digits.
+                f"Rezervacije so odprte samo {days} ({slovenian_number(days)}) dni vnaprej (prvih {days} "
                 "vrstic). Za kasnejši datum to preprosto povej in ponudi datum "
                 "znotraj tega ali da prošnjo posreduješ lastniku "
                 "(take_message) — nikoli ne ugibaj."
@@ -467,6 +468,7 @@ def _build_system_prompt(
     sms_confirmation: bool = False,
     switchable_to: list[str] | tuple = (),
     features=ALL_FEATURES,
+    customer_lookup: bool = False,
 ) -> str:
     static_prompt = build_static_prompt(language, switchable_to, features)
     logger.info(
@@ -483,7 +485,7 @@ def _build_system_prompt(
     ]
     if business_block:
         parts.append(business_block)
-    parts.append(render_caller_block(caller_phone, customer, language))
+    parts.append(render_caller_block(caller_phone, customer, language, can_lookup=customer_lookup))
     parts.append(render_confirmation_line(sms_confirmation, language))
     return "\n\n".join(parts)
 
@@ -712,6 +714,64 @@ class ReceptionistAgent(Agent):
         )
 
 
+def build_find_customer_tool(lookup, caller_phone: str | None):
+    """find_customer: an existing customer by a phone number the caller SAID
+    (withheld caller ID, or a different number than the one they call from).
+    With caller ID the lookup already happened at call start; a spoken
+    number needs the same, or booking-v2 matches only on phone + exact name
+    and a misheard surname becomes a duplicate customer.
+
+    lookup: async (phone_e164) -> "Stranke" row (Ime, Priimek, "Email
+    stranke") or None. Shared with the eval harness."""
+
+    @function_tool
+    async def find_customer(context: RunContext, phone: str) -> dict:
+        """Look up an existing customer by the phone number the caller said,
+        right after they confirmed your read-back of it — before asking for
+        their name.
+
+        Args:
+            phone: The number as the caller gave it, e.g. "041 555 123".
+        """
+        e164 = normalize_phone(phone)
+        if not e164:
+            return {"found": False, "message": "Not a phone number; ask for it again."}
+        if caller_phone and e164 == caller_phone:
+            return {"found": False, "message": "That's the number they're calling from — follow the caller line."}
+        try:
+            row = await lookup(e164)
+        except Exception:
+            logger.exception("find_customer lookup failed")
+            row = None
+        first = ((row or {}).get("Ime") or "").strip()
+        last = ((row or {}).get("Priimek") or "").strip()
+        if not first and not last:
+            return {
+                "found": False,
+                "message": "No customer with this number. Collect the details as usual.",
+            }
+        email = ((row or {}).get("Email stranke") or "").strip()
+        logger.info("find_customer: existing customer for spoken number")
+        return {
+            "found": True,
+            "first_name": first,
+            "last_name": last,
+            "email": email,
+            "message": (
+                "This number belongs to an existing customer. Ask once whether "
+                "you're speaking with them, by first name (in Slovenian in the "
+                "instrumental case: \"Ali govorim z Ano?\"). If yes: pass exactly "
+                "these first_name, last_name"
+                + (" and email" if email else "")
+                + " and this phone to create_booking, don't ask for them again"
+                + (", and never read the email aloud" if email else "")
+                + ". If no: collect the details as usual."
+            ),
+        }
+
+    return find_customer
+
+
 def build_receptionist_agent(
     company_data: dict,
     language: str,
@@ -728,6 +788,7 @@ def build_receptionist_agent(
     switchable_to: list[str] | tuple = (),
     on_turn_language=None,
     features=ALL_FEATURES,
+    customer_lookup: bool = False,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -747,6 +808,7 @@ def build_receptionist_agent(
             sms_confirmation=sms_confirmation,
             switchable_to=switchable_to,
             features=features,
+            customer_lookup=customer_lookup,
         ),
         tools=[
             booking_tools.get_slots,
@@ -2328,6 +2390,8 @@ async def entrypoint(ctx: JobContext) -> None:
         caller_phone=caller_phone,
         customer=customer,
         sms_confirmation=sms_confirmation,
+        # find_customer is registered below whenever the company id is known.
+        customer_lookup=bool((profile or {}).get("ID Podjetja")),
     )
 
     language_control = LanguageControl(
@@ -2342,6 +2406,12 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     extra_tools = [end_call_abusive]
+    company_text_id = (profile or {}).get("ID Podjetja")
+    if company_text_id:
+        async def _lookup_spoken_number(phone_e164: str) -> dict | None:
+            return await supabase.find_customer_by_phone(company_text_id, phone_e164)
+
+        extra_tools.insert(0, build_find_customer_tool(_lookup_spoken_number, caller_phone))
     if detect_language:
         extra_tools.insert(0, language_control.switch_language)
     if transfer_enabled:

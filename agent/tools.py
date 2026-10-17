@@ -86,6 +86,7 @@ from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
 from agent.business_info import booking_window_days
+from agent.call_policy import normalize_phone
 from agent.company_prompt import spoken_employee_names
 from agent.dates import spoken_date_label
 from agent.languages import pack
@@ -670,6 +671,9 @@ class BookingTools:
 
         last_name = _sanitize_free_text(last_name)
         notes = _sanitize_free_text(notes)
+        # Spoken numbers arrive as "041 555 123"; the customer record and its
+        # matching use E.164, like caller ID.
+        phone = normalize_phone(phone) or phone
 
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
