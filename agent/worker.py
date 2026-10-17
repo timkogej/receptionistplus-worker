@@ -65,6 +65,7 @@ from agent.business_info import (
     render_caller_block,
     render_confirmation_line,
 )
+from agent.call_metrics import CallMetrics
 from agent.call_notes import CallNotes
 from agent.languages import (
     DEFAULT_LANGUAGE,
@@ -83,6 +84,10 @@ from agent.tools import BookingTools
 
 logger = logging.getLogger("receptionistplus-worker")
 transcript_logger = logging.getLogger("receptionistplus-worker.transcript")
+# Conversation lines in journald: off by default (2026-10-16). The transcript
+# is stored in receptionist_calls (deleted after 365 days); a second copy in
+# the system log has no retention at all. LOG_TRANSCRIPTS=on for debugging.
+LOG_TRANSCRIPTS = os.environ.get("LOG_TRANSCRIPTS", "").strip().lower() in ("1", "on", "true", "yes")
 
 
 # NO_CREDITS_MESSAGE: per language in agent/languages.py (LanguagePack.no_credits).
@@ -547,7 +552,10 @@ class BootstrapAgent(Agent):
         self, turn_ctx: llm.ChatContext, new_message: ChatMessage
     ) -> None:
         text = new_message.text_content or ""
-        logger.info("bootstrap: caller spoke before the agent was ready: %r (no reply)", text)
+        logger.info(
+            "bootstrap: caller spoke before the agent was ready (%d words, no reply)",
+            len(text.split()),
+        )
         if self._on_user_turn is not None and text:
             self._on_user_turn(text)
         raise StopResponse
@@ -1583,7 +1591,8 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_conversation_item_added(event) -> None:
         item = event.item
         if isinstance(item, ChatMessage) and item.role in ("user", "assistant"):
-            transcript_logger.info("%s: %s", item.role, item.text_content)
+            if LOG_TRANSCRIPTS:
+                transcript_logger.info("%s: %s", item.role, item.text_content)
             transcript.append(
                 {
                     "role": item.role,
@@ -1599,7 +1608,8 @@ async def entrypoint(ctx: JobContext) -> None:
                     )
 
     def _record_suppressed_user_turn(text: str, why: str = "post-farewell") -> None:
-        transcript_logger.info("user (no reply, %s): %s", why, text)
+        if LOG_TRANSCRIPTS:
+            transcript_logger.info("user (no reply, %s): %s", why, text)
         transcript.append(
             {
                 "role": "user",
@@ -1786,9 +1796,12 @@ async def entrypoint(ctx: JobContext) -> None:
     # SDK's own built-in per-stage metrics (already computed internally)
     # rather than hand-rolling separate timestamps, and speech_id/request_id
     # let a later investigation correlate STT/LLM/TTS events for one turn.
+    call_metrics = CallMetrics()
+
     @session.on("metrics_collected")
     def _on_metrics_collected(event) -> None:
         m = event.metrics
+        call_metrics.record(m)
         if isinstance(m, EOUMetrics):
             logger.info(
                 "latency stt_eou: end_of_utterance_delay=%.3fs transcription_delay=%.3fs speech_id=%s",
@@ -1852,6 +1865,9 @@ async def entrypoint(ctx: JobContext) -> None:
             "provider error: type=%s recoverable=%s",
             event.error.type,
             event.error.recoverable,
+        )
+        call_metrics.record_error(
+            f"{event.error.type}{'' if event.error.recoverable else '_fatal'}"
         )
         if event.error.recoverable or provider_error_state["degrading"]:
             return
@@ -2040,6 +2056,11 @@ async def entrypoint(ctx: JobContext) -> None:
                     "callback_requested": notes.callback_requested,
                     "summary": summary,
                     "language": call_lang["code"],
+                    "metrics": call_metrics.summary(
+                        turns=sum(1 for t in transcript if t["role"] == "user"),
+                        languages=call_lang.get("history", []),
+                        time_limit_sec=call_limit_sec,
+                    ),
                 }
             )
         except Exception:

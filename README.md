@@ -121,6 +121,21 @@ Backups of every workflow before a change: `~/n8n-backup/<timestamp>-<topic>/`.
 `scripts/send_test_sms.py --phone +386...` sends one real SMS through the
 whole chain (uses SMS quota).
 
+## Monitoring
+
+- `scripts/heartbeat.py` (systemd timer `receptionistplus-heartbeat`, every
+  minute) writes the worker's health (LiveKit worker health server on :8081)
+  to `receptionist_worker_heartbeat`.
+- n8n "Receptionist+ – Nadzor workerja" (`yAiivvTTmfEiYi9y`) checks it every
+  5 minutes and texts an alert when the worker is unhealthy or the heartbeat
+  is older than 3 minutes (server down), and again on recovery.
+- Every call row has `metrics`: LLM first-token, TTS first-byte and
+  end-of-utterance p50/p90/max, models used (fallbacks show up), tokens,
+  provider errors, turns, languages.
+- Logs: no names/emails/phones from booking requests; conversation lines only
+  with `LOG_TRANSCRIPTS=on`.
+- CI: `.github/workflows/tests.yml` runs lint + unit tests on every push.
+
 ## Deploy
 
 ```bash

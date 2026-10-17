@@ -1,0 +1,17 @@
+[Unit]
+Description=Report ReceptionistPlus worker health to Supabase (monitoring)
+
+[Service]
+Type=oneshot
+User=receptionistplus
+Group=receptionistplus
+WorkingDirectory=/opt/receptionist-plus
+EnvironmentFile=/etc/receptionistplus/.env
+ExecStart=/opt/receptionist-plus/.venv/bin/python scripts/heartbeat.py
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true

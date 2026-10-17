@@ -74,7 +74,7 @@ chown -R receptionistplus:receptionistplus "$DIR"
 if [ "$UNITS" = "1" ]; then
   cp deploy/*.service deploy/*.timer /etc/systemd/system/
   systemctl daemon-reload
-  systemctl enable --now receptionistplus-transcript-retention.timer
+  systemctl enable --now receptionistplus-transcript-retention.timer receptionistplus-heartbeat.timer
 fi
 systemctl restart "$SERVICE"
 sleep 5

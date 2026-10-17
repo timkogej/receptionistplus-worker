@@ -27,7 +27,7 @@ logger = logging.getLogger("receptionistplus-worker.supabase")
 # insert that PostgREST rejects for an unknown column is retried without
 # them, so a deploy that runs ahead of its migration still logs the call.
 PHASE6_CALL_COLUMNS = frozenset(
-    {"caller_phone", "dialed_number", "message", "callback_requested", "summary", "language"}
+    {"caller_phone", "dialed_number", "message", "callback_requested", "summary", "language", "metrics"}
 )
 
 _SETTINGS_BASE = (

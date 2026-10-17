@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt pyflakes
+      - name: Lint
+        run: python -m pyflakes agent evals scripts tests
+      - name: Unit tests
+        # No secrets needed: unit tests never call LiveKit, Anthropic,
+        # Supabase or n8n. Evals (real LLM) are run by hand, see README.
+        run: python -m unittest discover -s tests -v

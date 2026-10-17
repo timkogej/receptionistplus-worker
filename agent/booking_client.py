@@ -66,8 +66,27 @@ def _sign(raw_body: bytes, *, secret: str, timestamp: str) -> str:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
+# Fields that identify a person — never written to the log (journald keeps
+# them outside the 365-day transcript retention). The values that matter for
+# debugging (action, services, date/time, staff) stay.
+_PERSONAL_FIELDS = frozenset({"firstName", "lastName", "email", "phone", "notes"})
+
+
+def _loggable(payload: dict) -> dict:
+    return {k: ("<redacted>" if k in _PERSONAL_FIELDS and v else v) for k, v in payload.items()}
+
+
+def _loggable_response(data) -> object:
+    if not isinstance(data, dict):
+        return type(data).__name__
+    # init/slots responses are business data (services, staff, free times),
+    # create/check are status: only keep the status-like keys either way.
+    keys = ("success", "error", "message", "terminId", "available", "requiresPayment", "fields")
+    return {k: data[k] for k in keys if k in data} or sorted(data)[:12]
+
+
 def _post(payload: dict, *, timeout: float) -> dict:
-    logger.info("booking webhook request: %s", payload)
+    logger.info("booking webhook request: %s", _loggable(payload))
 
     secret = os.environ.get(_HMAC_SECRET_ENV)
     if secret:
@@ -93,7 +112,7 @@ def _post(payload: dict, *, timeout: float) -> dict:
 
     response.raise_for_status()
     data = response.json()
-    logger.info("booking webhook response: %s", data)
+    logger.info("booking webhook response: %s", _loggable_response(data))
     return data
 
 
