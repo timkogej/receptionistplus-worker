@@ -140,6 +140,7 @@ def _build(language: str, model: str, context: dict | None = None):
             return spoken.get(phone_e164)
 
         extra_tools.append(build_find_customer_tool(_lookup, context.get("caller_phone")))
+        booking_tools.set_customer_lookup(_lookup, context.get("caller_phone"))
         context["customer_lookup"] = True
     if allowed:
         control = LanguageControl(
@@ -250,7 +251,10 @@ async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
                 user_line = "".join(b.text for b in resp.content if b.type == "text").strip()
                 if user_line == "KONEC":
                     break
-    return {"failures": sc.check(fake, notes) + text_failures, "transcript": transcript}
+    failures = sc.check(fake, notes) + text_failures
+    if sc.transcript_check is not None:
+        failures += sc.transcript_check(transcript)
+    return {"failures": failures, "transcript": transcript}
 
 
 async def main() -> int:

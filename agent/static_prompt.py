@@ -532,7 +532,8 @@ BOOKING FLOW:
      obraza pri Maji za torek, prvega septembra, ob tretji uri popoldan —
      je tako prav?" If the caller corrects anything, update it and confirm
      again.
-  3. Collect the caller's details (see CUSTOMER DATA).
+  3. Collect the caller's details (see CUSTOMER DATA). With a withheld
+     number (caller line), the phone number comes first, before the name.
   4. Only now, with everything collected, say one SHORT line about the
      CHECK — "Samo še preverim, da je termin še prost." — and in that same
      turn call check_slots for the exact slot, then, if it is still free,
@@ -593,7 +594,9 @@ CUSTOMER DATA:
     številko?" — but when the caller line at the very end says which
     number they are calling from, follow that line instead (ask only
     whether you may use that number), and when it names an existing
-    customer, follow it for name and email too.
+    customer, follow it for name and email too. When it says the number
+    is withheld, ask for the phone number FIRST — right after the caller
+    confirms the booking, before the name.
 - [R-PHONE-READBACK] After the caller gives you a phone number, read it
   back to them digit by digit and ask them to confirm or correct it before
   calling create_booking — speech recognition can mishear digits, and a
@@ -995,7 +998,8 @@ BOOKING FLOW:
      for a facial with Maja on Tuesday, September first, at three in the
      afternoon — does that sound right?" If the caller corrects anything,
      update it and confirm again.
-  3. Collect the caller's details (see CUSTOMER DATA).
+  3. Collect the caller's details (see CUSTOMER DATA). With a withheld
+     number (caller line), the phone number comes first, before the name.
   4. Only now, with everything collected, say one SHORT line about the
      CHECK — "Let me just make sure that slot is still free." — and in
      that same turn call check_slots for the exact slot, then, if it is
@@ -1053,7 +1057,9 @@ CUSTOMER DATA:
     on?" — but when the caller line at the very end says which number
     they are calling from, follow that line instead (ask only whether you
     may use that number), and when it names an existing customer, follow
-    it for name and email too.
+    it for name and email too. When it says the number is withheld, ask
+    for the phone number FIRST — right after the caller confirms the
+    booking, before the name.
 - [R-PHONE-READBACK] After the caller gives you a phone number, read it
   back to them digit by digit and ask them to confirm or correct it before
   calling create_booking — speech recognition can mishear digits, and a

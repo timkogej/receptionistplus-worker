@@ -143,13 +143,16 @@ def render_caller_block(
             "Caller: the number is withheld. When booking, ask for the phone "
             "number FIRST, before the name; read it back, and once they confirm "
             "it, call find_customer with it and follow its answer — ask for the "
-            "name (and email) only if it finds nobody or they say it isn't them."
+            "name (and email) only if it finds nobody or they say it isn't them. "
+            "If you already asked for the name, still call find_customer once "
+            "the number is confirmed."
             if en
             else "Klicatelj: številka je skrita. Pri rezervaciji telefonsko "
             "številko vprašaj NAJPREJ, pred imenom; preberi jo nazaj in, ko jo "
             "potrdi, pokliči find_customer s to številko ter sledi odgovoru — "
             "za ime (in e-naslov) vprašaj samo, če stranke ne najde ali če "
-            "klicatelj reče, da to ni on."
+            "klicatelj reče, da to ni on. Če si za ime že vprašala, "
+            "find_customer vseeno pokliči, ko številko potrdi."
         )
     other_number = (
         (

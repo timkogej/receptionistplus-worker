@@ -79,6 +79,7 @@ import asyncio
 import logging
 import re
 import time as time_module
+import unicodedata
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -299,6 +300,18 @@ def _weekday_for_filler(iso_date: str, language: str) -> str | None:
     return pack(language).weekdays_for_filler[d.weekday()]
 
 
+def _name_key(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "").casefold())
+    return "".join(c for c in text if c.isalnum())
+
+
+def _same_name(stored_first: str, stored_last: str, first: str, last: str) -> bool:
+    """Same person by name, ignoring case, accents and spacing."""
+    if _name_key(stored_first) != _name_key(first):
+        return False
+    return not stored_last or _name_key(stored_last) == _name_key(last)
+
+
 class BookingTools:
     def __init__(
         self,
@@ -339,6 +352,34 @@ class BookingTools:
         # background so the caller hears the confirmation straight away.
         self._on_booked = on_booked
         self.background_tasks: set = set()
+        # Existing-customer guard for SPOKEN numbers (set_customer_lookup).
+        self._customer_lookup = None
+        self._caller_phone: str | None = None
+        self._customer_by_phone: dict[str, dict | None] = {}
+
+    def set_customer_lookup(self, lookup, caller_phone: str | None) -> None:
+        """lookup: async (phone_e164) -> "Stranke" row or None. With it,
+        create_booking won't book a spoken number that belongs to an
+        existing customer under a different name until the caller has
+        confirmed or denied being that customer. booking-v2 matches a
+        customer by email, else phone + exact name, so a misheard surname
+        would otherwise create a duplicate (live test call 2026-10-17)."""
+        self._customer_lookup = lookup
+        self._caller_phone = caller_phone
+
+    async def _existing_customer(self, phone_e164: str) -> dict | None:
+        if self._customer_lookup is None or not phone_e164.startswith("+"):
+            return None
+        if self._caller_phone and phone_e164 == self._caller_phone:
+            return None  # caller ID: already matched at call start
+        if phone_e164 not in self._customer_by_phone:
+            try:
+                row = await self._customer_lookup(phone_e164)
+            except Exception:
+                logger.exception("existing-customer lookup failed")
+                row = None
+            self._customer_by_phone[phone_e164] = row
+        return self._customer_by_phone[phone_e164]
 
     def set_language(self, language: str) -> None:
         """Called when the call switches language (worker.py): fillers, day
@@ -636,6 +677,7 @@ class BookingTools:
         employee_id: str | None = None,
         any_person: bool = False,
         notes: str = "",
+        not_the_stored_customer: bool = False,
     ) -> dict:
         """Reserve the appointment, right after check_slots for the same slot.
 
@@ -653,6 +695,8 @@ class BookingTools:
             employee_id: Staff ID, when any_person is False.
             any_person: True if the caller doesn't mind who.
             notes: Extra note from the caller.
+            not_the_stored_customer: True only after the caller said they
+                are NOT the existing customer this tool named.
         """
         if (
             not self._company_data["company"].get("multiple_services_online")
@@ -674,6 +718,33 @@ class BookingTools:
         # Spoken numbers arrive as "041 555 123"; the customer record and its
         # matching use E.164, like caller ID.
         phone = normalize_phone(phone) or phone
+
+        existing = None if not_the_stored_customer else await self._existing_customer(phone)
+        if existing:
+            stored_first = (existing.get("Ime") or "").strip()
+            stored_last = (existing.get("Priimek") or "").strip()
+            stored_email = (existing.get("Email stranke") or "").strip()
+            if not _same_name(stored_first, stored_last, first_name, last_name):
+                full = " ".join(p for p in (stored_first, stored_last) if p)
+                return {
+                    "success": False,
+                    "error": "existing_customer",
+                    "first_name": stored_first,
+                    "last_name": stored_last,
+                    "email": stored_email,
+                    "message": (
+                        f"This phone number belongs to an existing customer, {full}. "
+                        f"Ask once, without explaining why: \"Ali ste {full}?\" (in "
+                        "the call's language). If yes: call create_booking again "
+                        "with exactly these first_name, last_name"
+                        + (" and email (never read it aloud)" if stored_email else "")
+                        + ". If no: call create_booking again with the caller's "
+                        "details and not_the_stored_customer=true. The slot check "
+                        "still stands; don't mention any lookup."
+                    ),
+                }
+            if not email and stored_email:
+                email = stored_email  # same person: keep their address
 
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
