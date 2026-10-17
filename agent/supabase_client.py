@@ -147,6 +147,84 @@ class SupabaseClient:
         except requests.RequestException as exc:
             raise SupabaseError(f"get_company_profile failed for {company_slug!r}: {exc}") from exc
 
+    async def get_confirmation_template_row(self, company_slug: str) -> dict | None:
+        """The "Podatki podjetij" fields the SMS confirmation template needs.
+        select=* on purpose: lastna_predloga_potrdilo_en only exists after the
+        Jedro+ migration, and naming a missing column fails the request."""
+        fields = (
+            "sms_type_potrdilo", "lastna_predloga_potrdilo", "lastna_predloga_potrdilo_en",
+            "jezik posiljanja", "language", "Naziv Podjetja", "Naslov podjetja", "Kontaktni telefon",
+            "Kontaktni_email", "Kontaktni email", "appt_management_link",
+        )
+
+        def _do() -> dict | None:
+            rows = _request(
+                "GET",
+                f"{self._rest_url}/Podatki podjetij",
+                self._api_key,
+                params={"slug": f"eq.{company_slug}", "select": "*", "limit": "1"},
+            ).json()
+            return {k: rows[0].get(k) for k in fields} if rows else None
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"get_confirmation_template_row failed for {company_slug!r}: {exc}") from exc
+
+    async def sms_quota_left(self, company_slug: str) -> int | None:
+        """SMS the company can still send this billing period, by the same
+        rules as every Jedro+ SMS path (n8n "Kvota" nodes): a live
+        subscription that isn't SMS-blocked, a plan with SMS, quota =
+        override, else plan + add-on, minus what this period already used
+        or reserved. 0 when SMS isn't available at all; None if unknown."""
+
+        def _get(table: str, params: dict) -> list:
+            return _request("GET", f"{self._rest_url}/{table}", self._api_key, params=params).json()
+
+        def _do() -> int:
+            company = _get("companies", {"slug": f"eq.{company_slug}", "select": "id", "limit": "1"})
+            if not company:
+                return 0
+            subs = _get(
+                "company_subscriptions",
+                {
+                    "company_id": f"eq.{company[0]['id']}",
+                    "sms_blocked": "eq.false",
+                    "status": "in.(trialing,active,past_due,paused)",
+                    "order": "current_period_end.desc",
+                    "limit": "1",
+                    "select": "plan_id,sms_quota_override,sms_addon_monthly,current_period_start",
+                },
+            )
+            if not subs or not subs[0].get("plan_id"):
+                return 0
+            sub = subs[0]
+            plans = _get("plans", {"id": f"eq.{sub['plan_id']}", "select": "sms_enabled,sms_quota_monthly", "limit": "1"})
+            plan = plans[0] if plans else {}
+            if not plan.get("sms_enabled"):
+                return 0
+            if sub.get("sms_quota_override") is not None:
+                quota = int(sub["sms_quota_override"])
+            else:
+                quota = int(plan.get("sms_quota_monthly") or 0) + int(sub.get("sms_addon_monthly") or 0)
+            usage = _get(
+                "company_sms_usage",
+                {
+                    "company_id": f"eq.{company[0]['id']}",
+                    "period_start": f"eq.{str(sub.get('current_period_start') or '')[:10]}",
+                    "select": "used_count,reserved_count",
+                    "limit": "1",
+                },
+            )
+            used = sum(int((usage[0] if usage else {}).get(k) or 0) for k in ("used_count", "reserved_count"))
+            return max(0, quota - used)
+
+        try:
+            return await asyncio.to_thread(_do)
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            logger.exception("SMS quota check failed for %s", company_slug)
+            return None
+
     async def find_customer_by_phone(self, company_id: str, phone_e164: str) -> dict | None:
         """An existing customer of this company with this number, or None.
 

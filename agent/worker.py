@@ -77,7 +77,12 @@ from agent.languages import (
     pack,
 )
 from agent.call_summary import summarize_call
-from agent.sms_client import booking_confirmation_text, send_sms
+from agent.sms_client import (
+    booking_confirmation_text,
+    choose_confirmation_template,
+    render_confirmation_template,
+    send_sms,
+)
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -1274,6 +1279,25 @@ async def entrypoint(ctx: JobContext) -> None:
         _timed("caller context", _load_caller_context())
     )
 
+    # Whether an SMS confirmation can actually go out (plan, subscription,
+    # quota left) and the company's own confirmation template. Without SMS
+    # the call confirms by email instead, so the caller isn't promised a
+    # text that never comes.
+    async def _load_sms_setup() -> tuple[int | None, dict | None]:
+        quota_left, template_row = await asyncio.gather(
+            supabase.sms_quota_left(company_slug),
+            supabase.get_confirmation_template_row(company_slug),
+            return_exceptions=True,
+        )
+        if isinstance(template_row, BaseException):
+            logger.warning("confirmation template lookup failed: %s", template_row)
+            template_row = None
+        if isinstance(quota_left, BaseException):
+            quota_left = None
+        return quota_left, template_row
+
+    sms_setup_task = asyncio.create_task(_timed("sms setup", _load_sms_setup()))
+
     settings_fetch_failed = False
     try:
         settings_row = await settings_task
@@ -2169,16 +2193,45 @@ async def entrypoint(ctx: JobContext) -> None:
     # without phase7 the setting is unknown, and asking for an email (the
     # old behaviour) is the safe choice until SMS is confirmed to work.
     sms_confirmation = bool((settings_row or {}).get("sms_confirmation", False))
+    confirmation_template_row: dict | None = None
+    if sms_confirmation:
+        try:
+            sms_quota_left, confirmation_template_row = await asyncio.wait_for(
+                asyncio.shield(sms_setup_task), timeout=2.0
+            )
+        except Exception:
+            logger.warning("SMS setup not ready — assuming SMS is available")
+            sms_quota_left = None
+        # Unknown (lookup failed) keeps SMS: the send itself still checks
+        # the quota, and the owner is told if it didn't go out.
+        if sms_quota_left == 0:
+            logger.info("no SMS left for %s — confirming by email instead", company_slug)
+            sms_confirmation = False
 
     async def _send_confirmation(booking: dict) -> None:
         services = {str(s["id"]): s["naziv"] for s in company_data.get("services", [])}
-        text = booking_confirmation_text(
-            company_name=company_data["company"]["naziv"],
-            service_names=[services.get(str(i), "") for i in booking["service_ids"]],
-            date=booking["date"],
-            time_hhmm=booking["time"],
-            language=call_lang["code"],
-        )
+        service_names = [services.get(str(i), "") for i in booking["service_ids"]]
+        template = choose_confirmation_template(confirmation_template_row, call_lang["code"])
+        if template:
+            text = render_confirmation_template(
+                template,
+                company_row=confirmation_template_row,
+                service_names=service_names,
+                date=booking["date"],
+                time_hhmm=booking["time"],
+                first_name=booking.get("first_name") or "",
+                last_name=booking.get("last_name") or "",
+                employee_name=booking.get("employee_name") or "",
+                language=call_lang["code"],
+            )
+        else:
+            text = booking_confirmation_text(
+                company_name=company_data["company"]["naziv"],
+                service_names=service_names,
+                date=booking["date"],
+                time_hhmm=booking["time"],
+                language=call_lang["code"],
+            )
         result = await send_sms(
             kind="confirmation",
             company_slug=company_slug,

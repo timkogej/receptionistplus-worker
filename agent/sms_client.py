@@ -21,13 +21,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+import unicodedata
 from datetime import datetime
 
 import requests
 
 from agent.booking_client import _HMAC_SECRET_ENV, _sign
 from agent.dates import WEEKDAYS
+from agent.languages import JEDROPLUS_LANGUAGE_CODES, normalize_language
 
 logger = logging.getLogger("receptionistplus-worker.sms")
 
@@ -56,7 +59,8 @@ def booking_confirmation_text(
     lang = language if language in _CONFIRMATION_TEMPLATES else "en"
     d = datetime.strptime(date, "%Y-%m-%d").date()
     services = ", ".join(n for n in service_names if n) or _DEFAULT_SERVICE_WORD[lang]
-    return _CONFIRMATION_TEMPLATES[lang].format(
+    # Same SMS rules as the company template (normalize_sms, defined below).
+    return normalize_sms(_CONFIRMATION_TEMPLATES[lang].format(
         company=company_name,
         services=services,
         weekday=WEEKDAYS[lang][d.weekday()],
@@ -64,7 +68,126 @@ def booking_confirmation_text(
         m=d.month,
         y=d.year,
         time=time_hhmm,
-    )
+    ))
+
+
+# --- The company's own confirmation template ("Podatki podjetij") ----------
+# Same template, placeholders and SMS rules as the Jedro+ booking
+# confirmation (n8n "JEDROPLUS - Vpisovanje podatkov", node "Render SMS iz
+# predloge1"), so a caller who booked by phone gets the text the company
+# wrote. lastna_predloga_potrdilo is in the company's language
+# ("jezik posiljanja"); lastna_predloga_potrdilo_en is its optional English
+# version, like the reminders' *_en columns (Jedro+ EnglishVariant).
+
+SMS_MAX_CHARS = 160
+_PLACEHOLDER = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
+_LINK = re.compile(r"[a-z0-9][a-z0-9.-]*\.[a-z]{2,}/\S*", re.IGNORECASE)
+# Not in the GSM alphabet: one of these turns the whole SMS into UCS-2,
+# which halves how much fits in one message.
+_NON_GSM = {"\u2014": "-", "\u2013": "-", "\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"', "\u2026": "..."}
+
+
+def _strip_diacritics(text: str) -> str:
+    for a, b in _NON_GSM.items():
+        text = text.replace(a, b)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.replace("đ", "d").replace("Đ", "D")
+
+
+def _clamp_keep_link(text: str, limit: int = SMS_MAX_CHARS) -> str:
+    """Cut to the limit at a word boundary, keeping a trailing link whole:
+    the link is usually last and usually the point of the message."""
+    if len(text) <= limit:
+        return text
+    m = _LINK.search(text)
+    if m:
+        link = m.group(0)
+        rest = (text[: m.start()] + text[m.end():]).strip()
+        room = limit - len(link) - 1
+        if room >= 20:
+            head = rest[:room].rstrip()
+            end = max(head.rfind("."), head.rfind("!"), head.rfind("?"))
+            if end >= 20:
+                head = head[: end + 1]
+            elif " " in head:
+                head = head[: head.rfind(" ")]
+            return f"{head.strip()} {link}".strip()
+    head = text[:limit].rstrip()
+    return head[: head.rfind(" ")].strip() if " " in head else head
+
+
+def normalize_sms(text: str) -> str:
+    """One line, no diacritics or non-GSM punctuation, at most 160 chars."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return _clamp_keep_link(_strip_diacritics(text))
+
+
+def company_language(company_row: dict | None) -> str:
+    row = company_row or {}
+    code = str(row.get("jezik posiljanja") or row.get("language") or "slo").strip().lower()
+    return JEDROPLUS_LANGUAGE_CODES.get(code, normalize_language(code) or "sl")
+
+
+def choose_confirmation_template(company_row: dict | None, language: str) -> str | None:
+    """The company's template for this call's language, or None for the
+    built-in text. Only when the company chose its own template ("LP"); in
+    AI mode Jedro+ writes the text with a model, which the call doesn't.
+
+    The company's language gets the main template, English the English
+    version. Any other language (or no English version) gets the built-in
+    text in that language: the caller's own language beats the company's
+    text in one they didn't speak."""
+    row = company_row or {}
+    if str(row.get("sms_type_potrdilo") or "AI").strip().upper() != "LP":
+        return None
+    if language == company_language(row):
+        template = row.get("lastna_predloga_potrdilo")
+    elif language == "en":
+        template = row.get("lastna_predloga_potrdilo_en")
+    else:
+        template = None
+    return str(template or "").strip() or None
+
+
+def render_confirmation_template(
+    template: str,
+    *,
+    company_row: dict | None,
+    service_names: list[str],
+    date: str,
+    time_hhmm: str,
+    first_name: str = "",
+    last_name: str = "",
+    employee_name: str = "",
+    language: str = "sl",
+) -> str:
+    row = company_row or {}
+    english = language == "en"
+    d = datetime.strptime(date, "%Y-%m-%d").date()
+    link = re.sub(r"^https?://", "", str(row.get("appt_management_link") or "").strip(), flags=re.I)
+    company = str(row.get("Naziv Podjetja") or "").strip()
+    phone = str(row.get("Kontaktni telefon") or "").strip()
+    values = {
+        "datum": f"{d.day:02d}/{d.month:02d}/{d.year}" if english else f"{d.day:02d}.{d.month:02d}.{d.year}",
+        "cas": time_hhmm,
+        "čas": time_hhmm,
+        "Čas": time_hhmm,
+        "storitev": ", ".join(n for n in service_names if n),
+        "ime_izvajalca": employee_name,
+        "ime": first_name,
+        "priimek": last_name,
+        "ime_podjetja": company,
+        "naslov": str(row.get("Naslov podjetja") or "").strip(),
+        "telefon_podjetja": phone,
+        "email_podjetja": str(row.get("Kontaktni_email") or row.get("Kontaktni email") or "").strip(),
+        "povezava_prenarocanje": link,
+        "leto": str(datetime.now().year),
+        "salon": company,
+        "telefon": phone,
+    }
+    filled = _PLACEHOLDER.sub(lambda m: str(values.get(m.group(1).strip(), "")), template)
+    return normalize_sms(filled)
 
 
 def _post(payload: dict, timeout: float) -> dict:
