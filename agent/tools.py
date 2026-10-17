@@ -87,7 +87,8 @@ from livekit.agents import RunContext, function_tool
 from agent import booking_client
 from agent.business_info import booking_window_days
 from agent.company_prompt import spoken_employee_names
-from agent.dates import SLOVENIAN_WEEKDAYS_ACCUSATIVE, spoken_date_label
+from agent.dates import spoken_date_label
+from agent.languages import pack
 from agent.booking_client import (
     BookingError,
     BookingMalformedResponseError,
@@ -128,27 +129,11 @@ def _sanitize_free_text(value: str) -> str:
 
 
 # Caller-facing phrasing suggested to the model for the two ambiguous
-# create_booking outcomes. Language-keyed the same way as worker.py's
-# NO_CREDITS_MESSAGE / TECHNICAL_DIFFICULTY_MESSAGE — before 2026-09-08 these
-# were hardcoded Slovenian, so an English call got Slovenian suggested wording
-# at the single most delicate moment in the flow. The surrounding instructions
+# create_booking outcomes: LanguagePack.ambiguous_retry_unsafe /
+# ambiguous_checking (agent/languages.py). Before 2026-09-08 these were
+# hardcoded Slovenian, so an English call got Slovenian suggested wording at
+# the single most delicate moment in the flow. The surrounding instructions
 # stay in English: those are addressed to the model, not spoken to the caller.
-# Slovenian uses feminine first-person past forms ("naredila") per the FEMALE
-# persona rule in STATIC_PROMPT_SL.
-_AMBIGUOUS_PHRASE_RETRY_UNSAFE = {
-    "sl": (
-        "Rezervacijo sem morda že naredila, lastnik bo preveril in vas "
-        "kontaktiral, če bo karkoli narobe"
-    ),
-    "en": (
-        "I may have already made the reservation — the owner will check and "
-        "get in touch if anything needs correcting"
-    ),
-}
-_AMBIGUOUS_PHRASE_CHECKING = {
-    "sl": "Rezervacijo sem morda že naredila, preverjam, prosim počakajte",
-    "en": "I may have already made the reservation — let me check, one moment please",
-}
 
 
 def _ambiguous_outcome_result(
@@ -192,7 +177,7 @@ def _ambiguous_outcome_result(
                 "may have already gone through, creating a real duplicate "
                 "booking. Do NOT call check_slots or create_booking again "
                 "for this request. Tell the caller something like "
-                f"'{_AMBIGUOUS_PHRASE_RETRY_UNSAFE[language]}' and end this "
+                f"'{pack(language).ambiguous_retry_unsafe}' and end this "
                 "booking attempt — do not try again this call."
             ),
         }
@@ -203,7 +188,7 @@ def _ambiguous_outcome_result(
             "The booking call's outcome is unknown, but the appointment "
             "may already have been created server-side — this is NOT a "
             "plain failure. Tell the caller something like "
-            f"'{_AMBIGUOUS_PHRASE_CHECKING[language]}' (do not "
+            f"'{pack(language).ambiguous_checking}' (do not "
             "say a plain error occurred). Then call check_slots for this "
             "exact slot/employee. If it now shows the slot as taken, tell "
             "the caller their booking is very likely confirmed and the "
@@ -295,61 +280,14 @@ def _day_labels(dates, language: str) -> dict:
 # apart from a model turn that promised a check and then stopped — the line
 # is paired with a real in-flight call that has its own timeout.
 #
-# get_slots for ONE day: {day} is the weekday after "v" (accusative).
-GET_SLOTS_DAY_FILLERS = {
-    "sl": [
-        "Trenutek, pogledam, kaj imamo prosto v {day}.",
-        "Samo trenutek, pogledam koledar za {day}.",
-        "Pogledam {day}, trenutek prosim.",
-    ],
-    "en": [
-        "One moment, let me look at {day}.",
-        "Just a second, I'm checking {day}.",
-        "Let me pull up {day}, one moment.",
-    ],
-}
-GET_SLOTS_RANGE_FILLERS = {
-    "sl": [
-        "Trenutek, pogledam, kaj imamo prosto.",
-        "Samo trenutek, pogledam v koledar.",
-        "Pogledam koledar, trenutek prosim.",
-    ],
-    "en": [
-        "One moment, let me see what we have.",
-        "Just a second, I'm looking at the calendar.",
-        "Let me check the calendar, one moment.",
-    ],
-}
-# check_slots runs as the last step before create_booking, right after the
-# model's own "Samo še preverim, da je termin še prost." line — so its
-# filler (only heard if the check takes >2.5s) continues that thought rather
-# than repeating it, and must talk about CHECKING, never booking: the
-# booking wording belongs to CREATE_BOOKING_FILLER_TEXT alone (2026-09-22:
-# callers heard "rezerviram" while only the availability check was running).
-CHECK_SLOTS_FILLER_TEXT = {
-    "sl": [
-        "Še trenutek, prosim.",
-        "Samo še sekundo, prosim.",
-    ],
-    "en": [
-        "Just a moment longer.",
-        "One more second, please.",
-    ],
-}
-CREATE_BOOKING_FILLER_TEXT = {
-    "sl": [
-        "Super, vas vpisujem, samo trenutek.",
-        "Odlično, vpisujem vas, trenutek prosim.",
-        "Vpisujem rezervacijo, samo trenutek.",
-    ],
-    "en": [
-        "Great, I'm putting you in now, one moment.",
-        "Perfect, I'm booking that in, just a moment.",
-        "Writing that in for you now, one moment.",
-    ],
-}
-
-_EN_WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+# The lines themselves are per language in agent/languages.py
+# (get_slots_day_fillers / get_slots_range_fillers / check_slots_fillers /
+# create_booking_fillers). check_slots runs as the last step before
+# create_booking, right after the model's own "Samo še preverim, da je termin
+# še prost." line — so its filler (only heard if the check takes >2.5s)
+# continues that thought rather than repeating it, and must talk about
+# CHECKING, never booking (2026-09-22: callers heard "rezerviram" while only
+# the availability check was running).
 
 
 def _weekday_for_filler(iso_date: str, language: str) -> str | None:
@@ -357,9 +295,7 @@ def _weekday_for_filler(iso_date: str, language: str) -> str | None:
         d = datetime.strptime(iso_date, "%Y-%m-%d").date()
     except (TypeError, ValueError):
         return None
-    if language == "en":
-        return _EN_WEEKDAYS[d.weekday()]
-    return SLOVENIAN_WEEKDAYS_ACCUSATIVE[d.weekday()]
+    return pack(language).weekdays_for_filler[d.weekday()]
 
 
 class BookingTools:
@@ -389,7 +325,7 @@ class BookingTools:
         self.owner_followup_reason: str | None = None
         # Round-robin step for filler variety within one call, and every
         # filler line actually handed to with_filler (see the note above
-        # GET_SLOTS_DAY_FILLERS).
+        # languages.py).
         self._filler_step = 0
         self.spoken_fillers: set[str] = set()
         # async callback(booking: dict) after a successful create_booking —
@@ -398,7 +334,12 @@ class BookingTools:
         self._on_booked = on_booked
         self.background_tasks: set = set()
 
-    def _next_filler(self, variants: list[str], **fmt) -> str:
+    def set_language(self, language: str) -> None:
+        """Called when the call switches language (worker.py): fillers, day
+        labels and suggested phrasings follow from then on."""
+        self._language = language
+
+    def _next_filler(self, variants, **fmt) -> str:
         text = variants[self._filler_step % len(variants)].format(**fmt)
         self._filler_step += 1
         self.spoken_fillers.add(text)
@@ -407,8 +348,8 @@ class BookingTools:
     def _get_slots_filler(self, start_date: str, end_date: str) -> str:
         day = _weekday_for_filler(start_date, self._language) if start_date == end_date else None
         if day:
-            return self._next_filler(GET_SLOTS_DAY_FILLERS[self._language], day=day)
-        return self._next_filler(GET_SLOTS_RANGE_FILLERS[self._language])
+            return self._next_filler(pack(self._language).get_slots_day_fillers, day=day)
+        return self._next_filler(pack(self._language).get_slots_range_fillers)
 
     def _note_ambiguous_booking(
         self, date: str, time: str, first_name: str, last_name: str
@@ -665,7 +606,7 @@ class BookingTools:
         )
         try:
             async with context.with_filler(
-                self._next_filler(CHECK_SLOTS_FILLER_TEXT[self._language]), delay=2.5
+                self._next_filler(pack(self._language).check_slots_fillers), delay=2.5
             ):
                 result = await booking_client.check_slots(
                     company_slug=self._company_slug,
@@ -804,7 +745,7 @@ class BookingTools:
         self._last_check_key = None  # single use — force a fresh check per booking
         try:
             async with context.with_filler(
-                self._next_filler(CREATE_BOOKING_FILLER_TEXT[self._language]), delay=4.5
+                self._next_filler(pack(self._language).create_booking_fillers), delay=4.5
             ):
                 result = await booking_client.create_booking(
                     company_slug=self._company_slug,
@@ -819,6 +760,7 @@ class BookingTools:
                     any_person=any_person,
                     eligible_employee_ids=eligible,
                     notes=notes,
+                    language=self._language,
                 )
         except BookingTimeoutError as exc:
             logger.error("create_booking timed out (ambiguous outcome): %s", exc)

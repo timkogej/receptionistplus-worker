@@ -35,7 +35,7 @@ def render_company_prompt(
 ) -> str:
     """hours_known: the business block (business_info.py) carries real
     opening hours, so the "you don't know the hours" line is left out."""
-    if language == "en":
+    if language != "sl":
         return _render_company_prompt_en(init_data, hours_known)
     return _render_company_prompt_sl(init_data, hours_known)
 

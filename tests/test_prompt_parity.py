@@ -194,7 +194,7 @@ class ToolAndDateIntegration(unittest.TestCase):
 
     def test_worker_uses_this_module(self):
         self.assertIn(
-            "from agent.static_prompt import STATIC_PROMPT_EN, STATIC_PROMPT_SL",
+            "from agent.static_prompt import build_static_prompt",
             self.worker_src,
         )
         self.assertNotIn('STATIC_PROMPT_SL = """', self.worker_src)

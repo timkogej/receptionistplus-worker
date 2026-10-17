@@ -60,8 +60,8 @@ def is_open(schedule: dict[int, list[tuple[str, str]]] | None, now: datetime) ->
 
 
 def render_hours(schedule, language: str) -> list[str]:
-    days = _EN_DAYS if language == "en" else URNIK_DAYS
-    closed = "closed" if language == "en" else "zaprto"
+    days = URNIK_DAYS if language == "sl" else _EN_DAYS
+    closed = "zaprto" if language == "sl" else "closed"
     lines = []
     for i in range(7):
         intervals = schedule.get(i, [])
@@ -89,7 +89,7 @@ def render_business_block(
     phone = _clean(profile.get("Kontaktni telefon"))
     web = _clean(profile.get("Spletna stran"))
 
-    en = language == "en"
+    en = language != "sl"
     lines = []
     if schedule:
         lines.append(
@@ -127,7 +127,7 @@ def render_caller_block(
     customer: dict | None,
     language: str,
 ) -> str:
-    en = language == "en"
+    en = language != "sl"
     if not caller_phone:
         return (
             "Caller: the number is withheld — ask for a phone number as usual."
@@ -199,7 +199,7 @@ def booking_window_days(company: dict | None, default: int = 14) -> int:
 def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
     """Tells the model how the booking confirmation reaches the caller, which
     decides whether an email is needed at all (R-ASK-DETAILS)."""
-    if language == "en":
+    if language != "sl":
         return (
             "Confirmation: by SMS to the phone number of the booking — don't "
             "ask for an email. After booking, mention they'll get a text."

@@ -109,9 +109,10 @@ class Fillers(unittest.TestCase):
         self.assertEqual(tools.spoken_fillers, {a, b})
 
     def test_check_filler_never_talks_about_booking(self):
-        for lang in ("sl", "en"):
-            for line in T.CHECK_SLOTS_FILLER_TEXT[lang]:
-                self.assertNotRegex(line.lower(), r"rezerv|vpis|book")
+        from agent.languages import SUPPORTED_LANGUAGES, pack
+        for lang in SUPPORTED_LANGUAGES:
+            for line in pack(lang).check_slots_fillers:
+                self.assertNotRegex(line.lower(), r"rezerv|vpis|book|buch|trag|upis|prenot|registr")
 
 
 @unittest.skipIf(T is None, "livekit-agents not installed")
