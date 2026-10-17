@@ -149,5 +149,8 @@ def build_llm(
         openai_api_key=openai_api_key,
     )
     # Outage/refusal safety net only, not load balancing: the fallback runs
-    # only after the primary has failed outright.
-    return llm.FallbackAdapter([primary, fallback])
+    # only after the primary has failed outright. attempt_timeout is how long
+    # to wait for Claude's first token before giving up on it: 5 s (the SDK
+    # default) cost a live call five silent seconds on 2026-10-17. Claude's
+    # first token is ~1-2 s even with a cold cache, so 3.5 s still leaves room.
+    return llm.FallbackAdapter([primary, fallback], attempt_timeout=3.5)

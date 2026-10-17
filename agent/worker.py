@@ -277,7 +277,7 @@ FAREWELLS_BEFORE_SILENCE = 2
 # "Ta klic je v hrvaščini" (eval 2026-10-17), never said to a real caller.
 _META_COMMENTARY = re.compile(
     r"\bthe caller\b|\bper (?:the |my )?rules?\b|\bswitch(?:ing)? (?:the )?(?:call|language)"
-    r"|\bswitch_language\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b"
+    r"|\bswitch_language\b|\btool[- ]?switch\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b"
     r"|\bswitch(?:ed|ing)? (?:back )?to (?:Slovenian|English|German|Croatian|Italian)\b"
     r"|\bta klic (?:je|vodim|bom vodila) v \w+(?:ščini|sko)\b",
     re.IGNORECASE,
