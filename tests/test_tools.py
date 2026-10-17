@@ -156,6 +156,18 @@ class CreateBookingGate(unittest.TestCase):
         self.assertEqual(self.tools.created_termin_id, "OB-1")
         self.assertIn("day_label", result)
 
+    def test_email_confirmation_on_by_default(self):
+        self._check()
+        self._create()
+        self.assertIs(self.created[0]["send_email_confirmation"], True)
+
+    def test_sms_company_skips_email_but_keeps_address(self):
+        self.tools = T.BookingTools("salon", COMPANY, email_confirmation=False)
+        self._check()
+        self._create()
+        self.assertIs(self.created[0]["send_email_confirmation"], False)
+        self.assertEqual(self.created[0]["email"], "ana@example.com")
+
     def test_check_for_another_slot_does_not_count(self):
         self._check(time="11:00")
         self.assertEqual(self._create()["error"], "must_check_slots_first")

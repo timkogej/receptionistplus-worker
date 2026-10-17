@@ -306,8 +306,13 @@ class BookingTools:
         language: str = "sl",
         *,
         on_booked=None,
+        email_confirmation: bool = True,
     ) -> None:
         self._company_slug = company_slug
+        # False when the company confirms by SMS: booking-v2 then skips its
+        # confirmation email, so a known customer with a stored address
+        # doesn't get both. The email is still sent along for matching.
+        self._email_confirmation = email_confirmation
         self._company_data = company_data
         self._language = language
         # Same window as the online booking page (max_dnevi_rezervacija):
@@ -722,6 +727,7 @@ class BookingTools:
                     eligible_employee_ids=eligible,
                     notes=notes,
                     language=self._language,
+                    send_email_confirmation=self._email_confirmation,
                 )
         except BookingTimeoutError as exc:
             logger.error("create_booking timed out (ambiguous outcome): %s", exc)
