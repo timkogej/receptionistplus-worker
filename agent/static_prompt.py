@@ -1349,21 +1349,88 @@ def _switch_rule(language_name: str, others: list[str]) -> str:
     return rule
 
 
-def build_static_prompt(language: str, switchable_to: list[str] | tuple = ()) -> str:
+# ---------------------------------------------------------------------------
+# Rules that only apply when the call has the feature (2026-10-17). Without
+# it, a rule is either dropped or replaced by a one-line guard: the no-tool
+# half of R-TRANSFER / R-MANAGE-APPOINTMENT ("never promise to connect /
+# cancel") matters even when the tool isn't there, so it stays as a guard.
+# ---------------------------------------------------------------------------
+ALL_FEATURES = frozenset({"transfer", "manage_link", "payments"})
+
+_FEATURE_RULES = {
+    "R-TRANSFER": "transfer",
+    "R-MANAGE-APPOINTMENT": "manage_link",
+    "R-PAYMENT-REQUIRED": "payments",
+}
+
+_NO_FEATURE_GUARDS = {
+    ("R-TRANSFER", "sl"): (
+        "- You can't put callers through to a person. If they ask for one, "
+        "say so kindly and offer take_message: \"Žal vas ne morem povezati, "
+        "lahko pa lastniku pustim sporočilo, da vas pokliče. Vam to "
+        "ustreza?\" Never promise to connect them."
+    ),
+    ("R-TRANSFER", "en"): (
+        "- You can't put callers through to a person. If they ask for one, "
+        "say so kindly and offer take_message: \"I'm afraid I can't put you "
+        "through, but I can leave the owner a message to call you back. "
+        "Would that work?\" Never promise to connect them."
+    ),
+    ("R-MANAGE-APPOINTMENT", "sl"): (
+        "- You can't cancel or move existing appointments. If asked, offer "
+        "take_message so the owner sorts it out — never claim you cancelled "
+        "or moved anything."
+    ),
+    ("R-MANAGE-APPOINTMENT", "en"): (
+        "- You can't cancel or move existing appointments. If asked, offer "
+        "take_message so the owner sorts it out — never claim you cancelled "
+        "or moved anything."
+    ),
+}
+
+
+def _rule_span(source: str, rule_id: str) -> tuple[int, int]:
+    """Start/end of one "- [R-ID] ..." block: up to the next rule, the next
+    blank line (section break), or the end of the prompt."""
+    start = source.index(f"- [{rule_id}]")
+    ends = [i for i in (source.find("\n- [R-", start + 3), source.find("\n\n", start)) if i > 0]
+    return start, min(ends) if ends else len(source)
+
+
+def _apply_features(source: str, prompt_language: str, features) -> str:
+    for rule_id, feature in _FEATURE_RULES.items():
+        if feature in features:
+            continue
+        start, end = _rule_span(source, rule_id)
+        guard = _NO_FEATURE_GUARDS.get((rule_id, prompt_language))
+        if guard:
+            source = source[:start] + guard + source[end:]
+        else:
+            # Drop the block and the newline that introduced it.
+            source = source[: max(0, start - 1)] + source[end:]
+    return source
+
+
+def build_static_prompt(
+    language: str,
+    switchable_to: list[str] | tuple = (),
+    features=ALL_FEATURES,
+) -> str:
     """The static prompt for one call language. `switchable_to`: the OTHER
-    languages the call may switch to (empty = this language only)."""
+    languages the call may switch to (empty = this language only).
+    `features`: which of ALL_FEATURES this call has (see _FEATURE_RULES)."""
     from agent.languages import LANGUAGE_NAMES
 
     others = [LANGUAGE_NAMES[c] for c in switchable_to if c != language and c in LANGUAGE_NAMES]
     name = LANGUAGE_NAMES.get(language, "English")
 
     if language == "sl":
-        prompt = STATIC_PROMPT_SL
+        prompt = _strip_rule_ids(_apply_features(_STATIC_PROMPT_SL_SOURCE, "sl", features))
         if others:
             prompt = prompt.replace(_SL_LANGUAGE_RULE, _switch_rule(name, others))
         return prompt
 
-    prompt = STATIC_PROMPT_EN
+    prompt = _strip_rule_ids(_apply_features(_STATIC_PROMPT_EN_SOURCE, "en", features))
     if language != "en":
         prompt = prompt.replace(
             _EN_PERSONA,

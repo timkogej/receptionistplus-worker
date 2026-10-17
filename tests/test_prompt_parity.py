@@ -162,10 +162,15 @@ class CompanyPromptIntegration(unittest.TestCase):
     def test_company_block_does_not_contradict_employee_preference_rule(self):
         # 26c14ca: the company block once said "if the caller doesn't say,
         # book anyone", which won on recency over the ask-first rule.
+        # Since 2026-10-17 the block no longer restates the rule at all; it
+        # must still never tell the model to default to anyone.
         sl = render_company_prompt(_INIT, "sl")
         en = render_company_prompt(_INIT, "en")
-        self.assertIn("PREDEN vprašaš za dan", sl)
-        self.assertIn("BEFORE asking about the day", en)
+        for bad in ("pri kateremkoli zaposlenem", "rezerviraj pri komerkoli"):
+            self.assertNotIn(bad, sl)
+        for bad in ("book with anyone", "book with any staff member"):
+            self.assertNotIn(bad, en)
+        self.assertIn("Imate željo po določenem zaposlenem", " ".join(sp.STATIC_PROMPT_SL.split()))
         for text in (sp.STATIC_PROMPT_SL, sp.STATIC_PROMPT_EN):
             self.assertNotIn("never mentions an employee at all", text)
 
@@ -194,7 +199,7 @@ class ToolAndDateIntegration(unittest.TestCase):
 
     def test_worker_uses_this_module(self):
         self.assertIn(
-            "from agent.static_prompt import build_static_prompt",
+            "from agent.static_prompt import ALL_FEATURES, build_static_prompt",
             self.worker_src,
         )
         self.assertNotIn('STATIC_PROMPT_SL = """', self.worker_src)
@@ -204,3 +209,19 @@ class ToolAndDateIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FeatureRules(unittest.TestCase):
+    def test_all_features_is_the_full_prompt(self):
+        self.assertEqual(sp.build_static_prompt("sl"), sp.STATIC_PROMPT_SL)
+        self.assertEqual(sp.build_static_prompt("en"), sp.STATIC_PROMPT_EN)
+
+    def test_without_features_guards_stay_and_payment_goes(self):
+        for lang in ("sl", "en", "de"):
+            p = sp.build_static_prompt(lang, features=frozenset())
+            self.assertNotIn("requiresPayment", p.split("ERROR RECOVERY")[1], lang)
+            self.assertNotIn("transfer_to_person", p, lang)
+            self.assertNotIn("send_manage_link", p, lang)
+            self.assertIn("Never promise to connect them", p, lang)
+            self.assertIn("never claim you cancelled", p, lang)
+            self.assertLess(len(p), len(sp.build_static_prompt(lang)), lang)

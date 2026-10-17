@@ -43,25 +43,16 @@ class CallNotes:
         callback_requested: bool,
         callback_phone: str = "",
     ) -> dict:
-        """Write down a message for the business owner.
-
-        Call this whenever the caller wants to leave a message, asks to be
-        called back, or whenever YOU tell them that someone will call them
-        back or get back to them (for example: a question you can't answer,
-        a date beyond what you can check, a request you can't handle). Only
-        a call to this tool actually reaches the owner — saying it without
-        calling the tool means nobody calls back.
+        """Pass a message or callback request to the business owner — the
+        only way it reaches them.
 
         Args:
-            message: One or two plain sentences in the caller's language
-                saying what they want, written for the owner (e.g. "Zanima
-                jo, ali delate tudi ob nedeljah."). Include the caller's
-                name if they gave it. No markup.
-            callback_requested: True if the caller wants (or was promised) a
-                call back.
-            callback_phone: Only if the caller gave a DIFFERENT number to
-                call back than the one they are calling from. Leave empty
-                otherwise.
+            message: One or two plain sentences for the owner, in the
+                caller's language, with their name if given.
+            callback_requested: True if they want, or were promised, a call
+                back.
+            callback_phone: Only if they want to be called on a different
+                number than the one they are calling from.
         """
         text = _sanitize_free_text(message)
         if callback_phone.strip():

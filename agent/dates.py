@@ -239,3 +239,73 @@ def spoken_date_label(d: date, language: str = "sl") -> str:
     if language == "it":
         return f"{weekday} {spoken_date_phrase(d, language)}"
     return f"{weekday}, {spoken_date_phrase(d, language)}"
+
+
+# Slovenian cardinal numbers as words, for prices and durations in the
+# company block (2026-10-17): the model built 45 as "štirideset pet" in
+# about 1 of 5 runs; copying a ready-made word removes that failure class,
+# the same way the date table did for ordinals.
+_SL_UNITS_M = ["nič", "en", "dva", "tri", "štiri", "pet", "šest", "sedem", "osem", "devet"]
+_SL_UNITS_F = ["nič", "ena", "dve", "tri", "štiri", "pet", "šest", "sedem", "osem", "devet"]
+_SL_COMPOUND_UNIT = ["", "ena", "dva", "tri", "štiri", "pet", "šest", "sedem", "osem", "devet"]
+_SL_TEENS = ["deset", "enajst", "dvanajst", "trinajst", "štirinajst", "petnajst",
+             "šestnajst", "sedemnajst", "osemnajst", "devetnajst"]
+_SL_TENS = ["", "", "dvajset", "trideset", "štirideset", "petdeset", "šestdeset",
+            "sedemdeset", "osemdeset", "devetdeset"]
+_SL_HUNDREDS = ["", "sto", "dvesto", "tristo", "štiristo", "petsto", "šeststo",
+                "sedemsto", "osemsto", "devetsto"]
+
+
+def slovenian_number(n: int, feminine: bool = False) -> str:
+    """0-9999 as Slovenian words: 45 -> "petinštirideset", 120 -> "sto
+    dvajset", 1 -> "en" / "ena"."""
+    if not 0 <= n <= 9999:
+        raise ValueError(f"out of range: {n}")
+    if n < 10:
+        return (_SL_UNITS_F if feminine else _SL_UNITS_M)[n]
+    if n < 20:
+        return _SL_TEENS[n - 10]
+    if n < 100:
+        tens, unit = divmod(n, 10)
+        return _SL_TENS[tens] if unit == 0 else f"{_SL_COMPOUND_UNIT[unit]}in{_SL_TENS[tens]}"
+    if n < 1000:
+        h, rest = divmod(n, 100)
+        return _SL_HUNDREDS[h] + ("" if rest == 0 else " " + slovenian_number(rest, feminine))
+    th, rest = divmod(n, 1000)
+    head = "tisoč" if th == 1 else f"{slovenian_number(th)} tisoč"
+    return head + ("" if rest == 0 else " " + slovenian_number(rest, feminine))
+
+
+def _sl_noun_form(n: int, forms: tuple[str, str, str, str]) -> str:
+    """forms = (1, 2, 3-4, 5+) by the last two digits, Slovenian rules."""
+    last = n % 100
+    if last == 1:
+        return forms[0]
+    if last == 2:
+        return forms[1]
+    if last in (3, 4):
+        return forms[2]
+    return forms[3]
+
+
+def slovenian_euros(amount) -> str | None:
+    """Whole euro amounts as words ("trideset evrov", "en evro"); None for
+    anything else (decimals, junk) — those stay as data only."""
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return None
+    if value != int(value) or not 0 <= value <= 9999:
+        return None
+    n = int(value)
+    return f"{slovenian_number(n)} {_sl_noun_form(n, ('evro', 'evra', 'evre', 'evrov'))}"
+
+
+def slovenian_minutes(minutes) -> str | None:
+    try:
+        n = int(minutes)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= n <= 9999:
+        return None
+    return f"{slovenian_number(n, feminine=True)} {_sl_noun_form(n, ('minuta', 'minuti', 'minute', 'minut'))}"
