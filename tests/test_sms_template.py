@@ -10,7 +10,7 @@ from agent.sms_client import (
 ROW = {
     "sms_type_potrdilo": "LP",
     "lastna_predloga_potrdilo": "Pozdravljeni {{ime}}! Termin {{datum}} ob {{cas}}. Lep pozdrav, {{ime_podjetja}}",
-    "predloge_potrdilo_prevodi": {"eng": "Hi {{ime}}! Your appointment is on {{datum}} at {{cas}}. {{ime_podjetja}}"},
+    "lastna_predloga_potrdilo_en": "Hi {{ime}}! Your appointment is on {{datum}} at {{cas}}. {{ime_podjetja}}",
     "language": "slo",
     "Naziv Podjetja": "Jedro Kozmetika",
     "Naslov podjetja": "Ljubljanska cesta 5",
@@ -33,9 +33,19 @@ class ChooseTemplate(unittest.TestCase):
     def test_ai_mode_uses_built_in(self):
         self.assertIsNone(choose_confirmation_template({**ROW, "sms_type_potrdilo": "AI"}, "sl"))
 
-    def test_translations_as_json_string(self):
-        row = {**ROW, "predloge_potrdilo_prevodi": '{"de": "Hallo {{ime}}"}'}
-        self.assertEqual(choose_confirmation_template(row, "de"), "Hallo {{ime}}")
+    def test_no_english_version_falls_back_to_built_in(self):
+        self.assertIsNone(choose_confirmation_template({**ROW, "lastna_predloga_potrdilo_en": ""}, "en"))
+
+    def test_jezik_posiljanja_wins(self):
+        row = {**ROW, "jezik posiljanja": "eng"}
+        self.assertTrue(choose_confirmation_template(row, "en").startswith("Pozdravljeni"))
+
+    def test_english_date_format(self):
+        text = render_confirmation_template(
+            "{{datum}}", company_row=ROW, service_names=[], date="2026-10-20",
+            time_hhmm="14:00", language="en",
+        )
+        self.assertEqual(text, "20/10/2026")
 
     def test_no_row(self):
         self.assertIsNone(choose_confirmation_template(None, "sl"))

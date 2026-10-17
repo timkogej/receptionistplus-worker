@@ -2222,6 +2222,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 first_name=booking.get("first_name") or "",
                 last_name=booking.get("last_name") or "",
                 employee_name=booking.get("employee_name") or "",
+                language=call_lang["code"],
             )
         else:
             text = booking_confirmation_text(

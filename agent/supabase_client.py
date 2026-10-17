@@ -149,11 +149,11 @@ class SupabaseClient:
 
     async def get_confirmation_template_row(self, company_slug: str) -> dict | None:
         """The "Podatki podjetij" fields the SMS confirmation template needs.
-        select=* on purpose: predloge_potrdilo_prevodi only exists after the
+        select=* on purpose: lastna_predloga_potrdilo_en only exists after the
         Jedro+ migration, and naming a missing column fails the request."""
         fields = (
-            "sms_type_potrdilo", "lastna_predloga_potrdilo", "predloge_potrdilo_prevodi",
-            "language", "Naziv Podjetja", "Naslov podjetja", "Kontaktni telefon",
+            "sms_type_potrdilo", "lastna_predloga_potrdilo", "lastna_predloga_potrdilo_en",
+            "jezik posiljanja", "language", "Naziv Podjetja", "Naslov podjetja", "Kontaktni telefon",
             "Kontaktni_email", "Kontaktni email", "appt_management_link",
         )
 

@@ -30,7 +30,7 @@ import requests
 
 from agent.booking_client import _HMAC_SECRET_ENV, _sign
 from agent.dates import WEEKDAYS
-from agent.languages import JEDROPLUS_LANGUAGE_CODES, TO_JEDROPLUS_CODE
+from agent.languages import JEDROPLUS_LANGUAGE_CODES, normalize_language
 
 logger = logging.getLogger("receptionistplus-worker.sms")
 
@@ -75,9 +75,9 @@ def booking_confirmation_text(
 # Same template, placeholders and SMS rules as the Jedro+ booking
 # confirmation (n8n "JEDROPLUS - Vpisovanje podatkov", node "Render SMS iz
 # predloge1"), so a caller who booked by phone gets the text the company
-# wrote. lastna_predloga_potrdilo is in the company's language;
-# predloge_potrdilo_prevodi holds optional versions per Jedro+ language code
-# ("eng", "de", "it", "hr").
+# wrote. lastna_predloga_potrdilo is in the company's language
+# ("jezik posiljanja"); lastna_predloga_potrdilo_en is its optional English
+# version, like the reminders' *_en columns (Jedro+ EnglishVariant).
 
 SMS_MAX_CHARS = 160
 _PLACEHOLDER = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
@@ -123,34 +123,31 @@ def normalize_sms(text: str) -> str:
     return _clamp_keep_link(_strip_diacritics(text))
 
 
-def _translations(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            return {}
-        return value if isinstance(value, dict) else {}
-    return {}
+def company_language(company_row: dict | None) -> str:
+    row = company_row or {}
+    code = str(row.get("jezik posiljanja") or row.get("language") or "slo").strip().lower()
+    return JEDROPLUS_LANGUAGE_CODES.get(code, normalize_language(code) or "sl")
 
 
 def choose_confirmation_template(company_row: dict | None, language: str) -> str | None:
     """The company's template for this call's language, or None for the
     built-in text. Only when the company chose its own template ("LP"); in
-    AI mode Jedro+ writes the text with a model, which the call doesn't."""
+    AI mode Jedro+ writes the text with a model, which the call doesn't.
+
+    The company's language gets the main template, English the English
+    version. Any other language (or no English version) gets the built-in
+    text in that language: the caller's own language beats the company's
+    text in one they didn't speak."""
     row = company_row or {}
     if str(row.get("sms_type_potrdilo") or "AI").strip().upper() != "LP":
         return None
-    company_lang = JEDROPLUS_LANGUAGE_CODES.get(str(row.get("language") or "slo").strip().lower(), "sl")
-    if language == company_lang:
-        template = str(row.get("lastna_predloga_potrdilo") or "").strip()
+    if language == company_language(row):
+        template = row.get("lastna_predloga_potrdilo")
+    elif language == "en":
+        template = row.get("lastna_predloga_potrdilo_en")
     else:
-        code = TO_JEDROPLUS_CODE.get(language, "")
-        template = str(_translations(row.get("predloge_potrdilo_prevodi")).get(code) or "").strip()
-    # No version in the caller's language: the built-in text in it beats
-    # the company's text in a language the caller didn't speak.
-    return template or None
+        template = None
+    return str(template or "").strip() or None
 
 
 def render_confirmation_template(
@@ -163,14 +160,16 @@ def render_confirmation_template(
     first_name: str = "",
     last_name: str = "",
     employee_name: str = "",
+    language: str = "sl",
 ) -> str:
     row = company_row or {}
+    english = language == "en"
     d = datetime.strptime(date, "%Y-%m-%d").date()
     link = re.sub(r"^https?://", "", str(row.get("appt_management_link") or "").strip(), flags=re.I)
     company = str(row.get("Naziv Podjetja") or "").strip()
     phone = str(row.get("Kontaktni telefon") or "").strip()
     values = {
-        "datum": f"{d.day:02d}.{d.month:02d}.{d.year}",
+        "datum": f"{d.day:02d}/{d.month:02d}/{d.year}" if english else f"{d.day:02d}.{d.month:02d}.{d.year}",
         "cas": time_hhmm,
         "čas": time_hhmm,
         "Čas": time_hhmm,
