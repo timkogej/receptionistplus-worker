@@ -181,6 +181,10 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
             for n, turn in enumerate(sc.turns, 1):
                 if control is not None:
                     control.turn_language["detected"] = turn.detected_language
+                    # session.run(user_input=...) skips on_user_turn_completed,
+                    # where the live call runs this; without it only the
+                    # model's switch_language path was ever evaluated.
+                    await control.on_turn(turn.user)
                 result = await session.run(user_input=turn.user)
                 names = _tool_names(result)
                 reply = _assistant_text(result)
