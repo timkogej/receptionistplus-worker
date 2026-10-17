@@ -779,6 +779,9 @@ class BookingTools:
                             "time": time,
                             "phone": phone,
                             "email": email,
+                            "first_name": first_name,
+                            "last_name": last_name,
+                            "employee_name": result.get("oseba") or "",
                         }
                     ),
                     name="on_booked",
