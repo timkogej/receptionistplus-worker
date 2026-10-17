@@ -271,16 +271,29 @@ FAREWELLS_BEFORE_SILENCE = 2
 
 
 # First sentence of a reply that talks ABOUT the call instead of TO the
-# caller (see ReceptionistAgent.llm_node). English only: the model writes its
+# caller (see ReceptionistAgent.llm_node). Mostly English: the model writes its
 # reasoning in the prompt's language, and a real reply to an English caller
-# never says "per the rules" or "the caller".
+# never says "per the rules" or "the caller". The one Slovenian pattern is
+# "Ta klic je v hrvaščini" (eval 2026-10-17), never said to a real caller.
 _META_COMMENTARY = re.compile(
     r"\bthe caller\b|\bper (?:the |my )?rules?\b|\bswitch(?:ing)? (?:the )?(?:call|language)"
     r"|\bswitch_language\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b"
-    r"|\bswitch(?:ed|ing)? (?:back )?to (?:Slovenian|English|German|Croatian|Italian)\b",
+    r"|\bswitch(?:ed|ing)? (?:back )?to (?:Slovenian|English|German|Croatian|Italian)\b"
+    r"|\bta klic (?:je|vodim|bom vodila) v \w+(?:ščini|sko)\b",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
+# "Switch first." / "Switching first, ..." in front of a reply or a
+# switch_language call (eval 2026-10-17, 2 in 10 Croatian switches): too
+# short to be a sentence the filter can judge, so it is cut off the front.
+_META_PREFIX = re.compile(
+    r"^\s*switch(?:ing|ed)?(?: (?:first|now|over|languages?))?\s*[,.:;!\u2014\u2013-]+\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_meta_prefix(text: str) -> str:
+    return _META_PREFIX.sub("", text, count=1)
 
 
 def _is_meta_commentary(text: str) -> bool:
@@ -590,6 +603,7 @@ class ReceptionistAgent(Agent):
             if content is None:
                 # A tool call (or usage): whatever text is held is narration
                 # of that call if it looks like it, a real line otherwise.
+                buffer = _strip_meta_prefix(buffer)
                 if buffer and not _is_meta_commentary(buffer):
                     yield llm.ChatChunk(
                         id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=buffer)
@@ -604,6 +618,9 @@ class ReceptionistAgent(Agent):
             if not m:
                 continue
             sentence, buffer = buffer[: m.end()], buffer[m.end():]
+            sentence = _strip_meta_prefix(sentence)
+            if not sentence.strip():
+                continue
             if _is_meta_commentary(sentence) and dropped < 3:
                 dropped += 1
                 logger.warning("dropped meta-commentary before reply: %r", sentence[:200])
@@ -614,6 +631,7 @@ class ReceptionistAgent(Agent):
                 delta=llm.ChoiceDelta(role="assistant", content=sentence + buffer),
             )
             buffer = ""
+        buffer = _strip_meta_prefix(buffer) if filtering else buffer
         if filtering and buffer and not _is_meta_commentary(buffer):
             yield llm.ChatChunk(id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=buffer))
 
