@@ -204,6 +204,7 @@ async def create_booking(
     eligible_employee_ids: list[str] | None,
     notes: str,
     language: str = "sl",
+    send_email_confirmation: bool = True,
 ) -> dict:
     """Call the "create" action: actually reserve the appointment."""
     payload: dict = {
@@ -226,6 +227,10 @@ async def create_booking(
         # through; Jedro+ normalises it), so reminders go out in the
         # language the caller booked in.
         "language": language,
+        # False when the call confirms by SMS: booking-v2 ("Create: Potrdilo
+        # online?") then skips the confirmation email. The email is still
+        # sent, since jp_find_client matches the customer by it first.
+        "send_email_confirmation": send_email_confirmation,
     }
     if any_person:
         payload["eligibleEmployeeIds"] = eligible_employee_ids or []

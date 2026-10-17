@@ -2203,6 +2203,7 @@ async def entrypoint(ctx: JobContext) -> None:
         company_data,
         language=language,
         on_booked=_send_confirmation if sms_confirmation else None,
+        email_confirmation=not sms_confirmation,
     )
     booking_ref["tools"] = booking_tools
 
