@@ -792,7 +792,12 @@ class BookingTools:
                     "retry blindly, the appointment may already exist."
                 ),
             }
-        logger.info("create_booking outcome: %s", result)
+        logger.info(
+            "create_booking outcome: success=%s terminId=%s error=%s",
+            result.get("success"),
+            result.get("terminId"),
+            result.get("error"),
+        )
         if result.get("success") and result.get("terminId"):
             self.created_termin_id = result["terminId"]
             # A retry after an ambiguous outcome went through cleanly.
