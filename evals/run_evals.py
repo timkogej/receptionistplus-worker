@@ -124,6 +124,10 @@ def _build(language: str, model: str, context: dict | None = None):
     # "switch_languages": the call may switch (detect_caller_language on);
     # same LanguageControl as the live call, minus the TTS.
     allowed = context.pop("switch_languages", None)
+    # Same as the live call: optional rules only for tools the call has.
+    # Evals have no transfer / portal-link tool, so those get the no-tool
+    # guards (static_prompt._NO_FEATURE_GUARDS).
+    context.setdefault("features", frozenset())
     booking_tools = BookingTools("eval-company", company, language=language)
     notes = CallNotes()
     control = None

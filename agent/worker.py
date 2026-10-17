@@ -55,7 +55,7 @@ from agent.call_policy import (
 from agent.company_prompt import render_company_prompt
 from agent.config import Settings
 from agent.dates import ENGLISH_WEEKDAYS, SLOVENIAN_WEEKDAYS, WEEKDAYS, spoken_date_phrase
-from agent.static_prompt import build_static_prompt
+from agent.static_prompt import ALL_FEATURES, build_static_prompt
 from agent.supabase_client import SupabaseClient
 from agent.business_info import (
     booking_window_days,
@@ -276,7 +276,8 @@ FAREWELLS_BEFORE_SILENCE = 2
 # never says "per the rules" or "the caller".
 _META_COMMENTARY = re.compile(
     r"\bthe caller\b|\bper (?:the |my )?rules?\b|\bswitch(?:ing)? (?:the )?(?:call|language)"
-    r"|\bswitch_language\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b",
+    r"|\bswitch_language\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b"
+    r"|\bswitch(?:ed|ing)? (?:back )?to (?:Slovenian|English|German|Croatian|Italian)\b",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
@@ -367,128 +368,73 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str
 
     table = "\n".join(rows)
 
-    if language != "sl":
-        return (
-            f"Current time is {time_str}, timezone Europe/Ljubljana. Below is "
-            f"a pre-computed table of the next {max(14, days)} days: ISO date, weekday, and "
-            f"the exact spoken date phrase. The first three rows are tagged "
-            f"[TODAY], [TOMORROW], and [DAY AFTER TOMORROW] directly — use "
-            f"these tags as-is to resolve those specific words, do NOT count "
-            f"rows or compute the offset yourself. Every row that falls in "
-            f"next calendar week is additionally tagged [NEXT WEEK].\n\n"
-            f"{table}\n\n"
-            f"To resolve any relative date (tomorrow, on Monday, as soon as "
-            f"possible, next week), look up the matching entry in this table "
-            f"— do NOT calculate the date or weekday yourself. For a COMPOUND "
-            f"reference that combines a week qualifier with a weekday name "
-            f"(e.g. \"next week on Thursday\"), find the table row tagged "
-            f"[NEXT WEEK] whose weekday matches the one requested, and use "
-            f"that row's exact date and phrase — never compute which date "
-            f"that is yourself, even approximately.\n"
-            f"  - Bad: caller says \"next week on Thursday\" → mentally "
-            f"counting forward some number of days and speaking whatever "
-            f"date that lands on, whether or not it's actually a Thursday.\n"
-            f"  - Good: caller says \"next week on Thursday\" → scan the "
-            f"table for the row tagged [NEXT WEEK] with weekday Thursday, "
-            f"and use exactly that row's date/phrase.\n"
-            f"When speaking a date aloud, use the exact phrase from the "
-            f"table verbatim (e.g. \"August 3rd\") — do NOT construct the "
-            f"ordinal yourself, since generating it live is error-prone. "
-            f"When confirming a weekday together with its date, prefer a "
-            f"natural connector over a flat statement.\n"
-            f"  - Not \"On Thursday it is September third.\" (awkward)\n"
-            f"  - Good: \"On Thursday, so September third.\"\n"
-        # 2026-09-21: "torek, osemindvajsetega septembra" (the 28th was a
-        # Monday). The table was right; the model never looked a Tuesday
-        # up — it glued the caller's weekday onto the first date of the
-        # get_slots result it was reading. These two rules close the gaps
-        # that let that through: nothing tied a spoken weekday to the same
-        # row as its date, and the NEXT WEEK rule only covered a qualifier
-        # and weekday said in one breath.
-        "A weekday and its date must ALWAYS come from ONE place: one row of "
-        "this table, or one label from a tool result (get_slots' "
-        "\"day_labels\", or the \"day_label\" from check_slots/"
-        "create_booking, e.g. \"Tuesday, September 29th\"). Never put a "
-        "weekday you heard from the caller next to a date you took from "
-        "somewhere else.\n"
-        "  - Bad (observed 2026-09-21, Slovenian call): caller says "
-        "\"Tuesday\" → \"So Tuesday, September twenty-eighth\" (the "
-        "caller's weekday glued to the first date of a get_slots result — "
-        "the 28th was a Monday, and the booking ended up on Monday)\n"
-        "  - Good: find the Tuesday row/label first → \"So Tuesday, "
-        "September twenty-ninth\"\n"
-        "A week qualifier the caller said EARLIER still applies when they "
-        "later name only a weekday. If they asked about \"next week\" and "
-        "a few turns later say \"Tuesday\", that means the row tagged both "
-        "Tuesday and [NEXT WEEK] — not this week's Tuesday, and not "
-        "whichever date you were just looking at. Only if nothing earlier "
-        "narrows it down and the weekday matches two rows, ask which one "
-        "they mean (\"This Tuesday, or Tuesday next week?\").\n"
-            f"Bookings are open only {days} days ahead — the bookable days "
-            f"are the first {days} rows. If a caller asks for a date beyond "
-            f"that, say plainly that bookings are open only that far ahead, "
-            f"and offer a date within it or to pass the request on so "
-            f"someone calls back (take_message) — never guess."
-        )
+    if language == "sl":
+        tags = ("[DANES]", "[JUTRI]", "[POJUTRIŠNJEM]", "[NASLEDNJI TEDEN]")
+        ex = {
+            "relative": "jutri, v ponedeljek, naslednji teden v četrtek",
+            "compound": "\"naslednji teden v četrtek\"",
+            "compound_day": "četrtek",
+            "aloud": "\"Naslednja sreda je devetnajstega oktobra? Ne, ...\"",
+            "phrase": "\"tretjega avgusta\"",
+            "connector": "\"V četrtek, torej tretjega septembra.\"",
+            "bad": "caller \"torek\" → \"torek, osemindvajsetega septembra\" (the 28th was a Monday)",
+            "decline": " You may add \"v\"/\"za\" and decline the weekday (v sredo), never change it.",
+            "later": "after \"naslednji teden\", a later \"torek\"",
+            "ask": "\"Mislite ta torek ali torek naslednji teden?\"",
+            # Kept in Slovenian on purpose: written in English (2026-10-17
+            # trim) the model echoed it aloud as English narration.
+            "window": (
+                f"Rezervacije so odprte samo {days} dni vnaprej (prvih {days} "
+                "vrstic). Za kasnejši datum to preprosto povej in ponudi datum "
+                "znotraj tega ali da prošnjo posreduješ lastniku "
+                "(take_message) — nikoli ne ugibaj."
+            ),
+        }
+    else:
+        tags = ("[TODAY]", "[TOMORROW]", "[DAY AFTER TOMORROW]", "[NEXT WEEK]")
+        ex = {
+            "relative": "tomorrow, on Monday, next week on Thursday",
+            "compound": "\"next week on Thursday\"",
+            "compound_day": "Thursday (in the table's language)",
+            "aloud": "\"Next Wednesday is the 19th? No, ...\"",
+            "phrase": "the table's phrase",
+            "connector": "\"On Thursday, so September third.\"",
+            "bad": "caller \"Tuesday\" → \"Tuesday, September twenty-eighth\" (the 28th was a Monday)",
+            "decline": "",
+            "later": "after \"next week\", a later \"Tuesday\"",
+            "ask": "\"Do you mean this Tuesday or next Tuesday?\"",
+            "window": (
+                f"Bookings are open {days} days ahead (the first {days} rows). "
+                "For a later date, say so and offer a date within that or "
+                "take_message — never guess."
+            ),
+        }
 
+    # Condensed 2026-10-17 from three paragraphs with two examples each; every
+    # rule is still here, each from a real incident (2026-08-14 "jutri" on
+    # today's row, 2026-08-29 compound "next week Thursday", 2026-09-21
+    # caller's weekday glued to another date).
     return (
-        f"Current time is {time_str}, timezone Europe/Ljubljana. Below is a "
-        f"pre-computed table of the next {max(14, days)} days: ISO date, Slovenian weekday, "
-        f"and the exact spoken date phrase. The first three rows are tagged "
-        f"[DANES] (today), [JUTRI] (tomorrow), and [POJUTRIŠNJEM] (the day "
-        f"after tomorrow) directly — use these tags as-is to resolve those "
-        f"specific words, do NOT count rows or compute the offset yourself. "
-        f"Every row that falls in next calendar week is additionally tagged "
-        f"[NASLEDNJI TEDEN].\n\n"
+        f"Current time is {time_str}, timezone Europe/Ljubljana. Table of the "
+        f"next {max(14, days)} days — ISO date, weekday, spoken date phrase. "
+        f"Rows are tagged {tags[0]}, {tags[1]}, {tags[2]}, and {tags[3]} for "
+        f"every day of next calendar week.\n\n"
         f"{table}\n\n"
-        f"To resolve any relative date (jutri, v ponedeljek, čim prej, "
-        f"naslednji teden), look up the matching entry in this table — do NOT "
-        f"calculate the date or weekday yourself. For a COMPOUND reference "
-        f"that combines a week qualifier with a weekday name (e.g. "
-        f"\"naslednji teden v četrtek\"), find the table row tagged "
-        f"[NASLEDNJI TEDEN] whose weekday matches the one requested, and use "
-        f"that row's exact date and phrase — never compute which date that "
-        f"is yourself, even approximately.\n"
-        f"  - Bad: caller says \"naslednji teden v četrtek\" → mentally "
-        f"counting forward some number of days and speaking whatever date "
-        f"that lands on, whether or not it's actually a Thursday.\n"
-        f"  - Good: caller says \"naslednji teden v četrtek\" → scan the "
-        f"table for the row tagged [NASLEDNJI TEDEN] with weekday četrtek, "
-        f"and use exactly that row's date/phrase.\n"
-        f"When speaking a date aloud, use the exact phrase from the table "
-        f"verbatim (e.g. \"tretjega avgusta\") — do NOT construct the "
-        f"ordinal number yourself, since generating it live is error-prone. "
-        f"When confirming a weekday together with its date, prefer a natural "
-        f"connector over a flat statement.\n"
-        f"  - Not \"V četrtek je to tretjega septembra.\" (awkward)\n"
-        f"  - Good: \"V četrtek, torej tretjega septembra.\"\n"
-        # See the matching note in the English branch above.
-        "A weekday and its date must ALWAYS come from ONE place: one row of "
-        "this table, or one label from a tool result (get_slots' "
-        "\"day_labels\", or the "
-        "\"day_label\" from check_slots/create_booking, e.g. \"torek, "
-        "devetindvajsetega septembra\"). Never put a weekday you heard from "
-        "the caller next to a date you took from somewhere else. You may put "
-        "\"v\"/\"za\" in front and adjust the weekday's ending (sreda → v "
-        "sredo), but never change which day it is.\n"
-        "  - Bad (observed 2026-09-21): caller says \"torek\" → \"Torej "
-        "torek, osemindvajsetega septembra\" (the caller's weekday glued to "
-        "the first date of a get_slots result — the 28th was a Monday, and "
-        "the booking ended up on Monday)\n"
-        "  - Good: find the torek row/label first → \"Torej v torek, "
-        "devetindvajsetega septembra\"\n"
-        "A week qualifier the caller said EARLIER still applies when they "
-        "later name only a weekday. If they asked about \"naslednji teden\" "
-        "and a few turns later say \"torek\", that means the row tagged "
-        "both torek and [NASLEDNJI TEDEN] — not this week's torek, and not "
-        "whichever date you were just looking at. Only if nothing earlier "
-        "narrows it down and the weekday matches two rows, ask which one "
-        "they mean (\"Mislite ta torek ali torek naslednji teden?\").\n"
-        f"Rezervacije so odprte samo {days} dni vnaprej — rezervirati se da "
-        f"prvih {days} vrstic. Če klicatelj želi datum dlje od tega, mu "
-        f"preprosto povej, da so termini odprti samo toliko dni vnaprej, in "
-        f"ponudi datum znotraj tega ali da prošnjo posreduješ lastniku "
-        f"(take_message) — nikoli ne ugibaj."
+        "Date rules:\n"
+        f"- Resolve every relative date ({ex['relative']}) by finding its row "
+        "— never count days or compute a date or weekday yourself. "
+        f"{ex['compound']} = the row tagged {tags[3]} whose weekday is "
+        f"{ex['compound_day']}. Look it up silently — never work a date out "
+        f"aloud (Bad: {ex['aloud']}).\n"
+        f"- Say a date with its row's phrase verbatim ({ex['phrase']}); join "
+        f"weekday and date naturally: {ex['connector']}\n"
+        "- A weekday and its date always come from ONE row or ONE tool label "
+        "(get_slots' \"day_labels\", check_slots/create_booking's "
+        "\"day_label\") — never a weekday the caller said next to a date "
+        f"from somewhere else. Bad (observed): {ex['bad']}.{ex['decline']}\n"
+        f"- A week qualifier said earlier still applies: {ex['later']} means "
+        f"the row tagged with both. Only if two rows still fit, ask: {ex['ask']}\n"
+        f"- {ex['window']}"
     )
 
 
@@ -502,8 +448,9 @@ def _build_system_prompt(
     customer: dict | None = None,
     sms_confirmation: bool = False,
     switchable_to: list[str] | tuple = (),
+    features=ALL_FEATURES,
 ) -> str:
-    static_prompt = build_static_prompt(language, switchable_to)
+    static_prompt = build_static_prompt(language, switchable_to, features)
     logger.info(
         "prompt built: language=%s switchable_to=%s",
         language,
@@ -757,6 +704,7 @@ def build_receptionist_agent(
     sms_confirmation: bool = False,
     switchable_to: list[str] | tuple = (),
     on_turn_language=None,
+    features=ALL_FEATURES,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -775,6 +723,7 @@ def build_receptionist_agent(
             customer=customer,
             sms_confirmation=sms_confirmation,
             switchable_to=switchable_to,
+            features=features,
         ),
         tools=[
             booking_tools.get_slots,
@@ -820,6 +769,9 @@ class LanguageControl:
         }
         self.enabled = enabled
         self.agent: "ReceptionistAgent | None" = None
+        # One switch per caller turn: the model once called switch_language
+        # three times in a row (hr, back to sl, hr again) and narrated it.
+        self._switched_this_turn = False
 
     async def switch(self, new_code: str, why: str) -> bool:
         new = normalize_language(new_code)
@@ -869,6 +821,16 @@ class LanguageControl:
             }
         if target == self.call_lang["code"]:
             return {"success": True, "message": "Already speaking it; just continue."}
+        if self._switched_this_turn:
+            current = LANGUAGE_NAMES[self.call_lang["code"]]
+            return {
+                "success": False,
+                "message": (
+                    f"Already switched to {current} this turn. Don't switch again "
+                    f"— reply to the caller in {current} now."
+                ),
+            }
+        self._switched_this_turn = True
         await self.switch(target, "tool")
         return {
             "success": True,
@@ -879,6 +841,7 @@ class LanguageControl:
         """Before each reply: switch if Soniox heard this turn in another
         allowed language (languages.detect_switch decides how sure is sure
         enough)."""
+        self._switched_this_turn = False
         if not self.enabled:
             return
         detected = self.turn_language["detected"]
@@ -892,6 +855,7 @@ class LanguageControl:
         self.turn_language["previous"] = detected
         if target:
             await self.switch(target, f"detected {detected}")
+            self._switched_this_turn = True
 
 
 def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
@@ -1536,17 +1500,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
     @function_tool
     async def end_call_abusive(context: RunContext) -> None:
-        """End this call because the caller remained abusive after a warning.
+        """End the call because genuine abuse continued after ONE warning.
 
-        Only call this after you have already given the caller ONE polite
-        warning and the abusive behaviour continued anyway. Never call it as
-        a first response, and never for a caller who is merely frustrated,
-        complaining, or unhappy with the company — only for genuine abuse
-        directed at you, such as personal insults, sexual harassment, or
-        threats.
-
-        You do not need to say goodbye first: a short closing line is spoken
-        automatically. Say nothing after calling this.
+        Never for frustration or complaints. A closing line is spoken
+        automatically; say nothing after calling this.
         """
         logger.warning(
             "ending call for continued abuse after warning: call_id=%s "
@@ -2280,7 +2237,20 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
         }
 
+    # Which optional rules this call's prompt carries (static_prompt.
+    # _FEATURE_RULES): the transfer and portal-link rules only when their
+    # tools are registered below, the prepayment rule only when the company
+    # takes payments online.
+    features = set()
+    if transfer_enabled:
+        features.add("transfer")
+    if caller_phone and customer_email:
+        features.add("manage_link")
+    if company_data["company"].get("stripe_enabled") in (True, "true", "TRUE", 1):
+        features.add("payments")
+
     prompt_args = dict(
+        features=frozenset(features),
         profile=profile,
         instructions=(settings_row or {}).get("instructions"),
         caller_phone=caller_phone,

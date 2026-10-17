@@ -492,28 +492,18 @@ class BookingTools:
         employee_id: str | None = None,
         any_person: bool = False,
     ) -> dict:
-        """Look up which dates/times are available for one or more services.
+        """Free dates and times for one or more services over a date range.
 
         Args:
-            service_ids: IDs of the services to book together (from the
-                company data given to you). Only pass more than one if the
-                company allows booking multiple services in one call.
-            start_date: First date to check, as YYYY-MM-DD.
-            end_date: Last date to check, as YYYY-MM-DD. Same as start_date
-                for a single day.
-            employee_id: Specific employee ID, if the caller asked for
-                someone by name. Omit this and set any_person=True if the
-                caller doesn't care who helps them.
-            any_person: True if the caller is fine with any qualified
-                employee, in which case employee_id is ignored. If the
-                service has only one eligible employee, that employee is
-                used automatically whatever you pass here. If several are
-                eligible you must pass either employee_id or
-                any_person=True — never neither.
+            service_ids: Service IDs from the company data (more than one
+                only if the company allows it).
+            start_date: First date, YYYY-MM-DD.
+            end_date: Last date, YYYY-MM-DD (same as start_date for one day).
+            employee_id: Staff ID, if the caller asked for someone.
+            any_person: True if the caller doesn't mind who.
 
-        The result's "day_labels" gives each date's weekday and spoken date
-        as one string ("torek, devetindvajsetega septembra"); whenever you
-        say a weekday together with a date, take both from that one label.
+        The result has "day_labels" (weekday and spoken date per date) and
+        "time_of_day" (free times per part of the day).
         """
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
@@ -576,27 +566,15 @@ class BookingTools:
         employee_id: str | None = None,
         any_person: bool = False,
     ) -> dict:
-        """Check whether one exact date/time is still free right now.
-
-        Call this as the LAST step before create_booking — after the caller
-        has confirmed the slot AND you have collected their details (see
-        your instructions: name, phone, and email only when asked for) — with the exact same service_ids/employee_id/any_person/
-        date/time, and then call create_booking straight away in the same
-        turn. Never call it before collecting the caller's details: a check
-        that old is stale, and create_booking rejects checks older than a
-        minute. Availability can change between calls.
+        """Is this exact slot still free? Call it last, right before
+        create_booking in the same turn, with the same arguments.
 
         Args:
-            service_ids: Same service IDs you intend to pass to
-                create_booking.
+            service_ids: Same as for create_booking.
             date: YYYY-MM-DD.
             time: HH:MM, 24-hour.
-            employee_id: Same employee ID you intend to pass to
-                create_booking, if any_person is False.
-            any_person: Same value you intend to pass to create_booking.
-
-        The result's "day_label" is the weekday and spoken date for `date`
-        as one string — use it when you mention the date.
+            employee_id: Same as for create_booking.
+            any_person: Same as for create_booking.
         """
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
@@ -653,39 +631,22 @@ class BookingTools:
         any_person: bool = False,
         notes: str = "",
     ) -> dict:
-        """Actually reserve the appointment. Requires a just-completed check_slots.
-
-        Call it right after check_slots, in the same turn, once the caller
-        has confirmed the slot and you have their details. A
-        check_slots result older than a minute is rejected
-        (must_check_slots_first) — then just check again and retry.
-
-        If the response has requiresPayment=true, the booking is held but NOT
-        confirmed — tell the caller their reservation is pending, and that
-        they'll receive a payment link shortly (a real SMS/payment link is
-        not sent yet in this phase). Do NOT ask the caller for card details
-        yourself.
+        """Reserve the appointment, right after check_slots for the same slot.
 
         Args:
-            service_ids: Service ID(s) to book. Only pass more than one if
-                the company data says multiple services can be booked online
-                in one call — otherwise book one and offer to note any
-                additional ones as a message.
+            service_ids: Service ID(s) (more than one only if the company
+                allows it).
             date: YYYY-MM-DD.
             time: HH:MM, 24-hour.
             first_name: Caller's first name.
-            phone: Caller's phone number (the number they call from, when
-                the caller line says so and they agreed).
-            email: Caller's email address — only if they gave one or it is
-                on file for a confirmed existing customer; may be empty
-                when confirmations go by SMS.
+            phone: Phone number for the booking.
+            email: The caller's email — or the stored one for a confirmed
+                existing customer (always pass it then). Empty only when
+                confirmations go by SMS and none was given.
             last_name: Caller's last name, if given.
-            employee_id: Employee ID, if any_person is False. Must be
-                someone who performs this service — anyone else is refused.
-            any_person: True if the caller is fine with any qualified
-                employee. If the service has only one eligible employee,
-                that employee is used automatically whatever you pass here.
-            notes: Any extra note from the caller for this booking.
+            employee_id: Staff ID, when any_person is False.
+            any_person: True if the caller doesn't mind who.
+            notes: Extra note from the caller.
         """
         if (
             not self._company_data["company"].get("multiple_services_online")

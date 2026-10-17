@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from collections import Counter
 
+from agent.dates import slovenian_euros, slovenian_minutes
+
 
 def spoken_employee_names(employees: list[dict]) -> dict[str, str]:
     """Map employee ID -> the name the agent should say out loud.
@@ -82,10 +84,13 @@ def _render_company_prompt_sl(init_data: dict, hours_known: bool = False) -> str
         elif eligible:
             names = ", ".join(employee_names.get(e, "?") for e in eligible)
             note = f" — opravljajo: {names}"
-        return (
-            f'- {svc["naziv"]} (ID storitve: {svc["id"]}): {svc["cena"]} EUR, '
-            f'{svc["trajanjeMin"]} minut{note}'
-        )
+        # The price and duration also as words, ready to copy: the model
+        # otherwise built e.g. 45 as "štirideset pet" (eval, 2026-10-17).
+        price_words = slovenian_euros(svc["cena"])
+        minutes_words = slovenian_minutes(svc["trajanjeMin"])
+        price = f'{svc["cena"]} EUR' + (f" ({price_words})" if price_words else "")
+        duration = f'{svc["trajanjeMin"]} minut' + (f" ({minutes_words})" if minutes_words else "")
+        return f'- {svc["naziv"]} (ID storitve: {svc["id"]}): {price}, {duration}{note}'
 
     lines = [f'Podatki o podjetju "{company["naziv"]}":']
 
@@ -135,23 +140,9 @@ def _render_company_prompt_sl(init_data: dict, hours_known: bool = False) -> str
             "podrobnosti.\""
         )
 
-    # Deliberately NOT "if the caller doesn't say, just book anyone
-    # (any_person)" — that was written before the proactive
-    # ask-for-employee-preference default existed in STATIC_PROMPT_SL, and
-    # because this block is appended AFTER the static prompt it was winning
-    # on recency and cancelling that rule out. The static rule is the one
-    # that should win; this line now restates it instead of contradicting
-    # it.
-    lines.append(
-        "\nČe stranka ne izrazi želje po določenem zaposlenem, jo vprašaj, "
-        "ali ima željo po določenem zaposlenem — takoj, ko je storitev "
-        "dokončno izbrana, in PREDEN vprašaš za dan. Šele ko pove, da ji je "
-        "vseeno, rezerviraj pri kateremkoli zaposlenem, ki opravlja izbrano "
-        "storitev (any_person). Izjema: če je pri KONČNO izbrani storitvi "
-        "navedeno, da jo opravlja SAMO en zaposleni, tega vprašanja ne "
-        "postavljaj — rezerviraj pri tistem zaposlenem. Če stranka zamenja "
-        "storitev, to presodi znova za novo storitev."
-    )
+    # The "ask for a staff preference" paragraph that used to follow here
+    # restated R-EMPLOYEE-PREFERENCE-ASK word for word; removed 2026-10-17
+    # (the per-service "SAMO ..." notes above still carry the exception).
 
     if not hours_known:
         lines.append(
@@ -238,20 +229,7 @@ def _render_company_prompt_en(init_data: dict, hours_known: bool = False) -> str
             "will get back to you with the details.\""
         )
 
-    # See the note in _render_company_prompt_sl: this deliberately no longer
-    # tells the model to silently default to any_person, which contradicted
-    # the proactive ask-for-employee-preference rule in STATIC_PROMPT_EN and
-    # won on recency by being appended after it.
-    lines.append(
-        "\nIf the caller hasn't expressed a preference, ask whether they'd "
-        "like a specific staff member — as soon as the service is final, "
-        "and BEFORE asking about the day. Only once they say they don't "
-        "mind should you book with any staff member who performs the chosen "
-        "service (any_person). Exception: if the FINALLY chosen service is "
-        "marked as having only ONE staff member, don't ask that question — "
-        "book with that person. If the caller switches service, decide "
-        "again for the new one."
-    )
+    # See the note in _render_company_prompt_sl (paragraph removed 2026-10-17).
 
     if not hours_known:
         lines.append(
