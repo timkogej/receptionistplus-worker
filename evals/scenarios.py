@@ -422,6 +422,44 @@ SCENARIOS: list[Scripted | Simulated] = [
         context={"sms_confirmation": True, "spoken_customers": {}},
     ),
     Scripted(
+        "sl-telefon-stevke",
+        "sl",
+        [
+            Turn(
+                "Moja telefonska številka je 123 333 222.",
+                judge=(
+                    "Reads the number back digit by digit as Slovenian digit "
+                    "words, grouped by three: 'ena dva tri, tri tri tri, dva dva "
+                    "dva' (or the same digits without commas), and asks the "
+                    "caller to confirm. Fail if any digit is said as 'eden', "
+                    "'trije', 'dve' or 'štirje', if a digit is missing or extra, "
+                    "or if it is said as a whole number."
+                ),
+                forbid_tools=("create_booking",),
+            )
+        ],
+    ),
+    Scripted(
+        "sl-konkretna-ura",
+        "sl",
+        [
+            Turn("Rad bi pedikuro naslednji torek. Vseeno mi je, kdo."),
+            Turn(
+                "Popoldan, ob dveh.",
+                judge=(
+                    "The caller asked for two in the afternoon (14:00). The "
+                    "reply must NOT list several times for the caller to choose "
+                    "from or ask about the part of the day. Pass if it either "
+                    "says two o'clock is free and reads back the booking for "
+                    "the caller to confirm (service, day, date, 'ob dveh "
+                    "popoldan'), or says two o'clock is taken and offers a few "
+                    "(up to four) nearby free times instead."
+                ),
+                forbid_tools=("create_booking",),
+            ),
+        ],
+    ),
+    Scripted(
         "sl-odpoved-brez-orodja",
         "sl",
         [

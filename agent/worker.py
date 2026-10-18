@@ -284,7 +284,12 @@ _META_COMMENTARY = re.compile(
     r"\bthe caller\b|\bper (?:the |my )?rules?\b|\bswitch(?:ing)? (?:the )?(?:call|language)"
     r"|\bswitch_language\b|\btool[- ]?switch\b|\blanguage first\b|\b(?:language|\w+ian|English|German) detected\b|\bso I switch\b"
     r"|\bswitch(?:ed|ing)? (?:back )?to (?:Slovenian|English|German|Croatian|Italian)\b"
-    r"|\bta klic (?:je|vodim|bom vodila) v \w+(?:ščini|sko)\b",
+    r"|\bta klic (?:je|vodim|bom vodila) v \w+(?:ščini|sko)\b"
+    # Reasoning about the prompt's data (eval 2026-10-18: "\"Naslednji torek\"
+    # is the row tagged [NASLEDNJI TEDEN] ... Pedikura is service 18, caller
+    # said any person.").
+    r"|\brow tagged\b|\bcaller (?:said|wants|asked|gave)\b|\bany[_ ]person\b"
+    r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
