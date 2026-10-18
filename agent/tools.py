@@ -356,6 +356,9 @@ class BookingTools:
         self._customer_lookup = None
         self._caller_phone: str | None = None
         self._customer_by_phone: dict[str, dict | None] = {}
+        # Stored customer emails seen this call; the agent never speaks them
+        # (ReceptionistAgent.llm_node / EmailMask).
+        self.private_emails: set[str] = set()
 
     def set_customer_lookup(self, lookup, caller_phone: str | None) -> None:
         """lookup: async (phone_e164) -> "Stranke" row or None. With it,
@@ -724,6 +727,8 @@ class BookingTools:
             stored_first = (existing.get("Ime") or "").strip()
             stored_last = (existing.get("Priimek") or "").strip()
             stored_email = (existing.get("Email stranke") or "").strip()
+            if stored_email:
+                self.private_emails.add(stored_email)
             if not _same_name(stored_first, stored_last, first_name, last_name):
                 full = " ".join(p for p in (stored_first, stored_last) if p)
                 return {

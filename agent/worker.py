@@ -83,6 +83,7 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
+from agent.spoken_text import SpokenTextFilter
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -559,10 +560,16 @@ class ReceptionistAgent(Agent):
         language: str,
         on_suppressed_user_turn=None,
         on_turn_language=None,
+        private_emails: set[str] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._language = language
+        # Stored customer emails (caller ID match, find_customer, the
+        # existing-customer guard). The prompt says never to read them out;
+        # llm_node also replaces them, since the model still did now and then
+        # (eval sl-znana-stranka-rezervacija, ~1 in 5).
+        self._private_emails = private_emails if private_emails is not None else set()
         # async callback(text) run before each reply, while the caller's turn
         # is complete but the LLM hasn't started — the one point where a
         # language switch takes effect for THIS reply (worker.entrypoint).
@@ -588,6 +595,33 @@ class ReceptionistAgent(Agent):
         self._language = language
 
     async def llm_node(self, chat_ctx, tools, model_settings):
+        """_llm_node_filtered, then SpokenTextFilter over the text."""
+        stream = self._llm_node_filtered(chat_ctx, tools, model_settings)
+        mask = SpokenTextFilter(self._private_emails, self._language)
+        chunk_id = ""
+        async for chunk in stream:
+            if isinstance(chunk, str):
+                out = mask.feed(chunk)
+                if out:
+                    yield out
+                continue
+            if isinstance(chunk, llm.ChatChunk):
+                chunk_id = chunk.id or chunk_id
+                delta = chunk.delta
+                if delta is not None and delta.content and not delta.tool_calls:
+                    out = mask.feed(delta.content)
+                    if out:
+                        yield llm.ChatChunk(id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=out))
+                    continue
+            rest = mask.flush()
+            if rest:
+                yield llm.ChatChunk(id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=rest))
+            yield chunk
+        rest = mask.flush()
+        if rest:
+            yield llm.ChatChunk(id=chunk_id, delta=llm.ChoiceDelta(role="assistant", content=rest))
+
+    async def _llm_node_filtered(self, chat_ctx, tools, model_settings):
         """The default LLM node, minus a first sentence of meta-commentary.
 
         With thinking off, Claude sometimes writes its reasoning as text
@@ -719,7 +753,7 @@ class ReceptionistAgent(Agent):
         )
 
 
-def build_find_customer_tool(lookup, caller_phone: str | None):
+def build_find_customer_tool(lookup, caller_phone: str | None, private_emails: set | None = None):
     """find_customer: an existing customer by a phone number the caller SAID
     (withheld caller ID, or a different number than the one they call from).
     With caller ID the lookup already happened at call start; a spoken
@@ -756,6 +790,8 @@ def build_find_customer_tool(lookup, caller_phone: str | None):
                 "message": "No customer with this number. Collect the details as usual.",
             }
         email = ((row or {}).get("Email stranke") or "").strip()
+        if email and private_emails is not None:
+            private_emails.add(email)
         logger.info("find_customer: existing customer for spoken number")
         return {
             "found": True,
@@ -802,8 +838,12 @@ def build_receptionist_agent(
     harness (evals/run_evals.py), so both run the same prompt and tools.
     extra_tools carries the ones bound to the live session (end_call_abusive).
     """
+    stored_email = ((customer or {}).get("Email stranke") or "").strip()
+    if stored_email:
+        booking_tools.private_emails.add(stored_email)
     return ReceptionistAgent(
         language=language,
+        private_emails=booking_tools.private_emails,
         on_suppressed_user_turn=on_suppressed_user_turn,
         on_turn_language=on_turn_language,
         instructions=_build_system_prompt(
@@ -2419,7 +2459,10 @@ async def entrypoint(ctx: JobContext) -> None:
         async def _lookup_spoken_number(phone_e164: str) -> dict | None:
             return await supabase.find_customer_by_phone(company_text_id, phone_e164)
 
-        extra_tools.insert(0, build_find_customer_tool(_lookup_spoken_number, caller_phone))
+        extra_tools.insert(
+            0,
+            build_find_customer_tool(_lookup_spoken_number, caller_phone, booking_tools.private_emails),
+        )
         booking_tools.set_customer_lookup(_lookup_spoken_number, caller_phone)
     if detect_language:
         extra_tools.insert(0, language_control.switch_language)
