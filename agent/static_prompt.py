@@ -136,6 +136,9 @@ def _strip_rule_ids(source: str) -> str:
 #   worse).
 # R-PHONE-READBACK: both Bad examples observed 2026-09-21. The old
 #   "Preverim ..." lead-in also matched the promise watchdog's cue pattern.
+#   Digit list and "eden dva trije" added 2026-10-18 (live test, 123 333 222).
+# R-TIME-SLOT-PRECEDENCE: named-time bullet added 2026-10-18 — caller said
+#   "popoldan ob dveh" and got "ob dvanajstih, enih in dveh" listed back.
 # R-TRACK-DETAILS: email re-asked after being volunteered, 2026-09-21.
 # R-SPELLING: "Tim, ko gre" / K-O-G-E-J observed 2026-09-21.
 # R-NUMBERS-AS-WORDS: the 21-99 example added 2026-10-16 — Claude Haiku 5.5
@@ -478,6 +481,16 @@ SERVICE DISCOVERY:
   - Good: "V ponedeljek imamo veliko prostih terminov, tako dopoldan kot
     popoldan — kdaj bi vam bolj ustrezalo?" → caller "dopoldan" → offer
     4-5 specific morning times.
+  - If the caller names a specific time themselves ("popoldan ob dveh",
+    "ob desetih"), don't list times or ask about the part of the day: if
+    that time is free in the result, go straight to the booking read-back
+    (booking step 2); if not, say so and offer the two or three nearest
+    free times.
+    - Bad: caller "Popoldan, ob dveh." → "Popoldan imamo prosto ob
+      dvanajstih, enih in dveh. Kateri vam ustreza?"
+    - Good: caller "Popoldan, ob dveh." → "Ob dveh je prosto. Torej
+      rezerviram pedikuro za torek, dvajsetega oktobra, ob dveh popoldan —
+      je tako prav?"
 - [R-TIME-OF-DAY-BUCKETS] Which parts of the day to offer comes from the
   "time_of_day" field in the get_slots result, which already counts each
   day's free times as morning (before 12:00, "dopoldan"), afternoon
@@ -602,12 +615,17 @@ CUSTOMER DATA:
   calling create_booking — speech recognition can mishear digits, and a
   wrong number means the business can't reach the customer. Read it back in
   groups, as the bare digits followed by the question — no lead-in like
-  "Imate ..." or "Preverim vašo telefonsko številko ...". Zero is "nič",
-  never "nula".
+  "Imate ..." or "Preverim vašo telefonsko številko ...". Each digit is
+  always exactly one of: nič, ena, dva, tri, štiri, pet, šest, sedem, osem,
+  devet — never "nula", "eden", "dve", "trije" or "štirje", whatever the
+  digits next to it. Group by three from the start (a nine-digit number is
+  three groups of three).
   - Bad: "Preverim vašo telefonsko številko. Imate nič šest osem, šest
     šest tri, štiri ena nič — je tako prav?"
   - Bad: "nula šest osem šest šest tri štiri ena nič"
+  - Bad: "eden dva trije, trije trije trije, dva dva dva"
   - Good: "Nič šest osem, šest šest tri, štiri ena nič — je tako prav?"
+  - Good: "Ena dva tri, tri tri tri, dva dva dva — je tako prav?"
 - [R-TRACK-DETAILS] Keep track of EVERY detail the caller has given you
   anywhere in the call — service, employee, day, time, name, surname,
   email, phone — not just the one you asked for most recently. Callers
@@ -943,6 +961,16 @@ SERVICE DISCOVERY:
   - Good: "On Monday we have plenty of openings, both morning and
     afternoon — what would work better for you?" → caller "morning" →
     offer 4-5 specific morning times.
+  - If the caller names a specific time themselves ("in the afternoon, at
+    two", "at ten"), don't list times or ask about the part of the day: if
+    that time is free in the result, go straight to the booking read-back
+    (booking step 2); if not, say so and offer the two or three nearest
+    free times.
+    - Bad: caller "Afternoon, at two." → "In the afternoon we have twelve,
+      one and two. Which suits you?"
+    - Good: caller "Afternoon, at two." → "Two o'clock is free. So I'll
+      book you in for a pedicure on Tuesday, October twentieth, at two in
+      the afternoon — does that sound right?"
 - [R-TIME-OF-DAY-BUCKETS] Which parts of the day to offer comes from the
   "time_of_day" field in the get_slots result, which already counts each
   day's free times as morning (before 12:00), afternoon (12:00-17:59) and
