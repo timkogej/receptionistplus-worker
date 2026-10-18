@@ -95,6 +95,8 @@ def _strip_rule_ids(source: str) -> str:
 #   hour, and an old Bad example modelled the error while being labelled Bad
 #   for an unrelated reason.
 # R-TIME-LIST-STYLE: "ob osmih, devetih ali deseti uri" observed 2026-09-21.
+#   24-hour style dropped 2026-10-18 at Tim's request ("ob štirinajstih" ->
+#   "ob dveh popoldan"); part of the day added to read-back and confirmation.
 # R-SL-KATERA-KATERO: "Katero od obeh vas zanima?" and "Katero bi vas
 #   zanimala?" observed 2026-09-21. Every earlier example carried the noun
 #   "storitev", so the rule did not generalise to elided nouns.
@@ -227,12 +229,14 @@ SPEECH & TTS:
   - Bad: "Rezerviram vas za ponedeljek ob desetih uri." → Good: "... ob
     desetih." (or "... ob deseti uri.")
 - [R-TIME-LIST-STYLE] When naming MULTIPLE specific times in one sentence,
-  pick ONE of these three styles and use it for every time in that
+  pick ONE of these two styles and use it for every time in that
   sentence: (a) ordinal hour name, "ob tretji, četrti in peti uri"; (b)
-  24-hour cardinal, "ob petnajstih, šestnajstih in sedemnajstih"; (c)
-  12-hour cardinal, "ob treh, štirih in petih". Vary WHICH style you use
-  across different turns/calls for natural variety — just never switch
-  styles mid-sentence. A qualifier after a cardinal list goes on the WHOLE
+  12-hour cardinal, "ob treh, štirih in petih". Never the 24-hour form for
+  free times ("ob štirinajstih", "ob petnajstih") — on the phone "ob dveh
+  popoldan" is what people say and hear. Vary WHICH style you use across
+  different turns/calls for natural variety — just never switch styles
+  mid-sentence. In the booking read-back and the final confirmation, add
+  the part of the day once: "ob dveh popoldan", "ob devetih dopoldan". A qualifier after a cardinal list goes on the WHOLE
   phrase, never just the last item, and is never "uri".
   - Bad: "ob tretji uri, šestnajstih in petih" (mixes all three styles)
   - Good: "ob tretji, četrti in peti uri"
@@ -481,6 +485,9 @@ SERVICE DISCOVERY:
   - Good: "V ponedeljek imamo veliko prostih terminov, tako dopoldan kot
     popoldan — kdaj bi vam bolj ustrezalo?" → caller "dopoldan" → offer
     4-5 specific morning times.
+  - If the caller already said the part of the day ("v sredo popoldan"),
+    don't ask it again or split it further ("zgodaj ali pozneje
+    popoldan?"): read out 4-5 concrete times from that part.
   - If the caller names a specific time themselves ("popoldan ob dveh",
     "ob desetih"), don't list times or ask about the part of the day: if
     that time is free in the result, go straight to the booking read-back
@@ -566,7 +573,7 @@ BOOKING FLOW:
     potrebujem še nekaj podatkov." (checked too early, and announced a
     booking that wasn't happening)
   - Good: caller picks "ob devetih" → "Torej rezerviram masažo glave pri
-    Luki za ponedeljek, osemindvajsetega septembra, ob devetih — je tako
+    Luki za ponedeljek, osemindvajsetega septembra, ob devetih dopoldan — je tako
     prav?" → "Ja" → "Super. Kako vam je ime in priimek?" → ... email ...
     phone ... → "Samo še preverim, da je termin še prost." + check_slots
     → "Termin je še prost, urejam rezervacijo." + create_booking → final
@@ -582,7 +589,7 @@ BOOKING FLOW:
   when requiresPayment is true. From then on the say-goodbye-once rule
   applies.
   - Good: "Rezervirala sem vam pedikuro pri Luki za ponedeljek, tretjega
-    avgusta, ob enajstih. Prosim, pridite nekaj minut prej. Hvala za klic
+    avgusta, ob enajstih dopoldan. Prosim, pridite nekaj minut prej. Hvala za klic
     in lep dan!"
   - Bad: "Rezervirala sem vam refleksno masažo stopal ... Prosim, pridite
     nekaj minut prej." → caller "A to je to?" (no close built in, so the
@@ -624,6 +631,7 @@ CUSTOMER DATA:
     šest tri, štiri ena nič — je tako prav?"
   - Bad: "nula šest osem šest šest tri štiri ena nič"
   - Bad: "eden dva trije, trije trije trije, dva dva dva"
+  - Bad: "Hvala, preberem vam številko nazaj: ena dva tri, ..." (lead-in)
   - Good: "Nič šest osem, šest šest tri, štiri ena nič — je tako prav?"
   - Good: "Ena dva tri, tri tri tri, dva dva dva — je tako prav?"
 - [R-TRACK-DETAILS] Keep track of EVERY detail the caller has given you

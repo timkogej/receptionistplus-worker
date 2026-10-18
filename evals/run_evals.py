@@ -68,6 +68,15 @@ SL_TEXT_CHECKS = [
      "number word in English order (e.g. 'štirideset pet' instead of 'petinštirideset')"),
     (re.compile(r"\d"), "digits in spoken text (TTS reads them badly)"),
     (re.compile(r"[*#]|^\s*-\s", re.M), "markdown in spoken text"),
+    # Free times in the 24-hour form; "ob dveh popoldan" is the phone form
+    # (R-TIME-LIST-STYLE). Opening hours ("do šestnajstih") don't use "ob".
+    (re.compile(r"\bob\s+(?:(?:trinajst|štirinajst|petnajst|šestnajst|sedemnajst|osemnajst|devetnajst|dvajset)ih)\b"
+                r"|,\s*(?:trinajst|štirinajst|petnajst|šestnajst|sedemnajst|osemnajst|devetnajst)ih\b", re.I),
+     "24-hour clock time ('ob štirinajstih' instead of 'ob dveh popoldan')"),
+    (re.compile(r"\bzgodaj\w*\s+popoldan\w*\b.{0,40}\b(?:pozneje|kasneje|pozno)\b", re.I),
+     "split the part of the day the caller already chose"),
+    (re.compile(r"\bpreberem\s+(?:vam\s+)?(?:še\s+)?(?:telefonsko\s+)?številko\b", re.I),
+     "lead-in before the phone read-back"),
 ]
 
 
@@ -139,7 +148,9 @@ def _build(language: str, model: str, context: dict | None = None):
         async def _lookup(phone_e164: str):
             return spoken.get(phone_e164)
 
-        extra_tools.append(build_find_customer_tool(_lookup, context.get("caller_phone")))
+        extra_tools.append(
+            build_find_customer_tool(_lookup, context.get("caller_phone"), booking_tools.private_emails)
+        )
         booking_tools.set_customer_lookup(_lookup, context.get("caller_phone"))
         context["customer_lookup"] = True
     if allowed:
