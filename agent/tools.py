@@ -247,6 +247,30 @@ def _time_of_day_summary(slots_by_date: dict) -> dict:
     return summary
 
 
+def _offer_times(slots_by_date: dict, per_part: int = 5) -> dict:
+    """Per open day and part of the day, at most per_part free times spread
+    across it: what to read out once the part of the day is known. Without
+    it the model, faced with a long afternoon, asked "zgodaj ali pozneje
+    popoldan?" instead of naming times (eval 2026-10-19)."""
+    offer = {}
+    for date, times in slots_by_date.items():
+        if not isinstance(times, list):
+            continue
+        parts = {"morning": [], "afternoon": [], "evening": []}
+        for t in sorted(times):
+            key = "morning" if t < _AFTERNOON_START else ("afternoon" if t < _EVENING_START else "evening")
+            parts[key].append(t)
+        day = {}
+        for key, ts in parts.items():
+            if len(ts) > per_part:
+                step = (len(ts) - 1) / (per_part - 1)
+                ts = [ts[round(i * step)] for i in range(per_part)]
+            if ts:
+                day[key] = ts
+        offer[date] = day
+    return offer
+
+
 def _day_label(iso_date: str, language: str) -> str | None:
     try:
         return spoken_date_label(datetime.strptime(iso_date, "%Y-%m-%d").date(), language)
@@ -621,6 +645,7 @@ class BookingTools:
         if isinstance(result.get("slots"), dict):
             _filter_elapsed_times_today(result["slots"])
             result["time_of_day"] = _time_of_day_summary(result["slots"])
+            result["offer_times"] = _offer_times(result["slots"])
             result["day_labels"] = _day_labels(result["slots"], self._language)
         if window_note and isinstance(result, dict):
             result["note"] = window_note

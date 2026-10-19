@@ -294,7 +294,8 @@ _META_COMMENTARY = re.compile(
     # Reasoning about the prompt's data (eval 2026-10-18: "\"Naslednji torek\"
     # is the row tagged [NASLEDNJI TEDEN] ... Pedikura is service 18, caller
     # said any person.").
-    r"|\brow tagged\b|\bcaller (?:said|wants|asked|gave)\b|\bany[_ ]person\b"
+    r"|\brow tagged\b|\bcaller (?:said|says|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
+    r"|\b(?:today|tomorrow|yesterday) is\b|\b\d{4}-\d{2}-\d{2}\b"
     r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
     re.IGNORECASE,
 )
