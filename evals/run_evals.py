@@ -38,6 +38,7 @@ from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
 from agent.worker import LanguageControl, build_find_customer_tool, build_receptionist_agent
 from agent.appointments import AppointmentTools
+from agent.group_booking import GroupBooking
 from evals.fake_booking import FakeAppointmentStore, FakeBooking
 from evals.scenarios import SCENARIOS, Scripted, Simulated
 
@@ -166,6 +167,10 @@ def _build(language: str, model: str, context: dict | None = None):
     rules = context.pop("appointment_rules", {})
     store = FakeAppointmentStore(own or [])
     booking_tools.eval_store = store
+    # Same as the live call: every call can book several people.
+    group = GroupBooking(booking_tools)
+    booking_tools.eval_group = group
+    extra_tools += [group.find_group_times, group.book_group]
     if own is not None:
         appt = AppointmentTools(
             supabase=store,

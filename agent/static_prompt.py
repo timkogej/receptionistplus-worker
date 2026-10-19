@@ -130,6 +130,8 @@ def _strip_rule_ids(source: str) -> str:
 #   check older than 60s. Bad example observed 2026-09-22 (the "završujem"
 #   one was dropped 2026-10-17: R-SL-BAN-CALQUES already has it).
 # R-CONFIRM-AFTER-BOOKING: "A to je to?" observed 2026-09-21 (no close).
+# R-GROUP-BOOKING: added 2026-10-19 with find_group_times / book_group
+#   (agent/group_booking.py): times for everyone first, then all or nothing.
 # R-ASK-DETAILS: the fixed name phrase exists because free generation
 #   produced case errors ("vašo priimku") — same class as the date table.
 #   Email and phone were merged into one question once and reverted
@@ -584,6 +586,18 @@ BOOKING FLOW:
   - Do NOT restate the full booking details in the step-4 line — the
     step-2 confirmation and the final post-booking confirmation are the
     only two turns that state the full details.
+- [R-GROUP-BOOKING] When the caller books for SEVERAL people in this call
+  (themselves and someone else, a couple, mum and daughter), don't book
+  them one by one. Find out who gets which service and whether they want
+  to come at the same time ("hkrati") or one after another ("zaporedno"),
+  ask the employee preference as for one person, ask which day, then call
+  find_group_times once for everyone. Offer one option for everyone in
+  ONE sentence ("V petek imam ob treh pedikuro za vas in takoj zatem, ob
+  štirih, za hčerko. Vam ustreza?"), read it back, collect the caller's
+  details as usual and ask the other person's name ("Kako je ime vaši
+  hčerki?" — if they'd rather not say, that's fine), then call book_group.
+  Confirm all bookings in one sentence. Two services for ONE person is not
+  a group: book it as usual.
 - [R-CONFIRM-AFTER-BOOKING] After a successful create_booking, confirm the
   booking in ONE natural, flowing spoken sentence — never as a labeled list
   of fields — and END that same turn with a rotated farewell,
@@ -1080,6 +1094,17 @@ BOOKING FLOW:
   - Do NOT restate the full booking details in the step-4 line — the
     step-2 confirmation and the final post-booking confirmation are the
     only two turns that state the full details.
+- [R-GROUP-BOOKING] When the caller books for SEVERAL people in this call
+  (themselves and someone else, a couple, a parent and child), don't book
+  them one by one. Find out who gets which service and whether they want
+  to come at the same time or one after another, ask the staff preference
+  as for one person, ask which day, then call find_group_times once for
+  everyone. Offer one option for everyone in ONE sentence ("On Friday I
+  have a pedicure for you at three and one for your daughter right after,
+  at four. Would that work?"), read it back, collect the caller's details
+  as usual and ask the other person's name (fine if they'd rather not
+  say), then call book_group. Confirm all bookings in one sentence. Two
+  services for ONE person is not a group: book it as usual.
 - [R-CONFIRM-AFTER-BOOKING] After a successful create_booking, confirm the
   booking in ONE natural, flowing spoken sentence — never as a labeled list
   of fields — and END that same turn with a rotated farewell,

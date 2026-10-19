@@ -190,6 +190,36 @@ def _check_link_not_change(fake, notes) -> list[str]:
     return failures
 
 
+def _check_back_to_back(fake, notes) -> list[str]:
+    c = fake.created
+    if len(c) != 2:
+        return [f"expected 2 bookings, got {len(c)}"]
+    failures = []
+    if c[0]["date"] != c[1]["date"]:
+        failures.append("the two bookings are on different days")
+    a, b = (int(x["time"][:2]) * 60 + int(x["time"][3:5]) for x in c)
+    if not (a + 45 <= b <= a + 45 + 30):
+        failures.append(f"second starts at {c[1]['time']}, not right after the first ({c[0]['time']} + 45 min)")
+    names = [x["first_name"].lower() for x in c]
+    if names != ["ana", "eva"]:
+        failures.append(f"names {names}, expected ana then eva")
+    if c[0]["phone"] != c[1]["phone"]:
+        failures.append("different phone numbers")
+    return failures
+
+
+def _check_together(fake, notes) -> list[str]:
+    c = fake.created
+    if len(c) != 2:
+        return [f"expected 2 bookings, got {len(c)}"]
+    failures = []
+    if (c[0]["date"], c[0]["time"]) != (c[1]["date"], c[1]["time"]):
+        failures.append(f"not at the same time: {c[0]['time']} / {c[1]['time']}")
+    if c[0].get("employee_id") and c[0].get("employee_id") == c[1].get("employee_id"):
+        failures.append("same employee for both at the same time")
+    return failures
+
+
 def _check_sms_confirmation_booking(fake, notes) -> list[str]:
     if len(fake.created) != 1:
         return [f"expected exactly 1 booking, got {len(fake.created)}"]
@@ -519,6 +549,30 @@ SCENARIOS: list[Scripted | Simulated] = [
         context={"manage_link_tool": True,
                  "spoken_customers": {"+38641555123": {"Ime": "Ana", "Priimek": "Novak",
                                                        "Email stranke": "ana.novak@primer.si"}}},
+    ),
+    Simulated(
+        "sl-dve-osebi-zaporedno",
+        "sl",
+        persona=(
+            "Si Ana Novak. Želiš pedikuro zase in takoj zatem še za hčerko Evo, "
+            "eno za drugo, naslednji teden v četrtek popoldan; vseeno ti je, kdo. "
+            "Telefonska številka: 041 222 333. E-naslova ne daš. Izberi prvo "
+            "ponujeno možnost in potrdi. Hčerka je Eva."
+        ),
+        check=_check_back_to_back,
+        context={"sms_confirmation": True},
+    ),
+    Simulated(
+        "sl-masaza-za-dva",
+        "sl",
+        persona=(
+            "Si Ana Novak in bi rada refleksno masažo stopal zase in za moža "
+            "Marka hkrati, ob isti uri, naslednji teden v petek dopoldan; vseeno "
+            "ti je, kdo. Telefonska številka: 041 222 333. E-naslova ne daš. "
+            "Izberi prvo ponujeno možnost in potrdi."
+        ),
+        check=_check_together,
+        context={"sms_confirmation": True},
     ),
     Simulated(
         "sl-sms-potrdilo-brez-emaila",

@@ -104,6 +104,23 @@ def appointment_change_text(
         time=time_hhmm,
     ))
 
+_GROUP_TEMPLATES = {
+    "sl": ("{company}: potrjujemo termine, {weekday}, {d}. {m}. {y}: {items}. Lep pozdrav!", "{service} ob {time} ({name})"),
+    "en": ("{company}: your bookings are confirmed, {weekday} {d}/{m}/{y}: {items}. See you then!", "{service} at {time} ({name})"),
+    "de": ("{company}: Ihre Termine sind bestätigt, {weekday}, {d}.{m}.{y}: {items}. Bis bald!", "{service} um {time} ({name})"),
+    "hr": ("{company}: potvrđujemo termine, {weekday}, {d}. {m}. {y}.: {items}. Lijep pozdrav!", "{service} u {time} ({name})"),
+    "it": ("{company}: confermiamo gli appuntamenti, {weekday} {d}/{m}/{y}: {items}. A presto!", "{service} alle {time} ({name})"),
+}
+
+
+def group_confirmation_text(*, company_name: str, bookings: list[dict], language: str) -> str:
+    """One SMS for everyone booked together in a call (group_booking.py)."""
+    lang = language if language in _GROUP_TEMPLATES else "en"
+    whole, item = _GROUP_TEMPLATES[lang]
+    d = datetime.strptime(bookings[0]["date"], "%Y-%m-%d").date()
+    items = ", ".join(item.format(service=b.get("service") or _DEFAULT_SERVICE_WORD[lang], time=b["time"], name=b.get("name") or "") for b in bookings)
+    return normalize_sms(whole.format(company=company_name, weekday=WEEKDAYS[lang][d.weekday()], d=d.day, m=d.month, y=d.year, items=items))
+
 # --- The company's own confirmation template ("Podatki podjetij") ----------
 # Same template, placeholders and SMS rules as the Jedro+ booking
 # confirmation (n8n "JEDROPLUS - Vpisovanje podatkov", node "Render SMS iz

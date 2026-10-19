@@ -78,10 +78,12 @@ from agent.languages import (
 )
 from agent.call_summary import summarize_call
 from agent.appointments import AppointmentTools
+from agent.group_booking import GroupBooking
 from agent.owner_alert import owner_alert_text, owner_language, unfinished_booking_message
 from agent.sms_client import (
     appointment_change_text,
     booking_confirmation_text,
+    group_confirmation_text,
     choose_confirmation_template,
     render_confirmation_template,
     send_sms,
@@ -2575,7 +2577,36 @@ async def entrypoint(ctx: JobContext) -> None:
         enabled=detect_language,
     )
 
-    extra_tools = [end_call_abusive]
+    async def _cancel_created(row_id) -> bool:
+        if not company_text_id:
+            return False
+        return bool(await supabase.update_appointment(company_text_id, row_id, {"Status": "cancelled"}))
+
+    async def _send_group_confirmation(bookings: list[dict], phone: str) -> None:
+        notes.add_change(
+            "Skupinska rezervacija po telefonu: "
+            + ", ".join(f"{b['terminId']} ({b['name']}, {b['time']})" for b in bookings) + "."
+        )
+        if not sms_confirmation:
+            return
+        text = group_confirmation_text(
+            company_name=company_data["company"]["naziv"], bookings=bookings, language=call_lang["code"]
+        )
+        result = await send_sms(
+            kind="confirmation", company_slug=company_slug, phone=normalize_phone(phone) or phone,
+            text=text, termin_id=bookings[0]["terminId"], call_id=call_id, language=call_lang["code"],
+        )
+        if not result.get("success") and not notes.message:
+            notes.message = (
+                f"SMS potrdilo za skupinsko rezervacijo ({bookings[0]['terminId']} …) ni bilo "
+                f"poslano ({result.get('error')}). Potrdite stranki drugače."
+            )
+            notes.alert_kind = "trouble"
+
+    group_booking = GroupBooking(
+        booking_tools, cancel_created=_cancel_created, on_group_booked=_send_group_confirmation
+    )
+    extra_tools = [group_booking.find_group_times, group_booking.book_group, end_call_abusive]
     if company_text_id:
         async def _lookup_spoken_number(phone_e164: str) -> dict | None:
             return await supabase.find_customer_by_phone(company_text_id, phone_e164)
