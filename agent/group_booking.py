@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
 
 from livekit.agents import RunContext, function_tool
 
