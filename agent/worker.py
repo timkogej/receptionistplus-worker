@@ -77,6 +77,7 @@ from agent.languages import (
     pack,
 )
 from agent.call_summary import summarize_call
+from agent.owner_alert import owner_alert_text, owner_language, unfinished_booking_message
 from agent.sms_client import (
     booking_confirmation_text,
     choose_confirmation_template,
@@ -2086,6 +2087,42 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception:
             logger.exception("failed to update customer language")
 
+    async def _send_owner_alert() -> None:
+        """SMS to the owner for a call that needs a follow-up (phase10).
+        Off until the migration has run (no column -> no alert)."""
+        row = settings_row or {}
+        if row.get("owner_alert_sms") is not True:
+            return
+        phone = normalize_phone(row.get("owner_alert_phone")) or normalize_phone(
+            (call_profile.get("profile") or {}).get("Kontaktni telefon")
+        )
+        if not phone:
+            logger.info("owner alert skipped: no phone (settings or Kontaktni telefon)")
+            return
+        lang = owner_language(company_language)
+        text = owner_alert_text(
+            message=notes.message,
+            callback_requested=notes.callback_requested,
+            kind=notes.alert_kind,
+            caller_phone=caller_phone,
+            language=lang,
+        )
+        try:
+            await asyncio.wait_for(
+                send_sms(
+                    kind="owner_alert",
+                    company_slug=company_slug,
+                    phone=phone,
+                    text=text,
+                    call_id=call_id,
+                    language=lang,
+                    timeout=8.0,
+                ),
+                timeout=9.0,
+            )
+        except Exception:
+            logger.exception("owner alert SMS failed")
+
     async def _on_shutdown() -> None:
         if call_end_state["logged_directly"]:
             return
@@ -2096,7 +2133,25 @@ async def entrypoint(ctx: JobContext) -> None:
             await asyncio.wait(list(booking_tools.background_tasks), timeout=10.0)
         created_termin_id = booking_tools.created_termin_id if booking_tools else None
         if booking_tools is not None and booking_tools.owner_followup_reason:
-            notes.request_callback(booking_tools.owner_followup_reason)
+            notes.request_callback(booking_tools.owner_followup_reason, kind="trouble")
+        # Looked for (or picked) a time and hung up before it was booked:
+        # the owner gets it as a callback request, like a message taken.
+        if (
+            booking_tools is not None
+            and not created_termin_id
+            and booking_tools.booking_interest
+            and not notes.has_note
+            and not call_end_state["transferred"]
+            and not call_end_state["abusive"]
+        ):
+            notes.request_callback(
+                unfinished_booking_message(
+                    booking_tools.booking_interest,
+                    booking_tools._company_data,
+                    owner_language(company_language),
+                ),
+                kind="unfinished",
+            )
         ended_at = call_ended_at.get("value") or datetime.now(timezone.utc)
         duration_sec = duration_seconds(started_at, ended_at)
 
@@ -2175,6 +2230,9 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception:
             logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
             return
+
+        if notes.has_note and not call_end_state["transferred"]:
+            await _send_owner_alert()
 
         await _remember_customer_language()
 
@@ -2360,6 +2418,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     f"SMS potrdilo za rezervacijo {booking.get('terminId')} ni bilo "
                     f"poslano ({result.get('error')}). Potrdite stranki drugače."
                 )
+                notes.alert_kind = "trouble"
 
     booking_tools = BookingTools(
         company_slug,

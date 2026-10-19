@@ -21,12 +21,15 @@ class CallNotes:
     def __init__(self) -> None:
         self.message: str | None = None
         self.callback_requested: bool = False
+        # What the owner's SMS alert leads with (owner_alert.py): "callback",
+        # "message", "unfinished" or "trouble". None -> from the flags.
+        self.alert_kind: str | None = None
 
     @property
     def has_note(self) -> bool:
         return bool(self.message) or self.callback_requested
 
-    def request_callback(self, reason: str) -> None:
+    def request_callback(self, reason: str, kind: str = "callback") -> None:
         """Code paths that tell the caller "we'll call you back" (technical
         failure, time limit, ambiguous booking) call this so the promise
         reaches the owner even though the model never called take_message.
@@ -34,6 +37,7 @@ class CallNotes:
         self.callback_requested = True
         if not self.message:
             self.message = reason
+            self.alert_kind = kind
 
     @function_tool
     async def take_message(
