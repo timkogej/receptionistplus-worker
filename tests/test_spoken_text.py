@@ -76,6 +76,19 @@ class SlovenianHours(unittest.TestCase):
         self.assertEqual(run(["Termin термин je prost."]), "Termin termin je prost.")
 
 
+class InternalData(unittest.TestCase):
+    def test_sentence_with_id_dropped(self):
+        out = run(["Z veseljem. Pedikura je ID 18. Imate željo po zaposlenem?"])
+        self.assertEqual(" ".join(out.split()), "Z veseljem. Imate željo po zaposlenem?")
+
+    def test_booking_id_dropped(self):
+        self.assertEqual(run(["Rezervirala sem termin OB-000063. Lep dan!"]).strip(), "Lep dan!")
+
+    def test_normal_text_kept(self):
+        text = "Pedikura traja petinštirideset minut."
+        self.assertEqual(run([text]), text)
+
+
 class PhoneReadback(unittest.TestCase):
     HEARD = "041222333"
 

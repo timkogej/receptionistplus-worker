@@ -141,6 +141,21 @@ def fix_phone_readback(text: str, heard: str | None) -> str:
     return _DIGIT_RUN.sub(swap, text)
 
 
+# Internal data the model sometimes says out loud mid-reply ("Pedikura je
+# ID 18."); the sentence carrying it is dropped (any language).
+_INTERNAL_DATA = re.compile(
+    r"\bID\s*\d+\b|\b(?:service|employee|appointment)_id\b|\bany_person\b|\bOB-\d{3,}\b"
+)
+_SENTENCE = re.compile(r"[^.!?\u2026]*[.!?\u2026]+\s*|[^.!?\u2026]+$")
+
+
+def drop_internal_sentences(text: str) -> str:
+    if not _INTERNAL_DATA.search(text):
+        return text
+    kept = [m.group(0) for m in _SENTENCE.finditer(text) if not _INTERNAL_DATA.search(m.group(0))]
+    return "".join(kept)
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
@@ -171,6 +186,7 @@ class SpokenTextFilter:
                 body = body[0].upper() + body[1:]
             text = (" " if self._after_cut else "") + body
             self._after_cut = None
+        text = drop_internal_sentences(text)
         if re.search(r"[\u0400-\u04FF]", text):
             text = text.translate(_CYRILLIC)
         if self._language == "sl":
