@@ -172,6 +172,7 @@ async def check_slots(
     employee_id: str | None,
     any_person: bool,
     eligible_employee_ids: list[str] | None,
+    resursi_ids: list[int] | None = None,
 ) -> dict:
     """Call the "check-slots" action: is this exact date/time still free right now."""
     payload: dict = {
@@ -181,6 +182,9 @@ async def check_slots(
         "date": date,
         "time": time,
         "any_person": any_person,
+        # The services' resources (rooms, beds); booking-v2 checks their
+        # capacity here and reserves them at create (Termini_Resursi).
+        "resursiIds": resursi_ids or [],
     }
     if any_person:
         payload["eligibleEmployeeIds"] = eligible_employee_ids or []
@@ -205,6 +209,7 @@ async def create_booking(
     notes: str,
     language: str = "sl",
     send_email_confirmation: bool = True,
+    resursi_ids: list[int] | None = None,
 ) -> dict:
     """Call the "create" action: actually reserve the appointment."""
     payload: dict = {
@@ -231,6 +236,9 @@ async def create_booking(
         # online?") then skips the confirmation email. The email is still
         # sent, since jp_find_client matches the customer by it first.
         "send_email_confirmation": send_email_confirmation,
+        # Without these booking-v2 writes no Termini_Resursi row, and the
+        # resource stays free for the next booking (found 2026-10-18).
+        "resursiIds": resursi_ids or [],
     }
     if any_person:
         payload["eligibleEmployeeIds"] = eligible_employee_ids or []
