@@ -356,6 +356,7 @@ class BookingTools:
         # they hang up before create_booking: services + date (+ time once
         # a slot was checked). Not personal data beyond the call row.
         self.booking_interest: dict | None = None
+        self._resource_map: dict = company_data.get("storitveResursiMap") or {}
         # Existing-customer guard for SPOKEN numbers (set_customer_lookup).
         self._customer_lookup = None
         self._caller_phone: str | None = None
@@ -363,6 +364,21 @@ class BookingTools:
         # Stored customer emails seen this call; the agent never speaks them
         # (ReceptionistAgent.llm_node / EmailMask).
         self.private_emails: set[str] = set()
+
+    def _resources(self, service_ids: list[str]) -> list[int]:
+        """Resource ids (rooms, beds, devices) the services need, from init's
+        storitveResursiMap — the mapping the slots already respect. booking-v2
+        checks and reserves resources only for the resursiIds it is sent, so
+        without them a phone booking left the resource free for a second
+        booking (found 2026-10-18)."""
+        ids: set[int] = set()
+        for sid in service_ids:
+            for rid in self._resource_map.get(str(sid)) or []:
+                try:
+                    ids.add(int(rid))
+                except (TypeError, ValueError):
+                    continue
+        return sorted(ids)
 
     def set_customer_lookup(self, lookup, caller_phone: str | None) -> None:
         """lookup: async (phone_e164) -> "Stranke" row or None. With it,
@@ -654,6 +670,7 @@ class BookingTools:
                     employee_id=employee_id,
                     any_person=any_person,
                     eligible_employee_ids=eligible,
+                    resursi_ids=self._resources(service_ids),
                 )
         except BookingError as exc:
             logger.error("check_slots failed: %s", exc)
@@ -819,6 +836,7 @@ class BookingTools:
                     notes=notes,
                     language=self._language,
                     send_email_confirmation=self._email_confirmation,
+                    resursi_ids=self._resources(service_ids),
                 )
         except BookingTimeoutError as exc:
             logger.error("create_booking timed out (ambiguous outcome): %s", exc)
@@ -856,6 +874,18 @@ class BookingTools:
             result.get("terminId"),
             result.get("error"),
         )
+        if result.get("error") == "resurs_taken":
+            # The room/bed/device the service needs filled up since the check.
+            return {
+                "success": False,
+                "error": "slot_no_longer_free",
+                "message": (
+                    "That time has just been taken (the room or equipment this "
+                    "service needs is in use). Tell the caller plainly, call "
+                    "get_slots for that day again and offer other times — "
+                    "booking step 5. Don't mention rooms or equipment unless asked."
+                ),
+            }
         if result.get("success") and result.get("terminId"):
             self.created_termin_id = result["terminId"]
             # A retry after an ambiguous outcome went through cleanly.

@@ -8,6 +8,12 @@ calls in progress.
 
 The n8n workflow "Receptionist+ – Nadzor workerja" alerts from these rows;
 a row that stops updating means the whole server is down.
+
+That workflow runs in n8n on this same server, so it can't report the
+server (or n8n itself) going down. HEALTHCHECK_PING_URL, when set, is an
+outside dead man's switch (e.g. healthchecks.io): pinged every minute while
+the worker and n8n are both up, pinged at /fail when either isn't, and when
+the pings stop altogether the service alerts on its own.
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ from pathlib import Path
 import requests
 
 HEALTH_URL = os.environ.get("WORKER_HEALTH_URL", "http://127.0.0.1:8081")
+# n8n runs booking-v2 and the SMS flows; without it calls can't book.
+N8N_HEALTH_URL = os.environ.get("N8N_HEALTH_URL", "https://n8n.jedroplus.com/healthz")
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -40,10 +48,34 @@ def _check() -> tuple[bool, str, int | None]:
     return True, "OK", jobs
 
 
+def _n8n_ok() -> tuple[bool, str]:
+    try:
+        r = requests.get(N8N_HEALTH_URL, timeout=8)
+    except requests.RequestException as exc:
+        return False, f"n8n unreachable: {exc.__class__.__name__}"
+    return (True, "OK") if r.status_code == 200 else (False, f"n8n health {r.status_code}")
+
+
+def _ping_outside(ok: bool, detail: str) -> None:
+    """Best effort: a failed ping must not stop the Supabase row."""
+    ping = os.environ.get("HEALTHCHECK_PING_URL", "").strip().rstrip("/")
+    if not ping:
+        return
+    try:
+        requests.post(ping if ok else ping + "/fail", data=detail.encode()[:1000], timeout=10)
+    except requests.RequestException as exc:
+        print(f"outside ping failed: {exc.__class__.__name__}", file=sys.stderr)
+
+
 def main() -> int:
     url = os.environ["SUPABASE_URL"].rstrip("/")
     key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
     healthy, detail, jobs = _check()
+    n8n_ok, n8n_detail = _n8n_ok()
+    _ping_outside(
+        healthy and n8n_ok,
+        f"worker: {detail}; n8n: {n8n_detail}; active_jobs={jobs}; host={socket.gethostname()}",
+    )
     revision_file = REPO / "REVISION"
     row = {
         "id": socket.gethostname(),
@@ -68,7 +100,7 @@ def main() -> int:
     if resp.status_code >= 300:
         print(f"heartbeat write failed: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
         return 1
-    print(f"healthy={healthy} detail={detail} active_jobs={jobs}")
+    print(f"healthy={healthy} detail={detail} active_jobs={jobs} n8n={n8n_detail}")
     return 0
 
 

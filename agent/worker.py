@@ -2487,8 +2487,11 @@ async def entrypoint(ctx: JobContext) -> None:
         features.add("transfer")
     if caller_phone and customer_email:
         features.add("manage_link")
-    if company_data["company"].get("stripe_enabled") in (True, "true", "TRUE", 1):
-        features.add("payments")
+    # "payments" (R-PAYMENT-REQUIRED: "you'll get a payment link") stays off
+    # until the link exists (sklop 8): booking-v2 books phone bookings as
+    # ordinary appointments without prepayment and notes it for the owner
+    # (Tim, 2026-10-19). Before that a Stripe company's phone booking sat in
+    # pending_payment with a promised link nobody sent.
 
     prompt_args = dict(
         features=frozenset(features),

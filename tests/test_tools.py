@@ -205,6 +205,36 @@ class CreateBookingGate(unittest.TestCase):
         self._check()
         self.assertTrue(self._create()["success"])
 
+    def test_resources_sent_with_check_and_create(self):
+        company = {**COMPANY, "storitveResursiMap": {"multi": [3, 4], "other": [4]}}
+        self.tools = T.BookingTools("salon", company)
+        checked = []
+
+        async def check(**kw):
+            checked.append(kw)
+            return {"available": True}
+
+        with mock.patch.object(T.booking_client, "check_slots", check):
+            self._check()
+        self._create()
+        self.assertEqual(checked[0]["resursi_ids"], [3, 4])
+        self.assertEqual(self.created[0]["resursi_ids"], [3, 4])
+
+    def test_service_without_resources_sends_none(self):
+        self._check()
+        self._create()
+        self.assertEqual(self.created[0]["resursi_ids"], [])
+
+    def test_resource_taken_at_create(self):
+        async def taken(**kw):
+            return {"success": False, "error": "resurs_taken", "message": "Resurs ni več na voljo"}
+
+        self._check()
+        with mock.patch.object(T.booking_client, "create_booking", taken):
+            result = self._create()
+        self.assertEqual(result["error"], "slot_no_longer_free")
+        self.assertIsNone(self.tools.created_termin_id)
+
     def test_check_for_another_slot_does_not_count(self):
         self._check(time="11:00")
         self.assertEqual(self._create()["error"], "must_check_slots_first")
