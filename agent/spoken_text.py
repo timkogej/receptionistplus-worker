@@ -93,13 +93,63 @@ _CYRILLIC = str.maketrans({
 })
 
 
+# --- Phone number read-back (R-PHONE-READBACK) ------------------------------
+# The model once read "041 222 333" back as "štiri ena nič, dva dva dva, …";
+# a caller who says "ja" to that gets the wrong number on the booking. A run
+# of six or more Slovenian digit words is compared with the digits the
+# caller last said, and replaced with the right reading when they differ.
+
+_SL_DIGIT = {
+    "nič": "0", "nula": "0", "ena": "1", "en": "1", "eden": "1", "dva": "2", "dve": "2",
+    "tri": "3", "trije": "3", "štiri": "4", "štirje": "4", "pet": "5", "šest": "6",
+    "sedem": "7", "osem": "8", "devet": "9",
+}
+_SL_DIGIT_WORD = {"0": "nič", "1": "ena", "2": "dva", "3": "tri", "4": "štiri", "5": "pet",
+                  "6": "šest", "7": "sedem", "8": "osem", "9": "devet"}
+_DIGIT_ALT = "|".join(sorted(_SL_DIGIT, key=len, reverse=True))
+_DIGIT_RUN = re.compile(rf"\b(?:{_DIGIT_ALT})(?:[\s,]+(?:{_DIGIT_ALT})){{5,}}\b", re.IGNORECASE)
+
+
+def caller_digits(text: str) -> str | None:
+    """The digits in what the caller said (numerals or digit words), if it
+    looks like a phone number (6 to 15 digits)."""
+    digits = "".join(re.findall(r"\d", text or ""))
+    if len(digits) < 6:
+        words = re.findall(rf"\b(?:{_DIGIT_ALT})\b", (text or "").lower())
+        digits = "".join(_SL_DIGIT[w] for w in words)
+    return digits if 6 <= len(digits) <= 15 else None
+
+
+def spoken_sl_digits(digits: str) -> str:
+    groups = [digits[i:i + 3] for i in range(0, len(digits), 3)]
+    if len(groups) > 1 and len(groups[-1]) == 1:  # no lone last digit
+        groups[-2:] = [groups[-2][:2], groups[-2][2:] + groups[-1]]
+    return ", ".join(" ".join(_SL_DIGIT_WORD[d] for d in g) for g in groups)
+
+
+def fix_phone_readback(text: str, heard: str | None) -> str:
+    if not heard:
+        return text
+
+    def swap(m: re.Match) -> str:
+        said = "".join(_SL_DIGIT[w.lower()] for w in re.findall(rf"\b(?:{_DIGIT_ALT})\b", m.group(0), re.IGNORECASE))
+        if said == heard or abs(len(said) - len(heard)) > 1:
+            return m.group(0)
+        right = spoken_sl_digits(heard)
+        return right[0].upper() + right[1:] if m.group(0)[0].isupper() else right
+
+    return _DIGIT_RUN.sub(swap, text)
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
     e-naslov", the Slovenian read-back lead-in is cut, Slovenian clock
     hours are put right, and Cyrillic letters become Latin ones."""
 
-    def __init__(self, emails, language: str) -> None:
+    def __init__(self, emails, language: str, heard_digits: str | None = None) -> None:
+        # The digits of the phone number the caller last said, if any.
+        self._heard_digits = heard_digits
         self._emails = {e.strip().lower() for e in emails if e and "@" in e}
         self._say = _SPOKEN_EMAIL.get(language, _SPOKEN_EMAIL["en"])
         self._language = language
@@ -125,6 +175,7 @@ class SpokenTextFilter:
             text = text.translate(_CYRILLIC)
         if self._language == "sl":
             text = fix_slovenian_hours(text)
+            text = fix_phone_readback(text, self._heard_digits)
             stripped = _READBACK_LEAD_IN.sub("", text)
             if stripped != text:
                 stripped = stripped.rstrip()

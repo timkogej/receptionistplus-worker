@@ -1,6 +1,6 @@
 import unittest
 
-from agent.spoken_text import SpokenTextFilter, fix_slovenian_hours
+from agent.spoken_text import SpokenTextFilter, caller_digits, fix_phone_readback, fix_slovenian_hours, spoken_sl_digits
 
 
 def run(parts, emails=(), language="sl"):
@@ -74,6 +74,37 @@ class SlovenianHours(unittest.TestCase):
 
     def test_cyrillic_to_latin(self):
         self.assertEqual(run(["Termin термин je prost."]), "Termin termin je prost.")
+
+
+class PhoneReadback(unittest.TestCase):
+    HEARD = "041222333"
+
+    def test_caller_digits_from_numerals_and_words(self):
+        self.assertEqual(caller_digits("Moja številka je 041 222 333."), self.HEARD)
+        self.assertEqual(caller_digits("nič štiri ena, dva dva dva, tri tri tri"), self.HEARD)
+        self.assertIsNone(caller_digits("Ob dveh popoldan."))
+
+    def test_wrong_order_is_replaced(self):
+        self.assertEqual(
+            fix_phone_readback("Štiri ena nič, dva dva dva, tri tri tri — je tako prav?", self.HEARD),
+            "Nič štiri ena, dva dva dva, tri tri tri — je tako prav?",
+        )
+
+    def test_right_reading_untouched(self):
+        text = "Nič štiri ena, dva dva dva, tri tri tri — je tako prav?"
+        self.assertEqual(fix_phone_readback(text, self.HEARD), text)
+
+    def test_nothing_heard_nothing_changed(self):
+        text = "Štiri ena nič, dva dva dva, tri tri tri"
+        self.assertEqual(fix_phone_readback(text, None), text)
+
+    def test_grouping(self):
+        self.assertEqual(spoken_sl_digits("0412223334"), "nič štiri ena, dva dva dva, tri tri, tri štiri")
+
+    def test_through_the_filter(self):
+        f = SpokenTextFilter(set(), "sl", heard_digits=self.HEARD)
+        out = f.feed("Hvala. Štiri ena nič, dva dva dva, tri tri tri — je tako prav?") + f.flush()
+        self.assertEqual(out, "Hvala. Nič štiri ena, dva dva dva, tri tri tri — je tako prav?")
 
 
 if __name__ == "__main__":

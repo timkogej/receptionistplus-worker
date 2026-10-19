@@ -65,6 +65,7 @@ class BillCall(unittest.TestCase):
 
     def test_one_credit_per_minute(self):
         self.assertEqual(cp.bill_call(90, created_termin_id=None), (1.5, "info_only"))
+        self.assertEqual(cp.bill_call(90, created_termin_id=None, caller_spoke=False), (0.0, "abandoned"))
 
     def test_outcome_precedence(self):
         self.assertEqual(cp.bill_call(60, created_termin_id="OB-1")[1], "booked")
