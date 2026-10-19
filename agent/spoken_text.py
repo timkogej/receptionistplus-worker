@@ -20,10 +20,84 @@ _READBACK_LEAD_IN = re.compile(
 _SPOKEN_SEGMENT_END = re.compile(r"[.!?\u2026:](?=\s)")
 
 
+# --- Slovenian clock hours (R-SL-HOUR-URI, R-TIME-LIST-STYLE) ------------
+# The prompt asks for "ob dveh popoldan" (12-hour, with the part of the day)
+# and for "uri" after an ordinal hour; the model still wrote "ob
+# štirinajstih" and "ob deseti dopoldan" now and then (eval 2026-10-19).
+# A run of hours after "ob" is rewritten here when it breaks those rules.
+
+_CARD = {
+    "enih": 1, "dveh": 2, "treh": 3, "štirih": 4, "petih": 5, "šestih": 6, "sedmih": 7,
+    "osmih": 8, "devetih": 9, "desetih": 10, "enajstih": 11, "dvanajstih": 12,
+    "trinajstih": 13, "štirinajstih": 14, "petnajstih": 15, "šestnajstih": 16,
+    "sedemnajstih": 17, "osemnajstih": 18, "devetnajstih": 19, "dvajsetih": 20,
+    "enaindvajsetih": 21,
+}
+_ORD = {
+    "prvi": 1, "drugi": 2, "tretji": 3, "četrti": 4, "peti": 5, "šesti": 6, "sedmi": 7,
+    "osmi": 8, "deveti": 9, "deseti": 10, "enajsti": 11, "dvanajsti": 12,
+    "trinajsti": 13, "štirinajsti": 14, "petnajsti": 15, "šestnajsti": 16,
+    "sedemnajsti": 17, "osemnajsti": 18, "devetnajsti": 19, "dvajseti": 20,
+    "enaindvajseti": 21,
+}
+_CARD_BY_N = {n: w for w, n in _CARD.items() if n <= 12}
+_ORD_BY_N = {n: w for w, n in _ORD.items() if n <= 12}
+_HOUR_WORD = "|".join(sorted(map(re.escape, [*_CARD, *_ORD]), key=len, reverse=True))
+_HOUR_RUN = re.compile(
+    rf"\b(ob)\s+((?:{_HOUR_WORD})(?:\s*(?:,|\bin\b|\bali\b)\s*(?:{_HOUR_WORD}))*)\b"
+    rf"(\s+uri\b)?(\s+(?:dopoldan|popoldan|zvečer|zjutraj|opoldne)\b)?",
+    re.IGNORECASE,
+)
+_HOUR_ITEM = re.compile(rf"\b({_HOUR_WORD})\b", re.IGNORECASE)
+
+
+def _fix_hour_run(m: re.Match) -> str:
+    ob, run, uri, part = m.group(1), m.group(2), m.group(3) or "", m.group(4) or ""
+    words = [w.lower() for w in _HOUR_ITEM.findall(run)]
+    ordinal = [w in _ORD for w in words]
+    values = [_ORD.get(w) or _CARD[w] for w in words]
+    has_24h = any(v > 12 for v in values)
+    ordinal_without_uri = any(ordinal) and not uri
+    mixed = any(ordinal) and not all(ordinal)
+    if not (has_24h or ordinal_without_uri or mixed):
+        return m.group(0)
+    keep_ordinal = all(ordinal) and bool(uri)
+
+    def word(match: re.Match) -> str:
+        n = _ORD.get(match.group(1).lower()) or _CARD[match.group(1).lower()]
+        n12 = n % 12 or 12
+        return _ORD_BY_N[n12] if keep_ordinal else _CARD_BY_N[n12]
+
+    new_run = _HOUR_ITEM.sub(word, run)
+    if not part:
+        late = [v for v in values if v > 12]
+        if late:
+            part = " zvečer" if min(late) >= 18 else " popoldan"
+    return f"{ob} {new_run}{uri if keep_ordinal else ''}{part}"
+
+
+def fix_slovenian_hours(text: str) -> str:
+    return _HOUR_RUN.sub(_fix_hour_run, text)
+
+
+# Cyrillic letters in a Latin-script reply ("termin" came out once as
+# "термин"); TTS can't read them as intended.
+_CYRILLIC = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ж": "ž", "з": "z", "и": "i",
+    "й": "j", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
+    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "č", "ш": "š", "ы": "i", "э": "e",
+    "ј": "j", "љ": "lj", "њ": "nj", "ћ": "ć", "ђ": "đ", "џ": "dž", "ь": "", "ъ": "",
+    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ж": "Ž", "З": "Z", "И": "I",
+    "К": "K", "Л": "L", "М": "M", "Н": "N", "О": "O", "П": "P", "Р": "R", "С": "S", "Т": "T",
+    "У": "U", "Ф": "F", "Х": "H", "Ц": "C", "Ч": "Č", "Ш": "Š",
+})
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
-    e-naslov", and the Slovenian read-back lead-in is cut."""
+    e-naslov", the Slovenian read-back lead-in is cut, Slovenian clock
+    hours are put right, and Cyrillic letters become Latin ones."""
 
     def __init__(self, emails, language: str) -> None:
         self._emails = {e.strip().lower() for e in emails if e and "@" in e}
@@ -47,7 +121,10 @@ class SpokenTextFilter:
                 body = body[0].upper() + body[1:]
             text = (" " if self._after_cut else "") + body
             self._after_cut = None
+        if re.search(r"[\u0400-\u04FF]", text):
+            text = text.translate(_CYRILLIC)
         if self._language == "sl":
+            text = fix_slovenian_hours(text)
             stripped = _READBACK_LEAD_IN.sub("", text)
             if stripped != text:
                 stripped = stripped.rstrip()
