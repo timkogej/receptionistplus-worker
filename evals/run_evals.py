@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic as anthropic_sdk
-from livekit.agents import AgentSession
+from livekit.agents import AgentSession, RunContext, function_tool
 from livekit.agents import llm as llm_mod
 from livekit.agents.voice.run_result import ChatMessageEvent, FunctionCallEvent
 from livekit.plugins import anthropic
@@ -37,7 +37,9 @@ from agent.call_notes import CallNotes
 from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
 from agent.worker import LanguageControl, build_find_customer_tool, build_receptionist_agent
-from evals.fake_booking import FakeBooking
+from agent.appointments import AppointmentTools
+from agent.group_booking import GroupBooking
+from evals.fake_booking import FakeAppointmentStore, FakeBooking
 from evals.scenarios import SCENARIOS, Scripted, Simulated
 
 ROOT = Path(__file__).resolve().parent
@@ -73,6 +75,10 @@ SL_TEXT_CHECKS = [
     (re.compile(r"\bob\s+(?:(?:trinajst|štirinajst|petnajst|šestnajst|sedemnajst|osemnajst|devetnajst|dvajset)ih)\b"
                 r"|,\s*(?:trinajst|štirinajst|petnajst|šestnajst|sedemnajst|osemnajst|devetnajst)ih\b", re.I),
      "24-hour clock time ('ob štirinajstih' instead of 'ob dveh popoldan')"),
+    # Ordinal hour without "uri" ("ob deseti dopoldan"); R-SL-HOUR-URI.
+    (re.compile(r"\bob\s+(?:prvi|drugi|tretji|četrti|peti|šesti|sedmi|osmi|deveti|deseti|enajsti|dvanajsti)\b(?!\s+uri)", re.I),
+     "ordinal hour without 'uri' ('ob deseti' instead of 'ob desetih' / 'ob deseti uri')"),
+    (re.compile(r"[\u0400-\u04FF]"), "Cyrillic letters in a Slovenian reply"),
     (re.compile(r"\bzgodaj\w*\s+popoldan\w*\b.{0,40}\b(?:pozneje|kasneje|pozno)\b", re.I),
      "split the part of the day the caller already chose"),
     (re.compile(r"\bpreberem\s+(?:vam\s+)?(?:še\s+)?(?:telefonsko\s+)?številko\b", re.I),
@@ -153,6 +159,43 @@ def _build(language: str, model: str, context: dict | None = None):
         )
         booking_tools.set_customer_lookup(_lookup, context.get("caller_phone"))
         context["customer_lookup"] = True
+    # "own_appointments": rows of the caller's appointments (needs a
+    # "customer" with "ID stranke"): the call gets the cancel / move tools,
+    # backed by FakeAppointmentStore. "manage_link_tool": a recording
+    # send_manage_link for callers who aren't recognised.
+    own = context.pop("own_appointments", None)
+    rules = context.pop("appointment_rules", {})
+    store = FakeAppointmentStore(own or [])
+    booking_tools.eval_store = store
+    # Same as the live call: every call can book several people.
+    group = GroupBooking(booking_tools)
+    booking_tools.eval_group = group
+    extra_tools += [group.find_group_times, group.book_group]
+    if own is not None:
+        appt = AppointmentTools(
+            supabase=store,
+            company_id="EVAL",
+            company_slug="eval-company",
+            customer=context.get("customer") or {},
+            profile=rules,
+            company_data=company,
+            notes=notes,
+            language=language,
+            resources_for=booking_tools._resources,
+        )
+        extra_tools += [appt.list_my_appointments, appt.cancel_appointment, appt.reschedule_appointment]
+        context["features"] = frozenset(set(context["features"]) | {"manage_link"})
+    if context.pop("manage_link_tool", False):
+        @function_tool
+        async def send_manage_link(context_: RunContext) -> dict:
+            """Text a link to the customer portal, where the appointment can be
+            cancelled or moved, to the number on file of the customer
+            find_customer found. Only after the caller said yes."""
+            store.links.append("sent")
+            return {"success": True, "message": "Sent. Tell the caller the text is on its way."}
+
+        extra_tools.append(send_manage_link)
+        context["features"] = frozenset(set(context["features"]) | {"manage_link"})
     if allowed:
         control = LanguageControl(
             call_lang={"code": language, "history": [language]},
@@ -194,6 +237,7 @@ def _assistant_text(result) -> str:
 async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
     agent, llm, _tools, _notes, control = _build(sc.language, model, sc.context)
     fake = FakeBooking()
+    fake.store = _tools.eval_store
     failures: list[str] = []
     transcript: list[dict] = []
     with fake.installed():
@@ -230,6 +274,7 @@ async def run_scripted(sc: Scripted, model: str, judge_llm) -> dict:
 async def run_simulated(sc: Simulated, model: str, caller_model: str) -> dict:
     agent, llm, _tools, notes, _control = _build(sc.language, model, sc.context)
     fake = FakeBooking()
+    fake.store = _tools.eval_store
     caller = anthropic_sdk.AsyncAnthropic()
     # From the simulated caller's side, the receptionist is the "user".
     caller_msgs: list[dict] = [{"role": "user", "content": "(telefon zazvoni, receptorka se oglasi)"}]

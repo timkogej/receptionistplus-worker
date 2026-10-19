@@ -77,3 +77,37 @@ class FakeBooking:
             booking_client, "check_slots", self.check_slots
         ), mock.patch.object(booking_client, "create_booking", self.create_booking):
             yield self
+
+
+class FakeAppointmentStore:
+    """Stands in for the SupabaseClient methods agent/appointments.py uses:
+    the caller's own appointments, and every change made to them."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = [dict(r) for r in rows]
+        self.updates: list[tuple[str, dict]] = []
+        self.history: list[tuple[str, str]] = []
+        self.links: list[str] = []
+
+    async def get_customer_appointments(self, company_id, customer_id, from_date):
+        return [dict(r) for r in self.rows if r["Datum"] >= from_date and r["Status"] == "scheduled"]
+
+    async def update_appointment(self, company_id, row_id, fields):
+        for r in self.rows:
+            if r["id"] == row_id:
+                r.update(fields)
+                self.updates.append((r["ID termina"], dict(fields)))
+                return dict(r)
+        return None
+
+    async def add_appointment_history(self, company_id, termin_id, actor, action):
+        self.history.append((termin_id, action))
+
+
+def eval_day(days_ahead: int, avoid_sunday: bool = True) -> str:
+    """A date days_ahead from today (moved off Sunday, when the fake
+    calendar is closed)."""
+    d = datetime.now(TZ).date() + timedelta(days=days_ahead)
+    if avoid_sunday and d.weekday() == 6:
+        d += timedelta(days=1)
+    return d.isoformat()

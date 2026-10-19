@@ -24,10 +24,28 @@ class CallNotes:
         # What the owner's SMS alert leads with (owner_alert.py): "callback",
         # "message", "unfinished" or "trouble". None -> from the flags.
         self.alert_kind: str | None = None
+        # Appointments the caller cancelled or moved by phone (appointments.py):
+        # recorded on the call row (so the owner's bell rings), but not, on
+        # their own, a reason for the owner's SMS.
+        self.changes: list[str] = []
 
     @property
     def has_note(self) -> bool:
+        return bool(self.message) or self.callback_requested or bool(self.changes)
+
+    @property
+    def needs_owner_alert(self) -> bool:
         return bool(self.message) or self.callback_requested
+
+    @property
+    def full_message(self) -> str | None:
+        """What goes in receptionist_calls.message: the message, then any
+        appointment changes."""
+        parts = [p for p in (self.message, *self.changes) if p]
+        return " ".join(parts) or None
+
+    def add_change(self, text: str) -> None:
+        self.changes.append(text)
 
     def request_callback(self, reason: str, kind: str = "callback") -> None:
         """Code paths that tell the caller "we'll call you back" (technical
