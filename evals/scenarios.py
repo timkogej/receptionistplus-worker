@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from evals.fake_booking import eval_day
+
 TZ = ZoneInfo("Europe/Ljubljana")
 
 
@@ -128,6 +130,63 @@ def _check_spoken_known_customer(fake, notes) -> list[str]:
         failures.append(f"last_name {b.get('last_name')!r} — should be the stored 'Novak'")
     if b["email"].lower() != "ana.novak@primer.si":
         failures.append(f"email {b['email']!r} — should be the stored one")
+    return failures
+
+
+def _own_appointment(days_ahead: int, time: str = "15:00:00", termin: str = "OB-EVAL-900") -> dict:
+    return {
+        "id": 900, "ID termina": termin, "ID stranke": "CBC-EVAL", "ID podjetja": "EVAL",
+        "Datum": eval_day(days_ahead), "Čas": time, "Konec": "15:45:00",
+        "Storitev": "Pedikura", "ID storitve": "18", "Oseba": "Maja Hribar", "ID Osebe": "19",
+        "Status": "scheduled", "deleted_at": None,
+    }
+
+
+KNOWN_CALLER_WITH_ID = {
+    "caller_phone": "+38641555123",
+    "customer": {"ID stranke": "CBC-EVAL", "Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
+}
+
+
+def _check_cancelled(fake, notes) -> list[str]:
+    ups = fake.store.updates
+    failures = []
+    if ups != [("OB-EVAL-900", {"Status": "cancelled"})]:
+        failures.append(f"expected exactly one cancel of OB-EVAL-900, got {ups}")
+    if fake.created:
+        failures.append("booked a new appointment instead of only cancelling")
+    return failures
+
+
+def _check_moved(fake, notes) -> list[str]:
+    ups = fake.store.updates
+    if len(ups) != 1 or "Datum" not in ups[0][1]:
+        return [f"expected exactly one move, got {ups}"]
+    failures = []
+    if ups[0][1]["Datum"] == _own_appointment(5)["Datum"]:
+        failures.append("moved within the same day; the caller asked for another day")
+    if not ups[0][1]["Čas"].startswith(("08", "09", "10", "11")):
+        failures.append(f"new time {ups[0][1]['Čas']} isn't in the morning as asked")
+    if fake.created:
+        failures.append("created a new booking instead of moving")
+    return failures
+
+
+def _check_too_late(fake, notes) -> list[str]:
+    failures = []
+    if fake.store.updates:
+        failures.append(f"changed the appointment despite the deadline: {fake.store.updates}")
+    if not (notes.message or notes.callback_requested):
+        failures.append("didn't pass the request to the owner (take_message)")
+    return failures
+
+
+def _check_link_not_change(fake, notes) -> list[str]:
+    failures = []
+    if fake.store.updates:
+        failures.append(f"changed an appointment for an unrecognised caller: {fake.store.updates}")
+    if len(fake.store.links) != 1:
+        failures.append(f"expected one portal link sent, got {len(fake.store.links)}")
     return failures
 
 
@@ -408,6 +467,58 @@ SCENARIOS: list[Scripted | Simulated] = [
                 "+38641555123": {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana.novak@primer.si"},
             },
         },
+    ),
+    Simulated(
+        "sl-odpoved-termina",
+        "sl",
+        persona=(
+            "Si Ana Novak in kličeš s svojega telefona. Imaš pedikuro, ki jo "
+            "želiš odpovedati, ker ne moreš priti. Ko ti povedo, kateri termin "
+            "imaš, potrdi, da gre za tega, in reci, da ga želiš odpovedati. Na "
+            "vprašanje za potrditev odpovedi reci ja. Nove rezervacije ne želiš."
+        ),
+        check=_check_cancelled,
+        context={**KNOWN_CALLER_WITH_ID, "own_appointments": [_own_appointment(5)],
+                 "appointment_rules": {"cancel_appt_days": "1", "reschedule_appt_days": "1"}},
+    ),
+    Simulated(
+        "sl-prestavitev-termina",
+        "sl",
+        persona=(
+            "Si Ana Novak in kličeš s svojega telefona. Svojo pedikuro bi rada "
+            "prestavila na en dan kasneje, dopoldan. Ko ti povedo, kateri termin "
+            "imaš, potrdi in povej, da ga želiš prestaviti na naslednji dan "
+            "dopoldan. Izberi prvo ponujeno dopoldansko uro in potrdi prestavitev."
+        ),
+        check=_check_moved,
+        context={**KNOWN_CALLER_WITH_ID, "own_appointments": [_own_appointment(5)],
+                 "appointment_rules": {"cancel_appt_days": "1", "reschedule_appt_days": "1"}},
+    ),
+    Simulated(
+        "sl-odpoved-prepozno",
+        "sl",
+        persona=(
+            "Si Ana Novak in kličeš s svojega telefona. Jutrišnjo pedikuro bi "
+            "rada odpovedala. Če ti rečejo, da je prepozno, prosi, naj lastnik "
+            "to uredi in te pokliče, in se s tem strinjaj."
+        ),
+        check=_check_too_late,
+        context={**KNOWN_CALLER_WITH_ID, "own_appointments": [_own_appointment(1, "10:00:00")],
+                 "appointment_rules": {"cancel_appt_days": "3", "reschedule_appt_days": "3"}},
+    ),
+    Simulated(
+        "sl-odpoved-skrita-stevilka",
+        "sl",
+        persona=(
+            "Si Ana Novak in kličeš s skrito številko. Svojo pedikuro bi rada "
+            "odpovedala. Ko te vprašajo za telefonsko številko, reci 041 555 "
+            "123. Na vprašanje, ali si Ana Novak, reci ja. Če ti ponudijo SMS s "
+            "povezavo za urejanje termina, reci ja."
+        ),
+        check=_check_link_not_change,
+        context={"manage_link_tool": True,
+                 "spoken_customers": {"+38641555123": {"Ime": "Ana", "Priimek": "Novak",
+                                                       "Email stranke": "ana.novak@primer.si"}}},
     ),
     Simulated(
         "sl-sms-potrdilo-brez-emaila",

@@ -39,7 +39,7 @@ _SETTINGS_PHASE7 = (
 
 _PROFILE_SELECT = (
     '"ID Podjetja","Naziv Podjetja","Naslov podjetja","Kontaktni telefon",'
-    '"Spletna stran",urnik,"Navodila chatbot"'
+    '"Spletna stran",urnik,"Navodila chatbot",cancel_appt_days,reschedule_appt_days'
 )
 
 
@@ -224,6 +224,78 @@ class SupabaseClient:
         except (requests.RequestException, ValueError, TypeError, KeyError):
             logger.exception("SMS quota check failed for %s", company_slug)
             return None
+
+    # --- The caller's own appointments (cancel / reschedule by phone) ------
+    # Same rules as the customer portal's n8n flows ("Customer portal –
+    # Cancel appointment" / "– Confirm reschedule"), keyed by "ID stranke"
+    # instead of email: phone customers often have no email.
+
+    _APPT_COLUMNS = 'id,"ID termina","ID stranke","ID podjetja",Datum,"Čas",Konec,Storitev,"ID storitve",Oseba,"ID Osebe",Status,deleted_at'
+
+    async def get_customer_appointments(self, company_id: str, customer_id: str, from_date: str) -> list[dict]:
+        def _do() -> list[dict]:
+            return _request(
+                "GET",
+                f"{self._rest_url}/Termini",
+                self._api_key,
+                params={
+                    "ID podjetja": f"eq.{company_id}",
+                    "ID stranke": f"eq.{customer_id}",
+                    "Datum": f"gte.{from_date}",
+                    "Status": "in.(scheduled,pending_payment)",
+                    "deleted_at": "is.null",
+                    "select": self._APPT_COLUMNS,
+                    "order": 'Datum.asc,"Čas".asc',
+                    "limit": "10",
+                },
+            ).json()
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"get_customer_appointments failed: {exc}") from exc
+
+    async def update_appointment(self, company_id: str, row_id: int, fields: dict) -> dict | None:
+        """PATCH one Termini row; returns the updated row."""
+
+        def _do() -> dict | None:
+            rows = _request(
+                "PATCH",
+                f"{self._rest_url}/Termini",
+                self._api_key,
+                params={"id": f"eq.{row_id}", "ID podjetja": f"eq.{company_id}"},
+                json_body=fields,
+                prefer="return=representation",
+            ).json()
+            return rows[0] if rows else None
+
+        try:
+            return await asyncio.to_thread(_do)
+        except requests.RequestException as exc:
+            raise SupabaseError(f"update_appointment failed: {exc}") from exc
+
+    async def add_appointment_history(self, company_id: str, termin_id: str, actor: str, action: str) -> None:
+        """jp_zgodovina_pripisi, as the portal flows call it ("odpovedan" /
+        "prestavljen"). Best effort: history must not undo a change."""
+
+        def _do() -> None:
+            _request(
+                "POST",
+                f"{self._rest_url}/rpc/jp_zgodovina_pripisi",
+                self._api_key,
+                json_body={
+                    "p_company": company_id,
+                    "p_entiteta": termin_id,
+                    "p_izvedel": actor,
+                    "p_izvedel_tip": "stranka",
+                    "p_akcija": action,
+                },
+            )
+
+        try:
+            await asyncio.to_thread(_do)
+        except requests.RequestException:
+            logger.exception("appointment history write failed (%s %s)", action, termin_id)
 
     async def find_customer_by_phone(self, company_id: str, phone_e164: str) -> dict | None:
         """An existing customer of this company with this number, or None.

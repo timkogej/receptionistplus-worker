@@ -77,8 +77,10 @@ from agent.languages import (
     pack,
 )
 from agent.call_summary import summarize_call
+from agent.appointments import AppointmentTools
 from agent.owner_alert import owner_alert_text, owner_language, unfinished_booking_message
 from agent.sms_client import (
+    appointment_change_text,
     booking_confirmation_text,
     choose_confirmation_template,
     render_confirmation_template,
@@ -754,7 +756,9 @@ class ReceptionistAgent(Agent):
         )
 
 
-def build_find_customer_tool(lookup, caller_phone: str | None, private_emails: set | None = None):
+def build_find_customer_tool(
+    lookup, caller_phone: str | None, private_emails: set | None = None, on_found=None
+):
     """find_customer: an existing customer by a phone number the caller SAID
     (withheld caller ID, or a different number than the one they call from).
     With caller ID the lookup already happened at call start; a spoken
@@ -793,6 +797,8 @@ def build_find_customer_tool(lookup, caller_phone: str | None, private_emails: s
         email = ((row or {}).get("Email stranke") or "").strip()
         if email and private_emails is not None:
             private_emails.add(email)
+        if on_found is not None:
+            on_found(e164, row)
         logger.info("find_customer: existing customer for spoken number")
         return {
             "found": True,
@@ -808,7 +814,8 @@ def build_find_customer_tool(lookup, caller_phone: str | None, private_emails: s
                 "Ana Novak?\") — what you heard may be misheard. If yes: pass exactly "
                 "these first_name, last_name"
                 + (" and email" if email else "")
-                + " and this phone to create_booking, don't ask for them again"
+                + " and this phone to create_booking (or, for an existing appointment, "
+                "follow the cancel/move rule), don't ask for them again"
                 + (", and never read the email aloud" if email else "")
                 + ". If no: collect the details as usual."
             ),
@@ -2216,7 +2223,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     "livekit_room": livekit_room,
                     "caller_phone": caller_phone,
                     "dialed_number": dialed_number,
-                    "message": notes.message,
+                    "message": notes.full_message,
                     "callback_requested": notes.callback_requested,
                     "summary": summary,
                     "language": call_lang["code"],
@@ -2231,7 +2238,7 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.exception("failed to insert receptionist_calls row for call_id=%s", call_id)
             return
 
-        if notes.has_note and not call_end_state["transferred"]:
+        if notes.needs_owner_alert and not call_end_state["transferred"]:
             await _send_owner_alert()
 
         await _remember_customer_language()
@@ -2448,16 +2455,35 @@ async def entrypoint(ctx: JobContext) -> None:
 
     customer_email = ((customer or {}).get("Email stranke") or "").strip()
 
+    # The customer find_customer matched to a spoken number: the portal
+    # link goes to THAT stored number, never to a number nobody verified.
+    spoken_match: dict = {}
+
+    def _remember_spoken_match(phone_e164: str, row: dict) -> None:
+        spoken_match.update(
+            phone=phone_e164, email=((row or {}).get("Email stranke") or "").strip()
+        )
+
     @function_tool
     async def send_manage_link(context: RunContext) -> dict:
-        """Text the caller a link to the customer portal, where they can
-        cancel or move their existing appointment themselves. Only after
-        they said yes to getting it. The link is valid for one hour."""
+        """Text a link to the customer portal, where the appointment can be
+        cancelled or moved, to the number on file of the customer
+        find_customer found. Only after the caller said yes. The link is
+        valid for one hour."""
+        phone = spoken_match.get("phone") or (caller_phone if customer_email else "")
+        email = spoken_match.get("email") if spoken_match else customer_email
+        if not phone:
+            return {"success": False, "error": "no_customer",
+                    "message": "No customer found for a number yet: use find_customer first, or offer take_message."}
+        if not email:
+            # Portal login is by email; without one the link can't work.
+            return {"success": False, "error": "no_email_on_file",
+                    "message": "This customer has no email, so the portal can't be used. Offer take_message instead."}
         result = await send_sms(
             kind="manage_link",
             company_slug=company_slug,
-            phone=caller_phone or "",
-            email=customer_email,
+            phone=phone,
+            email=email,
             call_id=call_id,
             language=call_lang["code"],
         )
@@ -2485,7 +2511,41 @@ async def entrypoint(ctx: JobContext) -> None:
     features = set()
     if transfer_enabled:
         features.add("transfer")
-    if caller_phone and customer_email:
+    company_text_id = (profile or {}).get("ID Podjetja")
+    appointment_tools = None
+    if caller_phone and customer and customer.get("ID stranke") and company_text_id:
+        async def _notify_change(kind, row, new_date, new_time) -> None:
+            if not sms_confirmation:
+                return
+            text = appointment_change_text(
+                kind,
+                company_name=company_data["company"]["naziv"],
+                service=row.get("Storitev") or "",
+                date=new_date or row["Datum"][:10],
+                time_hhmm=new_time or str(row.get("Čas") or "")[:5],
+                language=call_lang["code"],
+            )
+            result = await send_sms(
+                kind="confirmation", company_slug=company_slug, phone=caller_phone,
+                text=text, termin_id=row.get("ID termina"), call_id=call_id,
+                language=call_lang["code"],
+            )
+            if not result.get("success"):
+                notes.add_change(f"SMS o spremembi termina {row.get('ID termina')} ni bil poslan.")
+
+        appointment_tools = AppointmentTools(
+            supabase=supabase,
+            company_id=company_text_id,
+            company_slug=company_slug,
+            customer=customer,
+            profile=profile,
+            company_data=company_data,
+            notes=notes,
+            language=call_lang["code"],
+            resources_for=booking_tools._resources,
+            notify_customer=_notify_change,
+        )
+    if appointment_tools is not None or company_text_id:
         features.add("manage_link")
     # "payments" (R-PAYMENT-REQUIRED: "you'll get a payment link") stays off
     # until the link exists (sklop 8): booking-v2 books phone bookings as
@@ -2516,23 +2576,31 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     extra_tools = [end_call_abusive]
-    company_text_id = (profile or {}).get("ID Podjetja")
     if company_text_id:
         async def _lookup_spoken_number(phone_e164: str) -> dict | None:
             return await supabase.find_customer_by_phone(company_text_id, phone_e164)
 
         extra_tools.insert(
             0,
-            build_find_customer_tool(_lookup_spoken_number, caller_phone, booking_tools.private_emails),
+            build_find_customer_tool(
+                _lookup_spoken_number, caller_phone, booking_tools.private_emails,
+                on_found=_remember_spoken_match,
+            ),
         )
         booking_tools.set_customer_lookup(_lookup_spoken_number, caller_phone)
     if detect_language:
         extra_tools.insert(0, language_control.switch_language)
     if transfer_enabled:
         extra_tools.insert(0, transfer_to_person)
-    # The portal logs customers in by email, so the link only works for a
-    # known customer (caller ID matched "Stranke") with an email on file.
-    if caller_phone and customer_email:
+    # Cancel / move in the call only for a caller recognised by caller ID;
+    # everyone else can get the portal link texted to the number on file.
+    if appointment_tools is not None:
+        extra_tools[0:0] = [
+            appointment_tools.list_my_appointments,
+            appointment_tools.cancel_appointment,
+            appointment_tools.reschedule_appointment,
+        ]
+    elif company_text_id:
         extra_tools.insert(0, send_manage_link)
     receptionist_agent = build_receptionist_agent(
         company_data,
