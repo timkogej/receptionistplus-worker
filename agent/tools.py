@@ -352,6 +352,10 @@ class BookingTools:
         # background so the caller hears the confirmation straight away.
         self._on_booked = on_booked
         self.background_tasks: set = set()
+        # What the caller was after, for an "unfinished booking" note when
+        # they hang up before create_booking: services + date (+ time once
+        # a slot was checked). Not personal data beyond the call row.
+        self.booking_interest: dict | None = None
         # Existing-customer guard for SPOKEN numbers (set_customer_lookup).
         self._customer_lookup = None
         self._caller_phone: str | None = None
@@ -604,6 +608,12 @@ class BookingTools:
             result["day_labels"] = _day_labels(result["slots"], self._language)
         if window_note and isinstance(result, dict):
             result["note"] = window_note
+        if isinstance(result.get("slots"), dict):
+            self.booking_interest = {
+                "service_ids": list(service_ids),
+                "date": start_date if start_date == end_date else None,
+                "time": None,
+            }
         return result
 
     @function_tool
@@ -650,6 +660,7 @@ class BookingTools:
             self._last_check_key = None
             return {"success": False, "error": "technical_error", "message": str(exc)}
         if result.get("available"):
+            self.booking_interest = {"service_ids": list(service_ids), "date": date, "time": time}
             self._last_check_key = (
                 tuple(service_ids),
                 employee_id,
