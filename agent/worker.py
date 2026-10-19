@@ -88,7 +88,7 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
-from agent.spoken_text import SpokenTextFilter
+from agent.spoken_text import SpokenTextFilter, caller_digits
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -603,7 +603,12 @@ class ReceptionistAgent(Agent):
     async def llm_node(self, chat_ctx, tools, model_settings):
         """_llm_node_filtered, then SpokenTextFilter over the text."""
         stream = self._llm_node_filtered(chat_ctx, tools, model_settings)
-        mask = SpokenTextFilter(self._private_emails, self._language)
+        heard = None
+        for item in reversed(chat_ctx.items):
+            if getattr(item, "role", None) == "user":
+                heard = caller_digits(getattr(item, "text_content", "") or "")
+                break
+        mask = SpokenTextFilter(self._private_emails, self._language, heard_digits=heard)
         chunk_id = ""
         async for chunk in stream:
             if isinstance(chunk, str):
@@ -2171,6 +2176,7 @@ async def entrypoint(ctx: JobContext) -> None:
             abusive=call_end_state["abusive"],
             transferred=call_end_state["transferred"],
             message_taken=notes.has_note and not call_end_state["transferred"],
+            caller_spoke=any(t.get("role") == "user" and (t.get("text") or "").strip() for t in transcript),
         )
 
         if billed_credits > 0:

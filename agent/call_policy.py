@@ -106,6 +106,7 @@ def bill_call(
     abusive: bool = False,
     transferred: bool = False,
     message_taken: bool = False,
+    caller_spoke: bool = True,
 ) -> tuple[float, str]:
     """(billed_credits, outcome) for a finished call.
 
@@ -120,6 +121,10 @@ def bill_call(
     change what a company pays.
     """
     if duration_sec < ABANDONED_CALL_THRESHOLD_SEC:
+        return 0.0, "abandoned"
+    # A caller who never said a word (robocall, pocket dial, silent line
+    # until the silence closing) costs the company nothing (2026-10-19).
+    if not caller_spoke:
         return 0.0, "abandoned"
     billed = round(duration_sec / 60.0, 2)
     if abusive:
