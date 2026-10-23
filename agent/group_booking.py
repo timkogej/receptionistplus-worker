@@ -24,6 +24,7 @@ from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
 from agent.booking_client import BookingError
+from agent.booking_extras import answers_note
 from agent.call_policy import normalize_phone
 from agent.company_prompt import spoken_employee_names
 from agent.tools import _day_label, _filter_elapsed_times_today, _same_name, _sanitize_free_text
@@ -282,6 +283,7 @@ class GroupBooking:
         phone: str,
         other_names: list[str],
         email: str = "",
+        answers: list[str] | None = None,
     ) -> dict:
         """Book everyone at the option from find_group_times, only after the
         caller confirmed it and the caller's details are collected.
@@ -294,10 +296,20 @@ class GroupBooking:
             other_names: One entry per other person, in order: their name
                 as given ("Eva", "Eva Novak"), or "" if not given.
             email: The caller's email, if needed for the confirmation.
+            answers: Answers to the owner's before-booking questions for
+                these services, "<question> — <answer>" (for everyone).
         """
         if not 0 <= option < len(self._options) or self._date is None:
             return {"success": False, "error": "unknown_option", "message": "Call find_group_times first."}
         slots = self._options[option]["slots"]
+        service_ids = [p["service_id"] for p in self._people]
+        questions = self._bt.extras.questions_for(service_ids)
+        answers = [a for a in (_sanitize_free_text(str(a)) for a in (answers or [])) if a]
+        if len(answers) < len(questions):
+            return {"success": False, "error": "questions_not_asked", "questions": questions,
+                    "message": ("The owner needs these answered before booking. Ask the ones not asked "
+                                "yet, one at a time, then call book_group again with every answer in `answers`.")}
+        answers_line = answers_note(answers)
         if len(other_names) != len(slots) - 1:
             return {"success": False, "error": "bad_names",
                     "message": f"Give exactly {len(slots) - 1} other_names (\"\" when unknown)."}
@@ -363,7 +375,7 @@ class GroupBooking:
                     employee_id=slot["employee_id"],
                     any_person=slot["employee_id"] is None,
                     eligible_employee_ids=p["eligible"] if slot["employee_id"] is None else None,
-                    notes=note,
+                    notes=" ".join(x for x in (note, answers_line) if x),
                     language=self._bt._language,
                     send_email_confirmation=False if i else self._bt._email_confirmation,
                     resursi_ids=self._bt._resources([p["service_id"]]),
@@ -392,12 +404,17 @@ class GroupBooking:
             self._bt.background_tasks.add(task)
             task.add_done_callback(self._bt.background_tasks.discard)
         logger.info("group booked: %s", [m["terminId"] for m in made])
-        return {
+        result = {
             "success": True,
             "day_label": _day_label(date, self._bt._language),
             "bookings": [{"name": m["name"], "service": m["service"], "time": m["time"]} for m in made],
             "message": "All booked. Confirm everyone in ONE sentence and close the call as after a single booking.",
         }
+        advice = self._bt.extras.advice_for(service_ids)
+        if advice:
+            result["advice"] = advice
+            result["advice_message"] = "After confirming, tell the caller this advice briefly, in the call's language."
+        return result
 
     async def _undo(self, made: list[dict]) -> None:
         failed = []

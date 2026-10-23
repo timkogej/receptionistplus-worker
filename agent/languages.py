@@ -55,7 +55,6 @@ class LanguagePack:
     no_credits: str
     technical_difficulty: str
     ai_disclosure: str
-    greeting_template: str  # {name} = company name
     abuse_closing: str
     time_limit_closing: str
     transfer_message: str
@@ -95,7 +94,6 @@ _register(LanguagePack(
         "Prosimo, upoštevajte, da govorite z digitalnim glasovnim asistentom, "
         "ne z osebo."
     ),
-    greeting_template="Pozdravljeni, dobrodošli v {name}. Kako vam lahko pomagam?",
     abuse_closing="Hvala za klic. Klic bom zdaj zaključila. Lep dan še naprej.",
     time_limit_closing=(
         "Oprostite, klic moram zdaj zaključiti. Če česa še nismo uredili, vas "
@@ -158,7 +156,6 @@ _register(LanguagePack(
         "Please note that you are speaking with a digital voice assistant, "
         "not a person."
     ),
-    greeting_template="Hello, welcome to {name}. How can I help you?",
     abuse_closing="Thank you for calling. I'll end the call here. Have a good day.",
     time_limit_closing=(
         "I'm sorry, I have to end the call now. If anything is still open, "
@@ -226,7 +223,6 @@ _register(LanguagePack(
         "Bitte beachten Sie, dass Sie mit einem digitalen Sprachassistenten "
         "sprechen, nicht mit einer Person."
     ),
-    greeting_template="Guten Tag, willkommen bei {name}. Wie kann ich Ihnen helfen?",
     abuse_closing="Danke für Ihren Anruf. Ich beende das Gespräch jetzt. Einen schönen Tag noch.",
     time_limit_closing=(
         "Entschuldigung, ich muss das Gespräch jetzt beenden. Falls noch etwas "
@@ -292,7 +288,6 @@ _register(LanguagePack(
         "Molimo, imajte na umu da razgovarate s digitalnim glasovnim "
         "asistentom, a ne s osobom."
     ),
-    greeting_template="Dobar dan, dobrodošli u {name}. Kako vam mogu pomoći?",
     abuse_closing="Hvala na pozivu. Sada ću završiti razgovor. Ugodan dan.",
     time_limit_closing=(
         "Ispričavam se, moram sada završiti razgovor. Ako nešto još nije "
@@ -357,7 +352,6 @@ _register(LanguagePack(
         "La informiamo che sta parlando con un assistente vocale digitale, non "
         "con una persona."
     ),
-    greeting_template="Buongiorno, benvenuto da {name}. Come posso aiutarla?",
     abuse_closing="Grazie per la chiamata. Ora chiudo la conversazione. Buona giornata.",
     time_limit_closing=(
         "Mi scusi, ora devo chiudere la chiamata. Se qualcosa è rimasto in "
