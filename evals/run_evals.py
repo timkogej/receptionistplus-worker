@@ -36,6 +36,7 @@ from livekit.plugins import anthropic
 from agent.call_notes import CallNotes
 from agent.llm_factory import build_single_llm
 from agent.tools import BookingTools
+from agent.booking_extras import BookingExtras
 from agent.worker import LanguageControl, build_find_customer_tool, build_receptionist_agent
 from agent.appointments import AppointmentTools
 from agent.group_booking import GroupBooking
@@ -144,6 +145,14 @@ def _build(language: str, model: str, context: dict | None = None):
     # guards (static_prompt._NO_FEATURE_GUARDS).
     context.setdefault("features", frozenset())
     booking_tools = BookingTools("eval-company", company, language=language)
+    booking_tools.set_caller_customer(context.get("customer"), context.get("caller_phone"))
+    # "booking_extras": receptionist_settings-shaped {"booking_questions",
+    # "booking_advice"} — the owner's before-booking questions and advice.
+    extras_row = context.pop("booking_extras", None)
+    if extras_row is not None:
+        extras = BookingExtras.from_settings(extras_row)
+        booking_tools.set_booking_extras(extras)
+        context["booking_extras"] = extras
     notes = CallNotes()
     control = None
     extra_tools = []

@@ -236,12 +236,16 @@ def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
             "ask for an email, and don't explain that you don't need one: just "
             "ask for the next detail. After booking, mention they'll get a text."
             if sms_confirmation
-            else "Confirmation: by email — ask for the caller's email address."
+            else "Confirmation: by email — ask for the caller's email address, "
+            "unless they confirmed being the existing customer named above with "
+            "an email on file: then use that one and don't ask."
         )
     return (
         "Potrdilo: pride po SMS na telefonsko številko rezervacije — za "
         "e-naslov ne sprašuj in ne razlagaj, da ga ne potrebuješ: preprosto "
         "vprašaj za naslednji podatek. Po rezervaciji omeni, da bodo dobili SMS."
         if sms_confirmation
-        else "Potrdilo: pride po e-pošti — vprašaj za e-poštni naslov."
+        else "Potrdilo: pride po e-pošti — vprašaj za e-poštni naslov, razen "
+        "če je klicatelj potrdil, da je zgoraj navedena obstoječa stranka s "
+        "shranjenim e-naslovom: takrat uporabi tega in ne sprašuj."
     )

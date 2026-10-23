@@ -22,7 +22,6 @@ class Packs(unittest.TestCase):
         for code in ALL:
             p = L.pack(code)
             self.assertEqual(len(p.weekdays_for_filler), 7, code)
-            self.assertIn("{name}", p.greeting_template, code)
             for line in p.get_slots_day_fillers:
                 self.assertIn("{day}", line, code)
             self.assertGreaterEqual(len(p.redirect_phrases), 2, code)

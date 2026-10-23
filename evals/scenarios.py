@@ -246,6 +246,33 @@ def _check_known_customer_booking(fake, notes) -> list[str]:
     return failures
 
 
+OWNER_EXTRAS = {
+    "booking_questions": [
+        {"text": "Ali imate sladkorno bolezen?", "service_ids": ["18"]},
+        {"text": "Ali želite masažo z eteričnimi olji?", "service_ids": ["19"]},
+    ],
+    "booking_advice": [{"text": "Na pedikuro pridite brez laka na nohtih.", "service_ids": ["18"]}],
+}
+
+
+def _check_owner_question(fake, notes) -> list[str]:
+    failures = _check_known_customer_booking(fake, notes)
+    if fake.created:
+        note = (fake.created[0].get("notes") or "").lower()
+        if "sladkorn" not in note:
+            failures.append(f"the owner's question isn't in the note: {note!r}")
+        if "olj" in note:
+            failures.append("asked the massage question for a pedicure")
+    return failures
+
+
+def _told_advice(transcript: list) -> list[str]:
+    said = " ".join((t.get("agent") or "").lower() for t in transcript)
+    if "eteričn" in said:
+        return ["asked the massage question for a pedicure"]
+    return [] if "lak" in said else ["didn't pass on the owner's advice (no nail polish)"]
+
+
 SCENARIOS: list[Scripted | Simulated] = [
     Scripted(
         "sl-vikanje",
@@ -452,6 +479,22 @@ SCENARIOS: list[Scripted | Simulated] = [
         ),
         check=_check_known_customer_booking,
         context=KNOWN_CALLER,
+    ),
+    Simulated(
+        "sl-vprasanje-lastnika-in-nasvet",
+        "sl",
+        persona=(
+            "Si Ana Novak, stalna stranka kozmetičnega salona; kličeš s "
+            "svojega telefona. Želiš pedikuro naslednji teden v sredo "
+            "popoldan, vseeno ti je, kdo. Na vprašanje, ali govorijo s tabo, "
+            "reci ja. Na vprašanje, ali te lahko kontaktirajo na to številko, "
+            "reci ja. Svojega e-naslova ne povej, razen če te izrecno vprašajo. "
+            "Na vprašanje o sladkorni bolezni reci, da je nimaš. "
+            "Izberi prvo popoldansko uro in potrdi rezervacijo."
+        ),
+        check=_check_owner_question,
+        context={**KNOWN_CALLER, "booking_extras": OWNER_EXTRAS},
+        transcript_check=_told_advice,
     ),
     Simulated(
         "sl-skrita-stevilka-znana-stranka",

@@ -198,6 +198,18 @@ class CreateBookingGate(unittest.TestCase):
         self._create(first_name="ana", last_name="NOVAK", phone="+38641555123", email="")
         self.assertEqual(self.created[0]["email"], "ana@example.com")
 
+    def test_caller_id_customer_gets_the_stored_email(self):
+        self.tools.set_caller_customer(
+            {"Ime": "Ana", "Priimek": "Novak", "Email stranke": "ana@example.com"}, "+38641555123"
+        )
+        self._check()
+        self._create(first_name="Ana", last_name="Novak", phone="+38641555123", email="")
+        self.assertEqual(self.created[0]["email"], "ana@example.com")
+        # Someone else on that phone: nothing is filled in.
+        self._check()
+        self._create(first_name="Marko", phone="+38641555123", email="")
+        self.assertEqual(self.created[1]["email"], "")
+
     def test_caller_id_number_is_not_rechecked(self):
         async def lookup(phone):
             raise AssertionError("should not look up the caller-ID number")
@@ -249,6 +261,47 @@ class CreateBookingGate(unittest.TestCase):
         self._check()
         self.tools._last_check_at = time.monotonic() - T.CHECK_SLOTS_MAX_AGE_SEC - 1
         self.assertEqual(self._create()["error"], "must_check_slots_first")
+
+    def _with_extras(self):
+        from agent.booking_extras import BookingExtras
+        self.tools.set_booking_extras(BookingExtras.from_settings({
+            "booking_questions": [
+                {"text": "Ali imate alergije?", "service_ids": ["multi"]},
+                {"text": "Ali ste že bili pri nas?", "service_ids": []},
+                {"text": "Kako dolgi so lasje?", "service_ids": ["solo"]},
+            ],
+            "booking_advice": [{"text": "Pridite brez ličil.", "service_ids": ["multi"]}],
+        }))
+
+    def test_owner_questions_must_be_answered_before_booking(self):
+        self._with_extras()
+        self._check()
+        result = self._create()
+        self.assertEqual(result["error"], "questions_not_asked")
+        # Only the questions for this service and the general one.
+        self.assertEqual(result["questions"], ["Ali imate alergije?", "Ali ste že bili pri nas?"])
+        self.assertEqual(self.created, [])
+
+    def test_answers_go_into_the_note_and_advice_comes_back(self):
+        self._with_extras()
+        self._check()
+        result = self._create(
+            notes="Rada bi okno.",
+            answers=["Ali imate alergije? — ne", "Ali ste že bili pri nas? — da"],
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(
+            self.created[0]["notes"],
+            "Rada bi okno. Odgovori stranke: Ali imate alergije? — ne; Ali ste že bili pri nas? — da.",
+        )
+        self.assertEqual(result["advice"], ["Pridite brez ličil."])
+
+    def test_no_owner_questions_books_as_before(self):
+        self._check()
+        result = self._create()
+        self.assertTrue(result["success"])
+        self.assertNotIn("advice", result)
+        self.assertEqual(self.created[0]["notes"], "")
 
     def test_multiple_services_refused_when_company_disallows(self):
         result = self._create(service_ids=["multi", "solo"])

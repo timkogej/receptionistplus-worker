@@ -86,6 +86,7 @@ from zoneinfo import ZoneInfo
 from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
+from agent.booking_extras import BookingExtras, answers_note
 from agent.business_info import booking_window_days
 from agent.call_policy import normalize_phone
 from agent.company_prompt import spoken_employee_names
@@ -375,6 +376,8 @@ class BookingTools:
         # worker.py sends the SMS confirmation from it. Runs in the
         # background so the caller hears the confirmation straight away.
         self._on_booked = on_booked
+        # The owner's before-booking questions and advice (booking_extras.py).
+        self.extras = BookingExtras()
         self.background_tasks: set = set()
         # What the caller was after, for an "unfinished booking" note when
         # they hang up before create_booking: services + date (+ time once
@@ -385,6 +388,9 @@ class BookingTools:
         self._customer_lookup = None
         self._caller_phone: str | None = None
         self._customer_by_phone: dict[str, dict | None] = {}
+        # The customer the caller-ID number belongs to (worker.py).
+        self._caller_customer: dict | None = None
+        self._caller_customer_phone: str | None = None
         # Stored customer emails seen this call; the agent never speaks them
         # (ReceptionistAgent.llm_node / EmailMask).
         self.private_emails: set[str] = set()
@@ -403,6 +409,17 @@ class BookingTools:
                 except (TypeError, ValueError):
                     continue
         return sorted(ids)
+
+    def set_caller_customer(self, customer: dict | None, caller_phone: str | None) -> None:
+        """A caller recognised by caller ID who confirmed who they are and
+        books on that number gets their stored email even when the model
+        leaves it empty (evals 2026-10-23: the prompt says to use the stored
+        one, and the model sometimes passed nothing)."""
+        self._caller_customer = customer or None
+        self._caller_customer_phone = caller_phone
+
+    def set_booking_extras(self, extras: BookingExtras) -> None:
+        self.extras = extras
 
     def set_customer_lookup(self, lookup, caller_phone: str | None) -> None:
         """lookup: async (phone_e164) -> "Stranke" row or None. With it,
@@ -734,6 +751,7 @@ class BookingTools:
         any_person: bool = False,
         notes: str = "",
         not_the_stored_customer: bool = False,
+        answers: list[str] | None = None,
     ) -> dict:
         """Reserve the appointment, right after check_slots for the same slot.
 
@@ -753,6 +771,8 @@ class BookingTools:
             notes: Extra note from the caller.
             not_the_stored_customer: True only after the caller said they
                 are NOT the existing customer this tool named.
+            answers: The caller's answers to the owner's before-booking
+                questions for this service, "<question> — <answer>".
         """
         if (
             not self._company_data["company"].get("multiple_services_online")
@@ -769,8 +789,22 @@ class BookingTools:
                 ),
             }
 
+        questions = self.extras.questions_for(service_ids)
+        answers = [a for a in (_sanitize_free_text(str(a)) for a in (answers or [])) if a]
+        if len(answers) < len(questions):
+            return {
+                "success": False,
+                "error": "questions_not_asked",
+                "questions": questions,
+                "message": (
+                    "The owner needs these answered before booking this service. Ask the "
+                    "ones not asked yet, one at a time, then call create_booking again with "
+                    "every answer in `answers`."
+                ),
+            }
+
         last_name = _sanitize_free_text(last_name)
-        notes = _sanitize_free_text(notes)
+        notes = " ".join(p for p in (_sanitize_free_text(notes), answers_note(answers)) if p)
         # Spoken numbers arrive as "041 555 123"; the customer record and its
         # matching use E.164, like caller ID.
         phone = normalize_phone(phone) or phone
@@ -803,6 +837,19 @@ class BookingTools:
                 }
             if not email and stored_email:
                 email = stored_email  # same person: keep their address
+        elif (
+            not email
+            and not not_the_stored_customer
+            and self._caller_customer
+            and phone == self._caller_customer_phone
+            and _same_name(
+                (self._caller_customer.get("Ime") or "").strip(),
+                (self._caller_customer.get("Priimek") or "").strip(),
+                first_name,
+                last_name,
+            )
+        ):
+            email = (self._caller_customer.get("Email stranke") or "").strip()
 
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
@@ -938,4 +985,11 @@ class BookingTools:
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):
             result["day_label"] = label
+        advice = self.extras.advice_for(service_ids)
+        if advice and isinstance(result, dict) and result.get("success"):
+            result["advice"] = advice
+            result["advice_message"] = (
+                "After confirming the booking, tell the caller this advice from the business "
+                "briefly, in the call's language."
+            )
         return result

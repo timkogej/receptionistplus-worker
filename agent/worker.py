@@ -79,6 +79,9 @@ from agent.languages import (
 from agent.call_summary import summarize_call
 from agent.appointments import AppointmentTools
 from agent.group_booking import GroupBooking
+from agent.booking_extras import BookingExtras, render_extras_block
+from agent import greeting_audio
+from agent.greeting import build_greeting, render_assistant_identity, spoken_business_name
 from agent.owner_alert import owner_alert_text, owner_language, unfinished_booking_message
 from agent.sms_client import (
     appointment_change_text,
@@ -116,21 +119,13 @@ LOG_TRANSCRIPTS = os.environ.get("LOG_TRANSCRIPTS", "").strip().lower() in ("1",
 # TECHNICAL_DIFFICULTY_MESSAGE: per language in agent/languages.py (LanguagePack.technical_difficulty).
 
 # EU AI Act Article 50: callers must be told they're talking to an AI system,
-# no later than the first interaction. Prepended in code rather than baked
-# into the greeting itself so it can't be dropped by a misconfigured or
-# edited per-company greeting — this is the one guaranteed source of
-# disclosure, not the only one.
-# AI_DISCLOSURE: per language in agent/languages.py (LanguagePack.ai_disclosure).
-
-# Built from company_data.company.naziv (fetched live via booking-v2 init)
-# rather than a hand-maintained env var — a per-company GREETING_TEXT env var
-# went stale for real (found 2026-08-28: production was still greeting
-# callers with "Salon Lepote", a Phase 1 fake test company name, months
-# after switching to real jedroplus-d-o-o data) because nothing forces it to
-# stay in sync with the actual company name. This can't go stale the same
-# way, at the cost of no longer supporting custom greeting wording beyond
-# "Welcome to <company name>" — a deliberate tradeoff, not an oversight.
-# GREETING_TEMPLATE: per language in agent/languages.py (LanguagePack.greeting_template).
+# no later than the first interaction. Since 2026-10-23 the notice is part of
+# the greeting's non-interruptible opening ("Sem digitalna asistentka.",
+# agent/greeting.py), which the owner can't edit; with the owner's own
+# greeting text (style "custom") it is LanguagePack.ai_disclosure, spoken
+# before that text. The business name comes from greeting_name or the
+# company profile, never a hand-maintained env var (one went stale for real
+# in 2026-08: callers heard "Salon Lepote", a test company).
 
 # Pre-rendered once via a working Soniox TTS call (see assets/README or the
 # generation snippet in the Phase 5 Part C notes) so this specific message can
@@ -481,6 +476,8 @@ def _build_system_prompt(
     switchable_to: list[str] | tuple = (),
     features=ALL_FEATURES,
     customer_lookup: bool = False,
+    booking_extras: BookingExtras | None = None,
+    assistant_name: str | None = None,
 ) -> str:
     static_prompt = build_static_prompt(language, switchable_to, features)
     logger.info(
@@ -497,6 +494,10 @@ def _build_system_prompt(
     ]
     if business_block:
         parts.append(business_block)
+    extras_block = render_extras_block(booking_extras, company_data)
+    if extras_block:
+        parts.append(extras_block)
+    parts.append(render_assistant_identity(assistant_name))
     parts.append(render_caller_block(caller_phone, customer, language, can_lookup=customer_lookup))
     parts.append(render_confirmation_line(sms_confirmation, language))
     return "\n\n".join(parts)
@@ -849,6 +850,8 @@ def build_receptionist_agent(
     on_turn_language=None,
     features=ALL_FEATURES,
     customer_lookup: bool = False,
+    booking_extras: BookingExtras | None = None,
+    assistant_name: str | None = None,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -873,6 +876,8 @@ def build_receptionist_agent(
             switchable_to=switchable_to,
             features=features,
             customer_lookup=customer_lookup,
+            booking_extras=booking_extras,
+            assistant_name=assistant_name,
         ),
         tools=[
             booking_tools.get_slots,
@@ -1092,21 +1097,6 @@ def _build_llm(settings: Settings) -> llm.LLM:
         anthropic_api_key=settings.anthropic_api_key,
         openai_api_key=settings.openai_api_key,
     )
-
-
-def _render_greeting(custom: str | None, language: str, company_name: str) -> str:
-    """The greeting spoken after the disclosure.
-
-    The dashboard's greeting_text wins when set (it was saved but never used
-    until 2026-10-16); "{name}" or "{podjetje}" in it is replaced with the
-    company name. Plain str.replace, not str.format: owners type free text,
-    and a stray "{" must not crash the call. The AI disclosure is NOT part
-    of this and can't be removed by it — it is always spoken first, in code.
-    """
-    text = (custom or "").strip()
-    if not text:
-        return pack(language).greeting_template.format(name=company_name)
-    return text.replace("{name}", company_name).replace("{podjetje}", company_name)
 
 
 async def _insert_call_logged(supabase: SupabaseClient, row: dict) -> None:
@@ -1458,6 +1448,9 @@ async def entrypoint(ctx: JobContext) -> None:
     # The CURRENT language of the call. Everything spoken by code reads it
     # from here, never from `language`, which is only the starting point.
     call_lang = {"code": language, "history": [language]}
+    # Which greeting played and how it went, for receptionist_calls.metrics
+    # (filled in at the greeting below; empty if the call never got there).
+    greeting_state: dict = {}
 
     async def _say_technical_difficulty(target_session: AgentSession) -> None:
         """Play the pre-rendered apology clip for Slovenian (bypasses TTS
@@ -2240,6 +2233,7 @@ async def entrypoint(ctx: JobContext) -> None:
                         turns=sum(1 for t in transcript if t["role"] == "user"),
                         languages=call_lang.get("history", []),
                         time_limit_sec=call_limit_sec,
+                        greeting=greeting_state or None,
                     ),
                 }
             )
@@ -2326,8 +2320,70 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info("bootstrap: session started t=+%.3fs", _t())
     await _start_background_audio(ctx, session)
-    disclosure_handle = session.say(
-        pack(language).ai_disclosure, allow_interruptions=False
+
+    # The greeting (agent/greeting.py, 2026-10-23): "Salon Maja, dober dan!
+    # Sem digitalna asistentka." now, non-interruptible (it carries the AI
+    # notice), while init finishes; the question ("Kako vam lahko
+    # pomagam?") once the real agent is in, interruptible. The business
+    # name is the owner's greeting_name, else the legal name without
+    # "d.o.o."/"s.p." from the profile, which has been loading since the
+    # call started (waits at most 0.8s; without it the greeting has no name).
+    greeting_row = settings_row or {}
+    if greeting_row.get("greeting_name"):
+        greeting_business = str(greeting_row["greeting_name"]).strip()
+    else:
+        try:
+            _greeting_profile, _ = await asyncio.wait_for(
+                asyncio.shield(caller_context_task), timeout=0.8
+            )
+        except Exception:
+            _greeting_profile = None
+        greeting_business = spoken_business_name((_greeting_profile or {}).get("Naziv Podjetja"))
+    greeting_style = greeting_row.get("greeting_style")
+    if greeting_style is None and greeting_row.get("greeting_text"):
+        greeting_style = "custom"  # before the phase11 migration
+    greeting = build_greeting(
+        language=language,
+        style=greeting_style,
+        business_name=greeting_business,
+        assistant_name=greeting_row.get("assistant_name"),
+        # The owner's own text is written in the company's language; a call
+        # starting in the caller's own language gets the preset instead.
+        custom_text=greeting_row.get("greeting_text") if language == company_language else None,
+        disclosure=pack(language).ai_disclosure,
+    )
+    greeting_state.update(style=greeting.style, cached=False, opening_at=None, finished=False)
+    voice_key = f"{settings.tts_provider}|{settings.tts_voice_id or ''}|{language}"
+    greeting_render_tasks: set = set()
+
+    def _say_greeting_part(text: str, *, allow_interruptions: bool):
+        """Play the pre-rendered copy if there is one, else TTS and render a
+        copy for the next call once this one has played."""
+        path = greeting_audio.cached(text, voice_key)
+        if path is not None:
+            return session.say(
+                text, audio=audio_frames_from_file(str(path)), allow_interruptions=allow_interruptions
+            ), True
+        handle = session.say(text, allow_interruptions=allow_interruptions)
+
+        async def _render_after_playout() -> None:
+            try:
+                await handle.wait_for_playout()
+            except Exception:
+                pass
+            await greeting_audio.render(session.tts, text, voice_key)
+
+        task = asyncio.create_task(_render_after_playout(), name="greeting_render")
+        greeting_render_tasks.add(task)
+        task.add_done_callback(greeting_render_tasks.discard)
+        return handle, False
+
+    greeting_state["opening_at"] = round(_t(), 3)
+    disclosure_handle, greeting_state["cached"] = _say_greeting_part(
+        greeting.opening, allow_interruptions=False
+    )
+    logger.info(
+        "greeting: style=%s cached=%s t=+%.3fs", greeting.style, greeting_state["cached"], _t()
     )
 
     try:
@@ -2443,6 +2499,8 @@ async def entrypoint(ctx: JobContext) -> None:
         on_booked=_send_confirmation if sms_confirmation else None,
         email_confirmation=not sms_confirmation,
     )
+    booking_extras = BookingExtras.from_settings(settings_row)
+    booking_tools.set_booking_extras(booking_extras)
     booking_ref["tools"] = booking_tools
 
     # Caller hung up while the disclosure was playing / init was running.
@@ -2461,6 +2519,7 @@ async def entrypoint(ctx: JobContext) -> None:
     call_profile["profile"] = profile
     call_context["profile"] = profile
     call_context["customer"] = customer
+    booking_tools.set_caller_customer(customer, caller_phone)
 
     customer_email = ((customer or {}).get("Email stranke") or "").strip()
 
@@ -2571,6 +2630,8 @@ async def entrypoint(ctx: JobContext) -> None:
         sms_confirmation=sms_confirmation,
         # find_customer is registered below whenever the company id is known.
         customer_lookup=bool((profile or {}).get("ID Podjetja")),
+        booking_extras=booking_extras,
+        assistant_name=(settings_row or {}).get("assistant_name"),
     )
 
     language_control = LanguageControl(
@@ -2669,15 +2730,12 @@ async def entrypoint(ctx: JobContext) -> None:
             AGENT_SWAP_TIMEOUT_SEC,
         )
 
-    greeting = _render_greeting(
-        # The dashboard greeting is written in the company's language; a call
-        # starting in the caller's own language gets the template instead.
-        (settings_row or {}).get("greeting_text") if language == company_language else None,
-        language,
-        company_data["company"]["naziv"],
-    )
     try:
-        await session.say(greeting)
+        invitation_handle, _ = _say_greeting_part(greeting.invitation, allow_interruptions=True)
+        await invitation_handle
+        # False = the caller hung up during the greeting: what the styles
+        # are compared on.
+        greeting_state["finished"] = "value" not in call_ended_at
     except Exception:
         # A broken TTS provider surfaces here too; the "error" handler above
         # will already be counting toward _degrade_and_close, so just avoid

@@ -36,6 +36,15 @@ _SETTINGS_BASE = (
 _SETTINGS_PHASE7 = (
     _SETTINGS_BASE + ",instructions,transfer_enabled,transfer_number,sms_confirmation"
 )
+_SETTINGS_PHASE10 = _SETTINGS_PHASE7 + ",owner_alert_sms,owner_alert_phone"
+_SETTINGS_PHASE11 = (
+    _SETTINGS_PHASE10
+    + ",greeting_style,greeting_name,assistant_name,booking_questions,booking_advice"
+)
+# Newest first: a column a migration hasn't added yet makes PostgREST answer
+# 400, and the next, older list is tried. The features those columns drive
+# stay off until then.
+_SETTINGS_SELECTS = (_SETTINGS_PHASE11, _SETTINGS_PHASE10, _SETTINGS_PHASE7, _SETTINGS_BASE)
 
 _PROFILE_SELECT = (
     '"ID Podjetja","Naziv Podjetja","Naslov podjetja","Kontaktni telefon",'
@@ -91,13 +100,15 @@ class SupabaseClient:
             ).json()
 
         def _do() -> dict | None:
-            try:
-                rows = _get(_SETTINGS_PHASE7)
-            except requests.HTTPError as exc:
-                if exc.response is None or exc.response.status_code != 400:
-                    raise
-                # phase7 columns not there yet: the features they drive stay off.
-                rows = _get(_SETTINGS_BASE)
+            for select in _SETTINGS_SELECTS[:-1]:
+                try:
+                    rows = _get(select)
+                    break
+                except requests.HTTPError as exc:
+                    if exc.response is None or exc.response.status_code != 400:
+                        raise
+            else:
+                rows = _get(_SETTINGS_SELECTS[-1])
             return rows[0] if rows else None
 
         try:
