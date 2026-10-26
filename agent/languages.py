@@ -60,6 +60,9 @@ class LanguagePack:
     transfer_message: str
     still_there: tuple[str, ...]
     silence_closing: str
+    # Said when a reply is slow to start (ReceptionistAgent.llm_node), so the
+    # caller doesn't sit in silence; rotated.
+    thinking_fillers: tuple[str, ...]
     redirect_phrases: tuple[str, ...]
     # Matching (worker.py watchdogs)
     promise_cues: re.Pattern
@@ -88,6 +91,7 @@ def pack(code: str | None) -> LanguagePack:
 
 _register(LanguagePack(
     code="sl",
+    thinking_fillers=("Trenutek.", "Samo trenutek."),
     no_credits="Trenutno žal ne moremo sprejeti vašega klica. Prosimo, poskusite kasneje.",
     technical_difficulty="Oprostite, trenutno imamo tehnične težave, lastnik vas bo poklical nazaj.",
     ai_disclosure=(
@@ -147,6 +151,7 @@ _register(LanguagePack(
 
 _register(LanguagePack(
     code="en",
+    thinking_fillers=("One moment.", "Just a moment."),
     no_credits="We're unable to take your call right now. Please try again later.",
     technical_difficulty=(
         "Sorry, we're experiencing technical difficulties right now — the "
@@ -211,6 +216,7 @@ _register(LanguagePack(
 
 _register(LanguagePack(
     code="de",
+    thinking_fillers=("Einen Moment.", "Einen Augenblick."),
     no_credits=(
         "Leider können wir Ihren Anruf im Moment nicht entgegennehmen. Bitte "
         "versuchen Sie es später noch einmal."
@@ -279,6 +285,7 @@ _register(LanguagePack(
 
 _register(LanguagePack(
     code="hr",
+    thinking_fillers=("Trenutak.", "Samo trenutak."),
     no_credits="Nažalost trenutno ne možemo primiti vaš poziv. Molimo, pokušajte kasnije.",
     technical_difficulty=(
         "Ispričavam se, trenutno imamo tehničkih poteškoća — vlasnik će vas "
@@ -340,6 +347,7 @@ _register(LanguagePack(
 
 _register(LanguagePack(
     code="it",
+    thinking_fillers=("Un attimo.", "Un momento."),
     no_credits=(
         "Purtroppo al momento non possiamo rispondere alla sua chiamata. La "
         "preghiamo di riprovare più tardi."

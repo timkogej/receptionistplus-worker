@@ -30,6 +30,9 @@ class Settings:
 
     tts_provider: str
     tts_voice_id: str | None
+    # Soniox model. tts-rt-v1 is what calls have used since 2026-08;
+    # tts-rt-v2 (GA 2026-08-11) can be tried by setting TTS_MODEL.
+    tts_model: str
 
     # Fallback only: calls are routed by the dialled number (see
     # worker._resolve_company_slug). Unset = numbers with no mapping are
@@ -65,6 +68,7 @@ class Settings:
             openai_api_key=os.environ.get("OPENAI_API_KEY") or None,
             tts_provider=tts_provider,
             tts_voice_id=os.environ.get("TTS_VOICE_ID") or None,
+            tts_model=os.environ.get("TTS_MODEL") or "tts-rt-v1",
             company_slug=os.environ.get("COMPANY_SLUG") or None,
             supabase_url=_require("SUPABASE_URL"),
             supabase_service_role_key=_require("SUPABASE_SERVICE_ROLE_KEY"),

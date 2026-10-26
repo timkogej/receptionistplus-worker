@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from collections import Counter
 
+# A reply that starts later than this after the caller stopped talking is
+# counted as slow.
+SLOW_REPLY_SEC = 2.5
+
 
 def _percentiles(values: list[float]) -> dict | None:
     if not values:
@@ -32,6 +36,11 @@ class CallMetrics:
         self.cached_tokens = 0
         self.completion_tokens = 0
         self.provider_errors: Counter = Counter()
+        # Caller stops talking -> agent starts talking: the wait the caller
+        # actually hears (end-of-turn detection + LLM + TTS + filters).
+        self.response_gap: list[float] = []
+        # "Trenutek." said because the reply was slow (ReceptionistAgent.llm_node).
+        self.thinking_fillers = 0
 
     def record(self, m) -> None:
         kind = type(m).__name__
@@ -50,6 +59,10 @@ class CallMetrics:
             if getattr(m, "end_of_utterance_delay", None) is not None:
                 self.eou_delay.append(m.end_of_utterance_delay)
 
+    def record_response_gap(self, seconds: float) -> None:
+        if 0 <= seconds < 60:
+            self.response_gap.append(seconds)
+
     def record_error(self, error_type: str) -> None:
         self.provider_errors[error_type] += 1
 
@@ -58,6 +71,9 @@ class CallMetrics:
             "llm_ttft": _percentiles(self.llm_ttft),
             "tts_ttfb": _percentiles(self.tts_ttfb),
             "eou_delay": _percentiles(self.eou_delay),
+            "response_gap": _percentiles(self.response_gap),
+            "slow_replies": sum(1 for g in self.response_gap if g > SLOW_REPLY_SEC),
+            "thinking_fillers": self.thinking_fillers,
             "llm_models": dict(self.llm_models),
             "tokens": {
                 "prompt": self.prompt_tokens,

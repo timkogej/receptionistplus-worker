@@ -91,7 +91,7 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
-from agent.spoken_text import SpokenTextFilter, caller_digits
+from agent.spoken_text import PHONE_FIRST_QUESTIONS, SpokenTextFilter, caller_digits
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -257,6 +257,52 @@ _KNOWN_FILLER_TEXTS = frozenset(
     p for code in SUPPORTED_LANGUAGES for p in pack(code).still_there
 )
 
+# A reply whose first words haven't come out of the LLM this long after the
+# caller's turn ended starts with a short "Trenutek." (2026-10-26: Tim found
+# the silences on a live call too long; LLM ttft p90 ~1.4s, max ~3s). Only
+# the slow replies get it: a typical one has its first sentence by ~1.2s.
+THINKING_FILLER_AFTER_SEC = 1.8
+_THINKING_FILLERS = tuple(
+    sorted({p for code in SUPPORTED_LANGUAGES for p in pack(code).thinking_fillers}, key=len, reverse=True)
+)
+
+
+def _without_thinking_filler(text: str) -> str:
+    """The reply minus a leading thinking filler, for the promise watchdog:
+    "Trenutek. Masaža glave traja ..." is an answer, not a promise."""
+    for filler in _THINKING_FILLERS:
+        if text.startswith(filler):
+            return text[len(filler):].lstrip()
+    return text
+
+
+async def _with_thinking_filler(stream, make_filler, after_sec: float):
+    """Pass `stream` through; if it yields nothing for `after_sec`, first
+    yield the text make_filler() returns, so the reply starts with it."""
+    it = stream.__aiter__()
+    first = asyncio.ensure_future(it.__anext__())
+    try:
+        done, _ = await asyncio.wait({first}, timeout=after_sec)
+        if not done:
+            filler = make_filler()
+            if filler:
+                yield llm.ChatChunk(
+                    id="thinking-filler", delta=llm.ChoiceDelta(role="assistant", content=filler + " ")
+                )
+        try:
+            item = await first
+        except StopAsyncIteration:
+            return
+        yield item
+        async for item in it:
+            yield item
+    finally:
+        if not first.done():
+            first.cancel()
+        aclose = getattr(it, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
 # Post-farewell goodbye loop (2026-09-21). Observed: after "Nasvidenje!" the
 # caller said "ja, hvala", the agent answered with another farewell, the
 # caller acknowledged that, and so on for four rounds — each "hvala" is a
@@ -289,7 +335,7 @@ _META_COMMENTARY = re.compile(
     # Reasoning about the prompt's data (eval 2026-10-18: "\"Naslednji torek\"
     # is the row tagged [NASLEDNJI TEDEN] ... Pedikura is service 18, caller
     # said any person.").
-    r"|\brow tagged\b|\bcaller (?:said|says|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
+    r"|\brow tagged\b|\bcaller (?:said|says|speaks?|spoke|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
     r"|\b(?:today|tomorrow|yesterday) is\b|\b\d{4}-\d{2}-\d{2}\b"
     r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
     re.IGNORECASE,
@@ -568,10 +614,19 @@ class ReceptionistAgent(Agent):
         on_suppressed_user_turn=None,
         on_turn_language=None,
         private_emails: set[str] | None = None,
+        on_thinking_filler=None,
+        thinking_filler: bool = True,
+        phone_first: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._language = language
+        # () -> None, counted in the call metrics when a slow reply got "Trenutek."
+        self._on_thinking_filler = on_thinking_filler
+        self._thinking_filler = thinking_filler
+        # Withheld number with find_customer: the phone number before the name.
+        self._phone_first = phone_first
+        self._thinking_filler_step = 0
         # Stored customer emails (caller ID match, find_customer, the
         # existing-customer guard). The prompt says never to read them out;
         # llm_node also replaces them, since the model still did now and then
@@ -601,7 +656,29 @@ class ReceptionistAgent(Agent):
     def set_language(self, language: str) -> None:
         self._language = language
 
+    def _next_thinking_filler(self) -> str:
+        fillers = pack(self._language).thinking_fillers
+        text = fillers[self._thinking_filler_step % len(fillers)]
+        self._thinking_filler_step += 1
+        logger.info("slow reply: thinking filler %r", text)
+        if self._on_thinking_filler is not None:
+            self._on_thinking_filler()
+        return text
+
     async def llm_node(self, chat_ctx, tools, model_settings):
+        """_masked_llm_node, opened with "Trenutek." when it is slow to start."""
+        if not self._thinking_filler:
+            async for chunk in self._masked_llm_node(chat_ctx, tools, model_settings):
+                yield chunk
+            return
+        async for chunk in _with_thinking_filler(
+            self._masked_llm_node(chat_ctx, tools, model_settings),
+            self._next_thinking_filler,
+            THINKING_FILLER_AFTER_SEC,
+        ):
+            yield chunk
+
+    async def _masked_llm_node(self, chat_ctx, tools, model_settings):
         """_llm_node_filtered, then SpokenTextFilter over the text."""
         stream = self._llm_node_filtered(chat_ctx, tools, model_settings)
         heard = None
@@ -609,7 +686,18 @@ class ReceptionistAgent(Agent):
             if getattr(item, "role", None) == "user":
                 heard = caller_digits(getattr(item, "text_content", "") or "")
                 break
-        mask = SpokenTextFilter(self._private_emails, self._language, heard_digits=heard)
+        # Only until the caller says a number, and only once: a caller who
+        # won't give one isn't asked the same thing forever.
+        said = [getattr(i, "text_content", "") or "" for i in chat_ctx.items]
+        roles = [getattr(i, "role", None) for i in chat_ctx.items]
+        phone_first = (
+            self._phone_first
+            and not any(caller_digits(t) for t, r in zip(said, roles) if r == "user")
+            and not any(PHONE_FIRST_QUESTIONS.get(self._language, "\0") in t for t, r in zip(said, roles) if r == "assistant")
+        )
+        mask = SpokenTextFilter(
+            self._private_emails, self._language, heard_digits=heard, phone_first=phone_first
+        )
         chunk_id = ""
         async for chunk in stream:
             if isinstance(chunk, str):
@@ -852,6 +940,8 @@ def build_receptionist_agent(
     customer_lookup: bool = False,
     booking_extras: BookingExtras | None = None,
     assistant_name: str | None = None,
+    on_thinking_filler=None,
+    thinking_filler: bool = True,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -863,6 +953,9 @@ def build_receptionist_agent(
     return ReceptionistAgent(
         language=language,
         private_emails=booking_tools.private_emails,
+        on_thinking_filler=on_thinking_filler,
+        thinking_filler=thinking_filler,
+        phone_first=not caller_phone and customer_lookup,
         on_suppressed_user_turn=on_suppressed_user_turn,
         on_turn_language=on_turn_language,
         instructions=_build_system_prompt(
@@ -1026,7 +1119,7 @@ def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
         # live pipeline was silently running on for Slovenian calls (found
         # 2026-08-16 comparing against tools/tts_ab.py, which explicitly
         # requests these two params and sounded noticeably better).
-        model="tts-rt-v1",
+        model=settings.tts_model,
         language=language,
         # 1.0 (default) read as noticeably slow to callers; 1.1 read as too
         # fast in testing (2026-08-30). 1.04 is a subtler nudge (plugin
@@ -1587,6 +1680,11 @@ async def entrypoint(ctx: JobContext) -> None:
                 "max_duration": USER_TURN_MAX_DURATION_SEC,
                 "max_words": USER_TURN_MAX_WORDS,
             },
+            # The LLM already starts before the turn is confirmed (framework
+            # default); since 2026-10-26 TTS does too, so the first words are
+            # ready the moment the turn ends (~0.35s less silence per reply).
+            # A discarded draft costs a few TTS characters.
+            "preemptive_generation": {"preemptive_tts": True},
         },
     )
 
@@ -1916,6 +2014,29 @@ async def entrypoint(ctx: JobContext) -> None:
     # let a later investigation correlate STT/LLM/TTS events for one turn.
     call_metrics = CallMetrics()
 
+    # Caller stops talking -> agent starts talking, per reply.
+    reply_wait = {"since": None}
+
+    def _on_user_state_for_gap(event) -> None:
+        if event.new_state == "speaking":
+            reply_wait["since"] = None
+        elif event.old_state == "speaking":
+            reply_wait["since"] = time.monotonic()
+
+    def _on_agent_state_for_gap(event) -> None:
+        if event.new_state == "speaking" and reply_wait["since"] is not None:
+            gap = time.monotonic() - reply_wait["since"]
+            reply_wait["since"] = None
+            call_metrics.record_response_gap(gap)
+            if gap > 2.5:
+                logger.info("latency reply_gap: %.2fs (slow)", gap)
+
+    session.on("user_state_changed", _on_user_state_for_gap)
+    session.on("agent_state_changed", _on_agent_state_for_gap)
+
+    def _count_thinking_filler() -> None:
+        call_metrics.thinking_fillers += 1
+
     @session.on("metrics_collected")
     def _on_metrics_collected(event) -> None:
         m = event.metrics
@@ -2017,7 +2138,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     booking_ref["tools"] is not None
                     and text in booking_ref["tools"].spoken_fillers
                 )
-                and pack(call_lang["code"]).promise_cues.search(text)
+                and pack(call_lang["code"]).promise_cues.search(_without_thinking_filler(text))
             ):
                 _activity_since_promise.clear()
                 asyncio.create_task(_watch_for_promise_followup())
@@ -2353,7 +2474,7 @@ async def entrypoint(ctx: JobContext) -> None:
         disclosure=pack(language).ai_disclosure,
     )
     greeting_state.update(style=greeting.style, cached=False, opening_at=None, finished=False)
-    voice_key = f"{settings.tts_provider}|{settings.tts_voice_id or ''}|{language}"
+    voice_key = f"{settings.tts_provider}|{settings.tts_model}|{settings.tts_voice_id or ''}|{language}"
     greeting_render_tasks: set = set()
 
     def _say_greeting_part(text: str, *, allow_interruptions: bool):
@@ -2710,6 +2831,7 @@ async def entrypoint(ctx: JobContext) -> None:
         on_suppressed_user_turn=_record_suppressed_user_turn,
         switchable_to=[c for c in allowed_languages if c != language],
         on_turn_language=language_control.on_turn,
+        on_thinking_filler=_count_thinking_filler,
         **prompt_args,
     )
     agent_ref["receptionist"] = receptionist_agent

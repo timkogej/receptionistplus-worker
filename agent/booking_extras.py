@@ -96,11 +96,14 @@ def render_extras_block(extras: BookingExtras | None, company_data: dict) -> str
     if extras.questions:
         lines += [
             "BEFORE-BOOKING QUESTIONS (set by the owner):",
-            "Once the service, time and the caller's details are settled and before create_booking, "
-            "ask the questions for the service being booked: one at a time, briefly, in the call's "
-            "language, without saying the owner set them. Pass every answer to create_booking in "
-            "`answers` as \"<question> — <answer>\" (\"ne ve\" / \"ni odgovora\" if the caller doesn't "
-            "know or won't say). Never ask questions for services that aren't being booked.",
+            "Ask the questions for the service being booked right after the caller confirms the "
+            "service, day and time (their \"yes\" to \"je tako prav?\"), before asking for name, "
+            "phone or email, and never while checking the slot. One at a time, as the owner wrote it "
+            "(fix only capital letters and, in another language, translate it): don't rephrase it, "
+            "don't add \"answer yes or no\", and don't say the owner set them. Pass every answer to "
+            "create_booking in `answers` as \"<question> — <answer>\" (\"ne ve\" / \"ni odgovora\" if "
+            "the caller doesn't know or won't say). Never ask questions for services that aren't "
+            "being booked.",
         ]
         lines += [f"- For {_scope(q, names)}: \"{q.text}\"" for q in extras.questions]
     if extras.advice:

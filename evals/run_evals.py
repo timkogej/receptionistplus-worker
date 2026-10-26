@@ -84,6 +84,10 @@ SL_TEXT_CHECKS = [
      "split the part of the day the caller already chose"),
     (re.compile(r"\bpreberem\s+(?:vam\s+)?(?:še\s+)?(?:telefonsko\s+)?številko\b", re.I),
      "lead-in before the phone read-back"),
+    # Thinking aloud: a question answered by itself ("... oktobra? Ne, to je ...");
+    # R-NO-THINKING-ALOUD.
+    (re.compile(r"\?\s+(?:Ne|Oziroma|Pravzaprav)\b[,.]", re.I),
+     "thinking aloud / self-correction"),
 ]
 
 
@@ -222,6 +226,9 @@ def _build(language: str, model: str, context: dict | None = None):
         extra_tools=extra_tools,
         switchable_to=[c for c in (allowed or []) if c != language],
         on_turn_language=control.on_turn if control else None,
+        # Evals judge the model's own words; the code-inserted "Trenutek."
+        # for slow replies (tests/test_thinking_filler.py) would only add noise.
+        thinking_filler=False,
         **context,
     )
     if control:
