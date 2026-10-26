@@ -99,10 +99,10 @@ class GroupBook(unittest.TestCase):
 
 class SpokenTime(unittest.TestCase):
     def test_forms(self):
-        self.assertEqual(G.spoken_sl_time("12:00"), "ob dvanajstih")
-        self.assertEqual(G.spoken_sl_time("13:00"), "ob enih popoldan")
-        self.assertEqual(G.spoken_sl_time("09:30"), "ob pol desetih dopoldan")
-        self.assertIsNone(G.spoken_sl_time("10:15"))
+        self.assertEqual(G.spoken_time("12:00"), "ob dvanajstih")
+        self.assertEqual(G.spoken_time("13:00"), "ob enih popoldan")
+        self.assertEqual(G.spoken_time("09:30"), "ob pol desetih dopoldan")
+        self.assertIsNone(G.spoken_time("10:10"))
 
 
 if __name__ == "__main__":

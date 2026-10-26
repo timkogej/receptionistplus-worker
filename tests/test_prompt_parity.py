@@ -170,7 +170,7 @@ class CompanyPromptIntegration(unittest.TestCase):
             self.assertNotIn(bad, sl)
         for bad in ("book with anyone", "book with any staff member"):
             self.assertNotIn(bad, en)
-        self.assertIn("Imate željo po določenem zaposlenem", " ".join(sp.STATIC_PROMPT_SL.split()))
+        self.assertIn("Imate koga posebej v mislih, ali vam je vseeno?", " ".join(sp.STATIC_PROMPT_SL.split()))
         for text in (sp.STATIC_PROMPT_SL, sp.STATIC_PROMPT_EN):
             self.assertNotIn("never mentions an employee at all", text)
 

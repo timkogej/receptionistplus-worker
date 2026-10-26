@@ -110,7 +110,7 @@ def _phone_before_name(transcript: list) -> list[str]:
     phone_at = name_at = None
     for i, t in enumerate(transcript):
         a = (t.get("agent") or "").lower()
-        if phone_at is None and "telefonsk" in a:
+        if phone_at is None and re.search(r"telefonsk|na katero številko", a):
             phone_at = i
         if name_at is None and re.search(r"\bime in priimek\b|\bkako vam je ime\b|\bvaše ime\b", a):
             name_at = i
@@ -266,6 +266,53 @@ def _check_owner_question(fake, notes) -> list[str]:
     return failures
 
 
+def _coming_weekday(weekday: int) -> str:
+    """The nearest coming `weekday`, never today ("v četrtek" on a Monday is
+    this week's Thursday)."""
+    today = datetime.now(TZ).date()
+    return (today + timedelta(days=(weekday - today.weekday() - 1) % 7 + 1)).isoformat()
+
+
+# The live call of 2026-10-26: a nearby weekday, "ob pol dveh", Luka asked
+# for a service he doesn't do. Thursday, unless today is Wednesday or
+# Thursday (then the coming Monday), so the day is never ambiguous.
+def _natural_day() -> int:
+    return 0 if datetime.now(TZ).weekday() in (2, 3) else 3
+
+
+_SL_DAYS_ACC = ("ponedeljek", "torek", "sredo", "četrtek", "petek", "soboto", "nedeljo")
+_SL_MONTHS = r"(?:januarja|februarja|marca|aprila|maja|junija|julija|avgusta|septembra|oktobra|novembra|decembra)"
+
+
+def _check_natural_booking(fake, notes) -> list[str]:
+    if len(fake.created) != 1:
+        return [f"expected exactly 1 booking, got {len(fake.created)}"]
+    b = fake.created[0]
+    failures = []
+    if b["service_ids"] != ["41"]:
+        failures.append(f"service_ids {b['service_ids']} != ['41'] (Klasična nega obraza)")
+    if b["date"] != _coming_weekday(_natural_day()):
+        failures.append(f"date {b['date']} != {_coming_weekday(_natural_day())}")
+    if b["time"] != "13:30":
+        failures.append(f"time {b['time']} != 13:30 ('ob pol dveh')")
+    return failures
+
+
+def _sounds_natural(transcript: list) -> list[str]:
+    agent = [(t.get("agent") or "") for t in transcript]
+    failures = []
+    users = " ".join((t.get("user") or "").lower() for t in transcript)
+    said = " ".join(agent).lower()
+    if "evr" not in users and "cen" not in users and re.search(r"\bevr|\bminut", said):
+        failures.append("said the price or duration nobody asked for")
+    full_dates = sum(1 for a in agent if re.search(_SL_MONTHS, a, re.I))
+    if full_dates > 3:
+        failures.append(f"said the full date in {full_dates} turns (read-back and confirmation only)")
+    if re.search(r"ta\s+\w+\s+ali\s+(?:\w+\s+)?(?:v\s+)?naslednj", said):
+        failures.append("asked 'this one or next week's' for a plain weekday")
+    return failures
+
+
 def _told_advice(transcript: list) -> list[str]:
     said = " ".join((t.get("agent") or "").lower() for t in transcript)
     if "eteričn" in said:
@@ -274,6 +321,24 @@ def _told_advice(transcript: list) -> list[str]:
 
 
 SCENARIOS: list[Scripted | Simulated] = [
+    Simulated(
+        "sl-naraven-pogovor",
+        "sl",
+        persona=(
+            "Si Tim Zupančič in kličeš v salon s skrito številko. Govoriš "
+            "sproščeno in na kratko. Želiš klasično nego obraza. Najprej reci, "
+            "da bi rad, da te postreže Luka; ko ti povejo, da Luka tega ne "
+            "dela, reci »potem pa kdorkoli«. Za dan reci samo »v "
+            f"{_SL_DAYS_ACC[_natural_day()]}«. Ko te vprašajo za del dneva, reci "
+            "»popoldan«. Med ponujenimi urami izberi »ob pol dveh« (to je "
+            "13.30); če je ne ponudijo, vprašaj zanjo. Potrdi, ko ti preberejo "
+            "rezervacijo. Telefon: 068 663 410. Ime: Tim Zupančič. Za ceno ne "
+            "sprašuj."
+        ),
+        check=_check_natural_booking,
+        transcript_check=_sounds_natural,
+        context={"sms_confirmation": True},
+    ),
     Scripted(
         "sl-vikanje",
         "sl",

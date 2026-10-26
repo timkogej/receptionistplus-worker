@@ -48,7 +48,7 @@ starts. With **"detect_caller_language"** on (dashboard switch):
   they are easily confused), or when the model calls `switch_language` for
   an explicit request;
 - a switch swaps the agent's instructions, the TTS language (same Soniox
-  voice "Maya" in all five) and every fixed line (`agent/languages.py`);
+  voice "Nina" in all five) and every fixed line (`agent/languages.py`);
 - the booking is stored with the call's language and, after a booking, a
   known customer's "Stranke".language is updated, so reminders follow.
 
@@ -162,7 +162,7 @@ script** — run new files from `migrations/` in the Supabase SQL editor first.
 | `SONIOX_API_KEY` | yes | STT, and TTS when `TTS_PROVIDER=soniox` |
 | `ELEVENLABS_API_KEY` | if `TTS_PROVIDER=elevenlabs` | |
 | `TTS_PROVIDER` | no (`soniox`) | `soniox` or `elevenlabs` |
-| `TTS_VOICE_ID` | no | provider voice; Soniox default `Maya` |
+| `TTS_VOICE_ID` | no | provider voice; Soniox default `Nina` (model `TTS_MODEL`, default `tts-rt-v2`) |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes | receptionist_* tables |
 | `BOOKING_V2_HMAC_SECRET` | yes in prod | signs booking-v2 requests |
 | `COMPANY_SLUG` | no | fallback company for numbers with no mapping |

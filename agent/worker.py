@@ -76,7 +76,7 @@ from agent.languages import (
     normalize_language,
     pack,
 )
-from agent.call_summary import summarize_call
+from agent.call_summary import booking_facts, summarize_call
 from agent.appointments import AppointmentTools
 from agent.group_booking import GroupBooking
 from agent.booking_extras import BookingExtras, render_extras_block
@@ -91,7 +91,7 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
-from agent.spoken_text import PHONE_FIRST_QUESTIONS, SpokenTextFilter, caller_digits
+from agent.spoken_text import AUDIO_TAGS, PHONE_FIRST_QUESTIONS, SpokenTextFilter, caller_digits, without_audio_tags
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -368,7 +368,9 @@ _META_COMMENTARY = re.compile(
     # said any person.").
     r"|\brow tagged\b|\bcaller (?:said|says|speaks?|spoke|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
     r"|\b(?:today|tomorrow|yesterday) is\b|\b\d{4}-\d{2}-\d{2}\b"
-    r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
+    r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b"
+    # "I need to re-check the correct slot." (eval 2026-10-26)
+    r"|\bI (?:need|have) to (?:re-?check|call|check|use)\b|\bthe (?:correct|right) slot\b",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
@@ -541,6 +543,30 @@ def _build_date_context(language: str = DEFAULT_LANGUAGE, days: int = 14) -> str
     )
 
 
+def audio_tags_supported(settings: Settings) -> bool:
+    """Soniox tts-rt-v2 reads delivery tags ("[warm]"); v1 would say them."""
+    return settings.tts_provider == "soniox" and str(settings.tts_model).startswith("tts-rt-v2")
+
+
+# Only with a voice that reads them (audio_tags_supported). Few and rare on
+# purpose: a receptionist who laughs at everything sounds worse than one
+# who never does.
+_AUDIO_TAGS_BLOCK = (
+    "VOICE TAGS: your voice understands a few delivery tags. You may start a "
+    "sentence with ONE of these, rarely — most replies have none: [warm] (a "
+    "kind word, the goodbye), [happy] (good news, e.g. the time they wanted is "
+    "free), [reassuringly] (the caller is worried or apologises), [chuckles] "
+    "(ONLY when the caller makes a joke or says something funny; then also "
+    "answer it in a few kind words before going on), [laughs] (only for a "
+    "clearly funny joke). At most one tag per reply, never any other word in "
+    "square brackets, and never laugh at a complaint, a problem or the "
+    "caller. Example: caller \"Upam, da me ne boste preveč polepšali, žena me "
+    "ne bo prepoznala.\" → \"[chuckles] Bomo pazili! Kateri dan bi vam "
+    "ustrezal?\""
+)
+assert set(("warm", "happy", "reassuringly", "chuckles", "laughs")) == set(AUDIO_TAGS)
+
+
 def _build_system_prompt(
     company_data: dict,
     language: str = DEFAULT_LANGUAGE,
@@ -555,6 +581,7 @@ def _build_system_prompt(
     customer_lookup: bool = False,
     booking_extras: BookingExtras | None = None,
     assistant_name: str | None = None,
+    audio_tags: bool = False,
 ) -> str:
     static_prompt = build_static_prompt(language, switchable_to, features)
     logger.info(
@@ -575,6 +602,8 @@ def _build_system_prompt(
     if extras_block:
         parts.append(extras_block)
     parts.append(render_assistant_identity(assistant_name))
+    if audio_tags:
+        parts.append(_AUDIO_TAGS_BLOCK)
     parts.append(render_caller_block(caller_phone, customer, language, can_lookup=customer_lookup))
     parts.append(render_confirmation_line(sms_confirmation, language))
     return "\n\n".join(parts)
@@ -648,9 +677,12 @@ class ReceptionistAgent(Agent):
         on_thinking_filler=None,
         thinking_filler: bool = True,
         phone_first: bool = False,
+        audio_tags: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        # The TTS reads "[warm]"-style tags (audio_tags_supported).
+        self._audio_tags = audio_tags
         self._language = language
         # () -> None, counted in the call metrics when a slow reply got "Trenutek."
         self._on_thinking_filler = on_thinking_filler
@@ -731,7 +763,11 @@ class ReceptionistAgent(Agent):
             and not any(PHONE_FIRST_QUESTIONS.get(self._language, "\0") in t for t, r in zip(said, roles) if r == "assistant")
         )
         mask = SpokenTextFilter(
-            self._private_emails, self._language, heard_digits=heard, phone_first=phone_first
+            self._private_emails,
+            self._language,
+            heard_digits=heard,
+            phone_first=phone_first,
+            keep_audio_tags=self._audio_tags,
         )
         chunk_id = ""
         async for chunk in stream:
@@ -939,11 +975,10 @@ def build_find_customer_tool(
             "email": email,
             "message": (
                 "This number belongs to an existing customer. Without saying you "
-                "looked anything up, ask once whether "
-                "you're speaking with them, by first name (in Slovenian in the "
-                "instrumental case: \"Ali govorim z Ano?\"). If the caller already "
-                "gave you a name, ask with the full stored name instead (\"Ali ste "
-                "Ana Novak?\") — what you heard may be misheard. If yes: pass exactly "
+                "looked anything up, ask once, with the full stored name: in Slovenian "
+                "\"Termin vpišem na ime Ana Novak?\" (for an existing appointment: "
+                "\"Govorim z Ano Novak?\"), in English \"Shall I put it under Ana "
+                "Novak?\". If yes: pass exactly "
                 "these first_name, last_name"
                 + (" and email" if email else "")
                 + " and this phone to create_booking (or, for an existing appointment, "
@@ -977,6 +1012,7 @@ def build_receptionist_agent(
     assistant_name: str | None = None,
     on_thinking_filler=None,
     thinking_filler: bool = True,
+    audio_tags: bool = False,
 ) -> "ReceptionistAgent":
     """The receptionist for one call. Shared by entrypoint() and the eval
     harness (evals/run_evals.py), so both run the same prompt and tools.
@@ -991,6 +1027,7 @@ def build_receptionist_agent(
         on_thinking_filler=on_thinking_filler,
         thinking_filler=thinking_filler,
         phone_first=not caller_phone and customer_lookup,
+        audio_tags=audio_tags,
         on_suppressed_user_turn=on_suppressed_user_turn,
         on_turn_language=on_turn_language,
         instructions=_build_system_prompt(
@@ -1006,6 +1043,7 @@ def build_receptionist_agent(
             customer_lookup=customer_lookup,
             booking_extras=booking_extras,
             assistant_name=assistant_name,
+            audio_tags=audio_tags,
         ),
         tools=[
             booking_tools.get_slots,
@@ -1148,7 +1186,9 @@ def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
         )
     return soniox.TTS(
         api_key=settings.soniox_api_key,
-        voice=settings.tts_voice_id or "Maya",
+        # Nina on tts-rt-v2 since 2026-10-26 (Maya on v1 before), chosen by
+        # Tim from samples.
+        voice=settings.tts_voice_id or "Nina",
         # Explicit, not plugin defaults: the plugin defaults to model
         # "tts-rt-v1-preview" and language "en" if unset, which is what the
         # live pipeline was silently running on for Slovenian calls (found
@@ -1847,7 +1887,10 @@ async def entrypoint(ctx: JobContext) -> None:
             transcript.append(
                 {
                     "role": item.role,
-                    "text": item.text_content,
+                    # Voice tags ("[warm]") are for the TTS, not the owner.
+                    "text": without_audio_tags(item.text_content)
+                    if item.role == "assistant"
+                    else item.text_content,
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -2357,6 +2400,11 @@ async def entrypoint(ctx: JobContext) -> None:
         # first. Only when the owner will be NOTIFIED (message/callback) is a
         # quick summary made before the insert, so the notification carries
         # it; otherwise it is written afterwards.
+        summary_facts = (
+            booking_facts(booking_tools.booked, booking_tools._company_data, company_language)
+            if booking_tools
+            else ""
+        )
         summary = None
         if notes.has_note:
             summary = await summarize_call(
@@ -2364,6 +2412,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=6.0,
+                facts=summary_facts,
             )
 
         try:
@@ -2408,6 +2457,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=12.0,
+                facts=summary_facts,
             )
             if summary:
                 try:
@@ -2788,6 +2838,7 @@ async def entrypoint(ctx: JobContext) -> None:
         customer_lookup=bool((profile or {}).get("ID Podjetja")),
         booking_extras=booking_extras,
         assistant_name=(settings_row or {}).get("assistant_name"),
+        audio_tags=audio_tags_supported(settings),
     )
 
     language_control = LanguageControl(

@@ -88,6 +88,17 @@ SL_TEXT_CHECKS = [
     # R-NO-THINKING-ALOUD.
     (re.compile(r"\?\s+(?:Ne|Oziroma|Pravzaprav)\b[,.]", re.I),
      "thinking aloud / self-correction"),
+    # Half hours in English order ("dveh in pol" for 14:30); Slovenian says
+    # "pol treh" (agent/spoken_time.py, live call 2026-10-26).
+    (re.compile(r"\b(?:enih|dveh|treh|štirih|petih|šestih|sedmih|osmih|devetih|desetih|enajstih|dvanajstih)\s+in\s+pol\b", re.I),
+     "half hour in English order ('dveh in pol' instead of 'pol treh')"),
+    (re.compile(r"\bštevilk\w*\s+(?:je\s+)?skrit|\bskrit\w*\s+številk", re.I),
+     "told the caller the number is withheld"),
+    (re.compile(r"\b(?:preverila bom|termin je še prost, urejam|samo še preverim)\b", re.I),
+     "narrated a tool call"),
+    (re.compile(r"\bimam\s+(?:še\s+)?(?:prost|nekaj|kar|termin)", re.I),
+     "spoke in the singular ('imam prosto' instead of 'imamo')"),
+    (re.compile(r"\[[^\]]*\]"), "square-bracket tag read aloud by a voice without tags"),
 ]
 
 

@@ -10,7 +10,7 @@ Supported: the five languages Jedro+ already stores per customer
 ("Stranke".language: slo/eng/de/it/hr — see JEDROPLUS_LANGUAGE_CODES).
 
 Persona: female, formal address, in every language — same voice (Soniox
-"Maya" speaks all five). Lines spoken about herself use feminine forms
+"Nina" speaks all five). Lines spoken about herself use feminine forms
 (sl "zaključila", hr "završila", it "chiuderò" is neutral).
 """
 
@@ -136,9 +136,9 @@ _register(LanguagePack(
     ),
     check_slots_fillers=("Še trenutek, prosim.", "Samo še sekundo, prosim."),
     create_booking_fillers=(
-        "Super, vas vpisujem, samo trenutek.",
-        "Odlično, vpisujem vas, trenutek prosim.",
-        "Vpisujem rezervacijo, samo trenutek.",
+        "Še malo, pa je urejeno.",
+        "Samo še sekundo, prosim.",
+        "Skoraj je urejeno.",
     ),
     # "v <dan>" = accusative
     weekdays_for_filler=("ponedeljek", "torek", "sredo", "četrtek", "petek", "soboto", "nedeljo"),
@@ -202,9 +202,9 @@ _register(LanguagePack(
     ),
     check_slots_fillers=("Just a moment longer.", "One more second, please."),
     create_booking_fillers=(
-        "Great, I'm putting you in now, one moment.",
-        "Perfect, I'm booking that in, just a moment.",
-        "Writing that in for you now, one moment.",
+        "Almost done.",
+        "Just one more second, please.",
+        "Nearly there.",
     ),
     weekdays_for_filler=("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"),
     ambiguous_retry_unsafe=(

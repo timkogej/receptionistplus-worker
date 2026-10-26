@@ -14,7 +14,9 @@ _SPOKEN_EMAIL = {"sl": "vaš e-naslov", "en": "your email address", "de": "Ihre 
 # forbids it, and the model still wrote it in most evals (2026-10-18).
 _READBACK_LEAD_IN = re.compile(
     r"\b(?:da\s+)?(?:vam\s+)?preberem\s+(?:vam\s+)?(?:še\s+)?(?:vašo\s+)?"
-    r"(?:telefonsko\s+)?številko(?:\s+nazaj)?(?:,?\s*da\s+(?:jo\s+)?preverim)?\s*[:.,\u2014-]+\s*",
+    r"(?:telefonsko\s+)?številko(?:\s+nazaj)?(?:,?\s*da\s+(?:jo\s+)?preverim)?\s*[:.,\u2014-]+\s*"
+    # "Preberem nazaj: nič šest osem ..." (live call 2026-10-26)
+    r"|\b(?:vam\s+)?preberem\s+(?:vam\s+)?nazaj\s*[:.,\u2014-]+\s*",
     re.IGNORECASE,
 )
 _SPOKEN_SEGMENT_END = re.compile(r"[.!?\u2026:](?=\s)")
@@ -146,7 +148,15 @@ def fix_phone_readback(text: str, heard: str | None) -> str:
 _INTERNAL_DATA = re.compile(
     r"\bID\s*\d+\b|\b(?:service|employee|appointment)_id\b|\bany_person\b|\bOB-\d{3,}\b"
     # "Pedikura ima šifro 18." (eval 2026-10-26)
-    r"|\b(?:šifr[aoei]\w*|številk[aoi] storitve)\s+\d+\b",
+    r"|\b(?:šifr[aoei]\w*|številk[aoi] storitve)\s+\d+\b"
+    # "Številka je skrita, zato jo prosim navedite." (live call 2026-10-26):
+    # how the line reached us is none of the caller's business.
+    r"|\bštevilk\w*\s+(?:vam\s+)?(?:je\s+)?(?:skrit|zakrit|prikrit)\w*|\b(?:skrit|zakrit)\w*\s+številk\w*"
+    r"|\bnumber\s+(?:is\s+)?(?:withheld|hidden|private)\b|\b(?:withheld|hidden)\s+number\b"
+    # Reasoning about the prompt after a tool call: "according to the table,
+    # the torek in NASLEDNJI TEDEN is 2026-11-03" (eval 2026-10-26).
+    r"|\b\d{4}-\d{2}-\d{2}\b|\baccording to the\b|\bthe caller (?:says|said|wants|means)\b|\brow tagged\b"
+    r"|(?-i:\bNASLEDNJI TEDEN\b|\bTA TEDEN\b)",
     re.IGNORECASE,
 )
 _SENTENCE = re.compile(r"[^.!?\u2026]*[.!?\u2026]+\s*|[^.!?\u2026]+$")
@@ -194,8 +204,8 @@ _NAME_QUESTION = {
     "it": r"\b(?:nome e cognome|il suo nome|come si chiama)\b",
 }
 _PHONE_QUESTION = {
-    "sl": "Mi lahko najprej poveste svojo telefonsko številko?",
-    "en": "Could I first have your phone number?",
+    "sl": "Na katero številko vas lahko pokličemo?",
+    "en": "What number can we reach you on?",
     "de": "Darf ich zuerst Ihre Telefonnummer haben?",
     "hr": "Možete li mi najprije reći svoj broj telefona?",
     "it": "Può dirmi prima il suo numero di telefono?",
@@ -225,6 +235,41 @@ def ask_phone_before_name(text: str, language: str) -> str:
     return "".join(out)
 
 
+# --- The business speaks in the plural (R-CONCISE) -----------------------
+# "V četrtek imam prosto ..." → "imamo": the receptionist speaks for the
+# salon (Tim, 2026-10-26). Only availability phrases; "nimam podatka" stays.
+_SL_SINGULAR_HAVE = re.compile(
+    r"\b([Nn]?[Ii])mam(?=\s+(?:še\s+|žal\s+)?(?:prost|nekaj|kar|veliko|termin|samo|le\b|na voljo|ob\b))"
+)
+
+
+def business_plural(text: str) -> str:
+    return _SL_SINGULAR_HAVE.sub(lambda m: m.group(1) + "mamo", text)
+
+
+# --- Audio tags (Soniox tts-rt-v2) ---------------------------------------
+# "[warm]", "[chuckles]" before a sentence change how it is spoken. Only a
+# few are allowed, and only when the TTS model reads them; every other
+# bracketed word is dropped so it is never read aloud.
+AUDIO_TAGS = ("warm", "happy", "reassuringly", "chuckles", "laughs")
+_AUDIO_TAG = re.compile(r"\s*\[([a-z][a-z \-]{0,24})\]\s*", re.I)
+
+
+def audio_tags(text: str, keep: bool) -> str:
+    def swap(m: re.Match) -> str:
+        if keep and m.group(1).lower() in AUDIO_TAGS:
+            return f"[{m.group(1).lower()}] "
+        # Dropped: keep one space between words, none at the start.
+        return " " if m.start() > 0 and m.end() < len(m.string) else ""
+
+    return _AUDIO_TAG.sub(swap, text)
+
+
+def without_audio_tags(text: str) -> str:
+    """For the stored transcript and the summary."""
+    return audio_tags(text or "", keep=False).strip()
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
@@ -232,8 +277,15 @@ class SpokenTextFilter:
     hours are put right, and Cyrillic letters become Latin ones."""
 
     def __init__(
-        self, emails, language: str, heard_digits: str | None = None, *, phone_first: bool = False
+        self,
+        emails,
+        language: str,
+        heard_digits: str | None = None,
+        *,
+        phone_first: bool = False,
+        keep_audio_tags: bool = False,
     ) -> None:
+        self._keep_audio_tags = keep_audio_tags
         # Number withheld and no phone number said yet: ask for it before the name.
         self._phone_first = phone_first
         # The digits of the phone number the caller last said, if any.
@@ -298,12 +350,15 @@ class SpokenTextFilter:
                 body = body[0].upper() + body[1:]
             text = (" " if self._after_cut else "") + body
             self._after_cut = None
+        if "[" in text:
+            text = audio_tags(text, self._keep_audio_tags)
         text = drop_internal_sentences(text)
         if self._phone_first:
             text = ask_phone_before_name(text, self._language)
         if re.search(r"[\u0400-\u04FF]", text):
             text = text.translate(_CYRILLIC)
         if self._language == "sl":
+            text = business_plural(text)
             text = fix_slovenian_hours(text)
             text = fix_phone_readback(text, self._heard_digits)
             stripped = _READBACK_LEAD_IN.sub("", text)

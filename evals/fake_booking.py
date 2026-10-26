@@ -24,7 +24,8 @@ def _open_times(d: date) -> list[str] | str:
     if wd == 6:
         return "unavailable"
     last = 12 if wd == 5 else 18
-    times = [f"{h:02d}:00" for h in range(8, last)]
+    # Every half hour, so half-hour times ("ob pol dveh") get spoken too.
+    times = [f"{h:02d}:{m}" for h in range(8, last) for m in ("00", "30")]
     # A few taken slots, different per weekday, so "is X free?" has real answers.
     taken = {0: {"09:00", "10:00"}, 1: {"14:00"}, 2: {"08:00", "16:00"}, 3: set(), 4: {"11:00"}, 5: {"08:00"}}
     return [t for t in times if t not in taken.get(wd, set())]
