@@ -109,3 +109,45 @@ class BusinessVoice(unittest.TestCase):
                          "[chuckles] Bomo pazili! Kateri dan?")
         f = SpokenTextFilter([], "sl")
         self.assertEqual((f.feed("[chuckles] Bomo pazili! ") + f.flush()).strip(), "Bomo pazili!")
+
+
+class NaturalOffers(unittest.TestCase):
+    def test_duration_only_when_asked(self):
+        from agent.spoken_text import caller_asked_price_or_time, drop_unasked_details
+
+        self.assertEqual(
+            drop_unasked_details("Seveda. Pedikura traja petinštirideset minut. Imate koga posebej v mislih, ali vam je vseeno?"),
+            "Seveda. Imate koga posebej v mislih, ali vam je vseeno?",
+        )
+        self.assertEqual(
+            drop_unasked_details("Imamo masažo glave, ki traja trideset minut, in refleksno masažo stopal, ki traja "
+                                 "šestdeset minut in stane petnajst evrov. Katera vas zanima?"),
+            "Imamo masažo glave in refleksno masažo stopal. Katera vas zanima?",
+        )
+        self.assertTrue(caller_asked_price_or_time("Koliko pa traja?"))
+        self.assertFalse(caller_asked_price_or_time("Rad bi pedikuro."))
+
+    def test_pri_nas_imamo_and_parts_once(self):
+        from agent.spoken_text import business_plural
+
+        self.assertEqual(business_plural("Pri nas imate manikuro."), "Imamo manikuro.")
+        self.assertEqual(business_plural("Z veseljem, pri nas imamo manikuro."), "Z veseljem, imamo manikuro.")
+        self.assertEqual(
+            business_plural("V petek imamo proste termine tako dopoldan kot popoldan. Vam bolj ustreza dopoldan ali popoldan?"),
+            "V petek imamo še kar nekaj prostih terminov. Vam bolj ustreza dopoldan ali popoldan?",
+        )
+
+    def test_ask_day(self):
+        from datetime import datetime, timedelta
+
+        from agent.tools import _TIMEZONE, _ask_day, _offer_times
+
+        today = datetime.now(_TIMEZONE).date()
+        day = lambda n: (today + timedelta(days=n)).isoformat()  # noqa: E731
+        full = [f"{h:02d}:{m}" for h in range(8, 18) for m in ("00", "30")]
+        slots = {day(1): full, day(2): ["13:00", "13:30", "15:00", "16:00"], day(3): ["10:00", "14:30"], day(4): []}
+        ask = _ask_day(slots, _offer_times(slots), "sl")
+        self.assertEqual(ask[day(1)], "Jutri imamo še kar nekaj prostih terminov. Vam bolj ustreza dopoldan ali popoldan?")
+        self.assertIn("imamo prosto samo popoldan, ob enih, pol dveh, treh ali štirih.", ask[day(2)])
+        self.assertIn("imamo prosto le še ob desetih dopoldan ali ob pol treh popoldan.", ask[day(3)])
+        self.assertTrue(ask[day(4)].endswith("žal nimamo prostih terminov."))

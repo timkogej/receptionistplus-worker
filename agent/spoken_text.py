@@ -156,7 +156,9 @@ _INTERNAL_DATA = re.compile(
     # Reasoning about the prompt after a tool call: "according to the table,
     # the torek in NASLEDNJI TEDEN is 2026-11-03" (eval 2026-10-26).
     r"|\b\d{4}-\d{2}-\d{2}\b|\baccording to the\b|\bthe caller (?:says|said|wants|means)\b|\brow tagged\b"
-    r"|(?-i:\bNASLEDNJI TEDEN\b|\bTA TEDEN\b)",
+    r"|(?-i:\bNASLEDNJI TEDEN\b|\bTA TEDEN\b)"
+    # "Next Tuesday: Pedikura is service 18, any person." (eval 2026-10-26)
+    r"|\bservice\s+\d+\b|\bany[ _]person\b|^\s*(?:next|this)\s+\w+day\s*:",
     re.IGNORECASE,
 )
 _SENTENCE = re.compile(r"[^.!?\u2026]*[.!?\u2026]+\s*|[^.!?\u2026]+$")
@@ -243,8 +245,64 @@ _SL_SINGULAR_HAVE = re.compile(
 )
 
 
+# "Pri nas imate manikuro" ("you have") and "Pri nas imamo manikuro": plain
+# "Imamo manikuro" is what people say (Tim, live call 2026-10-26).
+_SL_PRI_NAS_IMATE = re.compile(r"\b([Pp])ri nas (?:imate|imamo)\b")
+# "V petek imamo proste termine tako dopoldan kot popoldan. Vam bolj ustreza
+# dopoldan ali popoldan?" names the parts of the day twice (Tim: "čudno").
+_SL_PARTS_TWICE = re.compile(
+    r"\bimamo\s+(?:še\s+)?(?:proste\s+termine|prosto|prostih\s+terminov|termine)\s+"
+    r"(?:tako\s+|in\s+)?(?:dopoldan|zjutraj)\w*\s*(?:,\s*)?(?:in|kot|ali)\s+(?:tudi\s+)?popoldan\w*"
+    r"(?:\s*(?:,|in|ali)\s*(?:tudi\s+)?zvečer)?",
+    re.I,
+)
+
+
 def business_plural(text: str) -> str:
-    return _SL_SINGULAR_HAVE.sub(lambda m: m.group(1) + "mamo", text)
+    text = _SL_SINGULAR_HAVE.sub(lambda m: m.group(1) + "mamo", text)
+    text = _SL_PRI_NAS_IMATE.sub(lambda m: "Imamo" if m.group(1) == "P" else "imamo", text)
+    return _SL_PARTS_TWICE.sub(
+        lambda m: ("I" if m.group(0)[0] == "I" else "i") + "mamo še kar nekaj prostih terminov", text
+    )
+
+
+# --- Price and duration nobody asked for (R-CONCISE) ---------------------
+# "Pedikura traja petinštirideset minut." on every service choice, live
+# calls 2026-10-26, although the prompt says only when asked. Dropped unless
+# the caller's last words asked about time or price.
+_ASKED_PRICE_OR_TIME = re.compile(
+    r"\btraja|\bdolgo\b|\bčasa\b|\bcen[aeiou]?\b|\bstane\b|\bkoliko\b|\bevr|\bplač"
+    r"|\bhow long\b|\bprice|\bcost|\bhow much\b|\bminutes?\b",
+    re.I,
+)
+_DURATION = r"(?:minut\w*|ur[oe]\b|uri\b|uro in pol|minutes?\b|hours?\b|an hour\b)"
+_PRICE = r"(?:evr\w*|euros?\b)"
+_CLAUSE = re.compile(
+    rf",?\s*(?:ki|which|that)\s+(?:traja|takes|lasts|stane|costs)\b[^.?!]*?(?:{_DURATION}|{_PRICE})"
+    rf"(?:\s+(?:in|and)\s+(?:stane|costs)\b[^.?!]*?{_PRICE})?(?=\s*,|\s*[.?!]|\s*$)"
+    # "glave, ki traja trideset minut, in refleksno" -> "glave in refleksno"
+    r"(?:,(?=\s+(?:in|ali|and|or)\b))?",
+    re.I,
+)
+_STATEMENT = re.compile(
+    rf"\b(?:traja|takes|lasts)\b[^.?!]*?{_DURATION}|\b(?:stane|costs)\b[^.?!]*?{_PRICE}", re.I
+)
+
+
+def caller_asked_price_or_time(text: str | None) -> bool:
+    return bool(_ASKED_PRICE_OR_TIME.search(text or ""))
+
+
+def drop_unasked_details(text: str) -> str:
+    """Duration and price out of a reply nobody asked them for: a relative
+    clause goes ("manikuro, ki traja šestdeset minut" -> "manikuro"), a
+    sentence that is only about them goes whole."""
+    if not _STATEMENT.search(text):
+        return text
+    text = _CLAUSE.sub("", text)
+    text = re.sub(r",\s*,", ",", text)
+    kept = [m.group(0) for m in _SENTENCE.finditer(text) if not _STATEMENT.search(m.group(0))]
+    return "".join(kept)
 
 
 # --- Audio tags (Soniox tts-rt-v2) ---------------------------------------
@@ -270,6 +328,9 @@ def without_audio_tags(text: str) -> str:
     return audio_tags(text or "", keep=False).strip()
 
 
+_PHONE_DIGITS = re.compile(r"(?<![\w.,])\+?\d{2,4}(?:[ /-]?\d{2,4}){2,3}(?![\w.,]\d)")
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
@@ -284,8 +345,11 @@ class SpokenTextFilter:
         *,
         phone_first: bool = False,
         keep_audio_tags: bool = False,
+        details_asked: bool = True,
     ) -> None:
         self._keep_audio_tags = keep_audio_tags
+        # False: the caller didn't ask about price or duration this turn.
+        self._details_asked = details_asked
         # Number withheld and no phone number said yet: ask for it before the name.
         self._phone_first = phone_first
         # The digits of the phone number the caller last said, if any.
@@ -353,11 +417,15 @@ class SpokenTextFilter:
         if "[" in text:
             text = audio_tags(text, self._keep_audio_tags)
         text = drop_internal_sentences(text)
+        if not self._details_asked:
+            text = drop_unasked_details(text)
         if self._phone_first:
             text = ask_phone_before_name(text, self._language)
         if re.search(r"[\u0400-\u04FF]", text):
             text = text.translate(_CYRILLIC)
         if self._language == "sl":
+            # "na številko 041 555 123": digits are read badly by TTS.
+            text = _PHONE_DIGITS.sub(lambda m: spoken_sl_digits(re.sub(r"\D", "", m.group(0))), text)
             text = business_plural(text)
             text = fix_slovenian_hours(text)
             text = fix_phone_readback(text, self._heard_digits)

@@ -289,6 +289,101 @@ def _say_times(offer: dict, language: str) -> dict:
     return out
 
 
+_PARTS = {
+    "sl": {"morning": "dopoldan", "afternoon": "popoldan", "evening": "zvečer"},
+    "en": {"morning": "the morning", "afternoon": "the afternoon", "evening": "the evening"},
+}
+
+
+def _join(words: list[str], last: str) -> str:
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} {last} {words[-1]}"
+
+
+def _day_ref(iso_date: str, language: str) -> str | None:
+    """"Jutri", "V petek", "Danes" / "Tomorrow", "On Friday"."""
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    today = datetime.now(_TIMEZONE).date()
+    delta = (d - today).days
+    if language == "sl":
+        if delta == 0:
+            return "Danes"
+        if delta == 1:
+            return "Jutri"
+        if 0 < delta < 7:
+            return f"V {pack('sl').weekdays_for_filler[d.weekday()]}"
+        label = _day_label(iso_date, "sl")
+        if 7 <= delta < 14 and label and ", " in label:
+            # "V torek, tretjega novembra," — the comma closes the insert.
+            return f"V {pack('sl').weekdays_for_filler[d.weekday()]}, {label.split(', ', 1)[1]},"
+        return None
+    if language == "en":
+        if delta == 0:
+            return "Today"
+        if delta == 1:
+            return "Tomorrow"
+        return f"On {pack('en').weekdays_for_filler[d.weekday()]}" if 0 < delta < 7 else None
+    return None
+
+
+def _ask_day(slots_by_date: dict, offer: dict, language: str, limit: int = 7) -> dict:
+    """Per day, the sentence that offers it, made here so the parts of the
+    day are named once and fit what is free (Tim, live call 2026-10-26:
+    "V petek imamo proste termine tako dopoldan kot popoldan. Vam bolj
+    ustreza dopoldan ali popoldan?" said them twice):
+      several parts: "V petek imamo še kar nekaj prostih terminov. Vam bolj
+                      ustreza dopoldan ali popoldan?"
+      one part:      "V petek imamo prosto samo popoldan, ob enih ali pol
+                      dveh. Vam kaj od tega ustreza?"
+      three or fewer: those times;  none: "V petek je žal že vse zasedeno."
+    Only Slovenian (two weeks ahead) and English (six days)."""
+    parts_word = _PARTS.get(language)
+    if not parts_word:
+        return {}
+    out = {}
+    for date, times in list(slots_by_date.items())[:limit]:
+        ref = _day_ref(date, language)
+        if not ref:
+            continue
+        if not isinstance(times, list) or not times:
+            # Closed or full: the caller hears the same.
+            out[date] = (f"{ref} žal nimamo prostih terminov." if language == "sl"
+                         else f"{ref} we have no openings, I'm afraid.")
+            continue
+        times = sorted(times)
+        if len(times) <= 3:
+            phrases = [spoken_time(t, language) for t in times]
+            if language == "en":
+                phrases = [p.removeprefix("at ") if p else p for p in phrases]
+            if all(phrases):
+                out[date] = (
+                    f"{ref} imamo prosto le še {_join(phrases, 'ali')}. Vam kaj od tega ustreza?"
+                    if language == "sl"
+                    else f"{ref} we only have {_join(phrases, 'or')} left. Would any of those work?"
+                )
+                continue
+        parts = [k for k in ("morning", "afternoon", "evening") if (offer.get(date) or {}).get(k)]
+        if len(parts) == 1:
+            say = spoken_time_list(offer[date][parts[0]], language)
+            if say:
+                out[date] = (
+                    f"{ref} imamo prosto samo {parts_word[parts[0]]}, {say}. Vam kaj od tega ustreza?"
+                    if language == "sl"
+                    else f"{ref} we only have {parts_word[parts[0]]}, {say}. Would any of those work?"
+                )
+            continue
+        names = [parts_word[k] for k in parts]
+        if language == "sl":
+            many = "še kar nekaj prostih terminov" if len(times) >= 6 else "še nekaj prostih terminov"
+            out[date] = f"{ref} imamo {many}. Vam bolj ustreza {_join(names, 'ali')}?"
+        else:
+            many = "quite a few openings" if len(times) >= 6 else "a few openings"
+            out[date] = f"{ref} we still have {many}. Would {_join(names, 'or')} suit you better?"
+    return out
+
+
 def _all_times(slots_by_date: dict) -> list[str]:
     return [t for times in slots_by_date.values() if isinstance(times, list) for t in times]
 
@@ -695,6 +790,9 @@ class BookingTools:
             say = _say_times(result["offer_times"], self._language)
             if say:
                 result["say_times"] = say
+            ask = _ask_day(result["slots"], result["offer_times"], self._language)
+            if ask:
+                result["ask_day"] = ask
             spoken = spoken_time_map(_all_times(result["slots"]), self._language)
             if spoken:
                 result["spoken_times"] = spoken
