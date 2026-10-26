@@ -276,6 +276,37 @@ def _without_thinking_filler(text: str) -> str:
     return text
 
 
+async def _warm_prompt_cache(session_llm, agent) -> None:
+    """Send the agent's system prompt and tools to Claude once while the
+    greeting plays, so the caller's first question hits a warm prompt cache.
+
+    The first reply of a call used to be the slowest (live call 2026-10-26:
+    LLM first token ~2-3s, the caller waited ~7s): Claude had to read the
+    ~20k-token prompt cold. The cache prefix is tools + system, so this
+    request (same tools, same instructions, one throwaway user line) leaves
+    exactly that prefix cached; it is stopped after the first token. Claude
+    only: the fallback model has no prompt to warm. Best effort, never raises.
+    """
+    instances = getattr(session_llm, "_llm_instances", None) or [session_llm]
+    primary = instances[0]
+    if not hasattr(primary, "_opts") or getattr(primary._opts, "caching", None) != "ephemeral":
+        return
+    started = time.monotonic()
+    try:
+        ctx = llm.ChatContext()
+        ctx.add_message(role="system", content=agent.instructions)
+        ctx.add_message(role="user", content="Halo?")
+        stream = primary.chat(chat_ctx=ctx, tools=list(agent.tools))
+        try:
+            async for _chunk in stream:
+                break
+        finally:
+            await stream.aclose()
+        logger.info("prompt cache warmed in %.2fs", time.monotonic() - started)
+    except Exception:
+        logger.warning("prompt cache warm-up failed", exc_info=True)
+
+
 async def _with_thinking_filler(stream, make_filler, after_sec: float):
     """Pass `stream` through; if it yields nothing for `after_sec`, first
     yield the text make_filler() returns, so the reply starts with it."""
@@ -666,8 +697,12 @@ class ReceptionistAgent(Agent):
         return text
 
     async def llm_node(self, chat_ctx, tools, model_settings):
-        """_masked_llm_node, opened with "Trenutek." when it is slow to start."""
-        if not self._thinking_filler:
+        """_masked_llm_node; the first reply of the call opens with
+        "Trenutek." when it is slow to start. Later replies don't: there the
+        filler came out joined to the answer and only made it longer (live
+        call 2026-10-26)."""
+        first_reply = sum(1 for i in chat_ctx.items if getattr(i, "role", None) == "user") <= 1
+        if not self._thinking_filler or not first_reply:
             async for chunk in self._masked_llm_node(chat_ctx, tools, model_settings):
                 yield chunk
             return
@@ -2836,6 +2871,11 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     agent_ref["receptionist"] = receptionist_agent
     language_control.agent = receptionist_agent
+    warm_task = asyncio.create_task(
+        _warm_prompt_cache(session.llm, receptionist_agent), name="warm_prompt_cache"
+    )
+    greeting_render_tasks.add(warm_task)
+    warm_task.add_done_callback(greeting_render_tasks.discard)
 
     # The handoff drains the bootstrap agent first, which waits for queued
     # speech to finish rather than interrupting it — the disclosure always
