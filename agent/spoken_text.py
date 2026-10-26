@@ -156,6 +156,26 @@ def drop_internal_sentences(text: str) -> str:
     return "".join(kept)
 
 
+# --- Thinking aloud (R-NO-THINKING-ALOUD) ---------------------------------
+# The model sometimes asks itself a question and answers it: "Naslednji
+# torek je sedemindvajsetega oktobra? Ne, naslednji torek v naslednjem tednu
+# je tretjega novembra." (evals 2026-10-26, about 1 in 15 date replies, even
+# with the prompt rule). The question is dropped and the reply goes on from
+# the correction.
+_SELF_CORRECTION = {
+    "sl": r"(?:ne|oziroma|pravzaprav)",
+    "en": r"(?:no|actually|wait)",
+    "de": r"(?:nein|eigentlich|moment)",
+    "hr": r"(?:ne|zapravo|odnosno)",
+    "it": r"(?:no|anzi|in realtà)",
+}
+
+
+def _self_correction_start(language: str) -> re.Pattern:
+    word = _SELF_CORRECTION.get(language, _SELF_CORRECTION["en"])
+    return re.compile(rf"^\s*{word}\b\s*[,.:!]\s*(?:(?:pozor|wait|warte)\s*[,.:!]\s*)?", re.I)
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
@@ -170,6 +190,45 @@ class SpokenTextFilter:
         self._language = language
         self._held = ""
         self._after_cut: str | None = None
+        # A question at the end of what was let through so far, held until
+        # the next words show whether the model answers it itself.
+        self._question = ""
+        self._correction = _self_correction_start(language)
+        # Set when a dropped correction ends a chunk; becomes _after_cut once
+        # this chunk is cleaned, so the next words start a sentence.
+        self._start_next: str | None = None
+
+    def _drop_thinking_aloud(self, text: str, *, final: bool) -> str:
+        text = self._question + text
+        self._question = ""
+        sentences = [m.group(0) for m in _SENTENCE.finditer(text)]
+        if "".join(sentences) != text:  # no clean split: leave it alone
+            return text
+        out: list[str] = []
+        i = 0
+        while i < len(sentences):
+            sentence = sentences[i]
+            if sentence.rstrip().endswith("?"):
+                if i + 1 < len(sentences):
+                    nxt = sentences[i + 1]
+                    m = self._correction.match(nxt)
+                    if m:
+                        rest = nxt[m.end():]
+                        if rest:
+                            sentences[i + 1] = (" " if out else "") + rest[0].upper() + rest[1:]
+                        else:
+                            # The correction's own words are still to come:
+                            # start them as a new sentence.
+                            sentences[i + 1] = ""
+                            self._start_next = "." if out else ""
+                        i += 1
+                        continue
+                elif not final:
+                    self._question = sentence
+                    break
+            out.append(sentence)
+            i += 1
+        return "".join(out)
 
     def _clean(self, text: str) -> str:
         if self._emails:
@@ -215,8 +274,14 @@ class SpokenTextFilter:
             return ""
         cut = ends[-1].end()
         out, self._held = self._held[:cut], self._held[cut:]
-        return self._clean(out)
+        return self._clean_chunk(out, final=False)
 
     def flush(self) -> str:
         out, self._held = self._held, ""
-        return self._clean(out)
+        return self._clean_chunk(out, final=True)
+
+    def _clean_chunk(self, text: str, *, final: bool) -> str:
+        text = self._clean(self._drop_thinking_aloud(text, final=final))
+        if self._start_next is not None:
+            self._after_cut, self._start_next = self._start_next, None
+        return text

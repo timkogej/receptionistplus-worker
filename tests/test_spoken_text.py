@@ -120,5 +120,33 @@ class PhoneReadback(unittest.TestCase):
         self.assertEqual(out, "Hvala. Nič štiri ena, dva dva dva, tri tri tri — je tako prav?")
 
 
+class ThinkingAloud(unittest.TestCase):
+    def _run(self, chunks, lang="sl"):
+        f = SpokenTextFilter(set(), lang)
+        out = "".join(f.feed(c) for c in chunks)
+        return out + f.flush()
+
+    def test_self_answered_question_is_dropped(self):
+        self.assertEqual(
+            self._run(["Z veseljem. Naslednji torek je sedemindvajsetega oktobra? ",
+                       "Ne, naslednji torek v naslednjem tednu je tretjega novembra. Preverim termine."]),
+            "Z veseljem. Naslednji torek v naslednjem tednu je tretjega novembra. Preverim termine.",
+        )
+        self.assertEqual(
+            self._run(["Naslednji petek je tridesetega oktobra? Ne, pozor: naslednji petek je šestega novembra."]),
+            "Naslednji petek je šestega novembra.",
+        )
+
+    def test_real_questions_stay(self):
+        self.assertEqual(self._run(["Je tako prav?"]), "Je tako prav?")
+        self.assertEqual(self._run(["Imate željo? ", "Ali vam je vseeno?"]), "Imate željo? Ali vam je vseeno?")
+        self.assertEqual(self._run(["Ste že bili pri nas? Ne skrbite, uredim."]),
+                         "Ste že bili pri nas? Ne skrbite, uredim.")
+
+    def test_english(self):
+        self.assertEqual(self._run(["Next Tuesday is the 27th? No, it's the 3rd of November."], "en"),
+                         "It's the 3rd of November.")
+
+
 if __name__ == "__main__":
     unittest.main()
