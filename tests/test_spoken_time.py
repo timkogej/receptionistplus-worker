@@ -130,7 +130,8 @@ class NaturalOffers(unittest.TestCase):
     def test_pri_nas_imamo_and_parts_once(self):
         from agent.spoken_text import business_plural
 
-        self.assertEqual(business_plural("Pri nas imate manikuro."), "Pri nas imamo manikuro.")
+        self.assertEqual(business_plural("Pri nas imate manikuro."), "Imamo manikuro.")
+        self.assertEqual(business_plural("Z veseljem, pri nas imamo manikuro."), "Z veseljem, imamo manikuro.")
         self.assertEqual(
             business_plural("V petek imamo proste termine tako dopoldan kot popoldan. Vam bolj ustreza dopoldan ali popoldan?"),
             "V petek imamo še kar nekaj prostih terminov. Vam bolj ustreza dopoldan ali popoldan?",

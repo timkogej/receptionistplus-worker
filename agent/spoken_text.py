@@ -245,8 +245,9 @@ _SL_SINGULAR_HAVE = re.compile(
 )
 
 
-# "Pri nas imate manikuro" ("you have") for "imamo" (live call 2026-10-26).
-_SL_PRI_NAS_IMATE = re.compile(r"\b([Pp]ri nas) imate\b")
+# "Pri nas imate manikuro" ("you have") and "Pri nas imamo manikuro": plain
+# "Imamo manikuro" is what people say (Tim, live call 2026-10-26).
+_SL_PRI_NAS_IMATE = re.compile(r"\b([Pp])ri nas (?:imate|imamo)\b")
 # "V petek imamo proste termine tako dopoldan kot popoldan. Vam bolj ustreza
 # dopoldan ali popoldan?" names the parts of the day twice (Tim: "čudno").
 _SL_PARTS_TWICE = re.compile(
@@ -259,7 +260,7 @@ _SL_PARTS_TWICE = re.compile(
 
 def business_plural(text: str) -> str:
     text = _SL_SINGULAR_HAVE.sub(lambda m: m.group(1) + "mamo", text)
-    text = _SL_PRI_NAS_IMATE.sub(lambda m: m.group(1) + " imamo", text)
+    text = _SL_PRI_NAS_IMATE.sub(lambda m: "Imamo" if m.group(1) == "P" else "imamo", text)
     return _SL_PARTS_TWICE.sub(
         lambda m: ("I" if m.group(0)[0] == "I" else "i") + "mamo še kar nekaj prostih terminov", text
     )
