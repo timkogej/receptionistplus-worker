@@ -10,7 +10,7 @@ Supported: the five languages Jedro+ already stores per customer
 ("Stranke".language: slo/eng/de/it/hr — see JEDROPLUS_LANGUAGE_CODES).
 
 Persona: female, formal address, in every language — same voice (Soniox
-"Maya" speaks all five). Lines spoken about herself use feminine forms
+"Nina" speaks all five). Lines spoken about herself use feminine forms
 (sl "zaključila", hr "završila", it "chiuderò" is neutral).
 """
 

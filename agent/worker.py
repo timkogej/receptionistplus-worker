@@ -1186,7 +1186,9 @@ def _build_tts(settings: Settings, language: str = DEFAULT_LANGUAGE):
         )
     return soniox.TTS(
         api_key=settings.soniox_api_key,
-        voice=settings.tts_voice_id or "Maya",
+        # Nina on tts-rt-v2 since 2026-10-26 (Maya on v1 before), chosen by
+        # Tim from samples.
+        voice=settings.tts_voice_id or "Nina",
         # Explicit, not plugin defaults: the plugin defaults to model
         # "tts-rt-v1-preview" and language "en" if unset, which is what the
         # live pipeline was silently running on for Slovenian calls (found
