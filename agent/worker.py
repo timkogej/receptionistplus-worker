@@ -91,7 +91,14 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
-from agent.spoken_text import AUDIO_TAGS, PHONE_FIRST_QUESTIONS, SpokenTextFilter, caller_digits, without_audio_tags
+from agent.spoken_text import (
+    AUDIO_TAGS,
+    PHONE_FIRST_QUESTIONS,
+    SpokenTextFilter,
+    caller_asked_price_or_time,
+    caller_digits,
+    without_audio_tags,
+)
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -749,9 +756,11 @@ class ReceptionistAgent(Agent):
         """_llm_node_filtered, then SpokenTextFilter over the text."""
         stream = self._llm_node_filtered(chat_ctx, tools, model_settings)
         heard = None
+        last_user = ""
         for item in reversed(chat_ctx.items):
             if getattr(item, "role", None) == "user":
-                heard = caller_digits(getattr(item, "text_content", "") or "")
+                last_user = getattr(item, "text_content", "") or ""
+                heard = caller_digits(last_user)
                 break
         # Only until the caller says a number, and only once: a caller who
         # won't give one isn't asked the same thing forever.
@@ -768,6 +777,7 @@ class ReceptionistAgent(Agent):
             heard_digits=heard,
             phone_first=phone_first,
             keep_audio_tags=self._audio_tags,
+            details_asked=caller_asked_price_or_time(last_user),
         )
         chunk_id = ""
         async for chunk in stream:
