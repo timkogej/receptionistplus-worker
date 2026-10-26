@@ -93,3 +93,19 @@ class ReadbackTime(unittest.TestCase):
         self.assertEqual(bt._readback_time(ctx, "2026-10-29", "14:30"), "13:30")
         self.assertEqual(bt._readback_time(ctx, "2026-10-29", "13:30"), "13:30")
         self.assertEqual(bt._readback_time(ctx, "2026-10-30", "14:30"), "14:30")
+
+
+class BusinessVoice(unittest.TestCase):
+    def test_plural_for_availability(self):
+        from agent.spoken_text import business_plural
+
+        self.assertEqual(business_plural("V četrtek imam prosto ob enih."), "V četrtek imamo prosto ob enih.")
+        self.assertEqual(business_plural("Nimam prostega termina."), "Nimamo prostega termina.")
+        self.assertEqual(business_plural("Tega podatka žal nimam."), "Tega podatka žal nimam.")
+
+    def test_audio_tags_only_with_a_voice_that_reads_them(self):
+        f = SpokenTextFilter([], "sl", keep_audio_tags=True)
+        self.assertEqual((f.feed("[chuckles] Bomo pazili! [excited] Kateri dan? ") + f.flush()).strip(),
+                         "[chuckles] Bomo pazili! Kateri dan?")
+        f = SpokenTextFilter([], "sl")
+        self.assertEqual((f.feed("[chuckles] Bomo pazili! ") + f.flush()).strip(), "Bomo pazili!")

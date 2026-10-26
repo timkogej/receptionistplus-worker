@@ -96,6 +96,9 @@ SL_TEXT_CHECKS = [
      "told the caller the number is withheld"),
     (re.compile(r"\b(?:preverila bom|termin je še prost, urejam|samo še preverim)\b", re.I),
      "narrated a tool call"),
+    (re.compile(r"\bimam\s+(?:še\s+)?(?:prost|nekaj|kar|termin)", re.I),
+     "spoke in the singular ('imam prosto' instead of 'imamo')"),
+    (re.compile(r"\[[^\]]*\]"), "square-bracket tag read aloud by a voice without tags"),
 ]
 
 
