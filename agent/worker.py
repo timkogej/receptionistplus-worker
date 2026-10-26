@@ -91,7 +91,7 @@ from agent.sms_client import (
     render_confirmation_template,
     send_sms,
 )
-from agent.spoken_text import SpokenTextFilter, caller_digits
+from agent.spoken_text import PHONE_FIRST_QUESTIONS, SpokenTextFilter, caller_digits
 from agent.tools import _sanitize_free_text as _sanitize
 from agent.llm_factory import LLMConfig, build_llm
 from agent.tools import BookingTools
@@ -335,7 +335,7 @@ _META_COMMENTARY = re.compile(
     # Reasoning about the prompt's data (eval 2026-10-18: "\"Naslednji torek\"
     # is the row tagged [NASLEDNJI TEDEN] ... Pedikura is service 18, caller
     # said any person.").
-    r"|\brow tagged\b|\bcaller (?:said|says|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
+    r"|\brow tagged\b|\bcaller (?:said|says|speaks?|spoke|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
     r"|\b(?:today|tomorrow|yesterday) is\b|\b\d{4}-\d{2}-\d{2}\b"
     r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
     re.IGNORECASE,
@@ -616,6 +616,7 @@ class ReceptionistAgent(Agent):
         private_emails: set[str] | None = None,
         on_thinking_filler=None,
         thinking_filler: bool = True,
+        phone_first: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -623,6 +624,8 @@ class ReceptionistAgent(Agent):
         # () -> None, counted in the call metrics when a slow reply got "Trenutek."
         self._on_thinking_filler = on_thinking_filler
         self._thinking_filler = thinking_filler
+        # Withheld number with find_customer: the phone number before the name.
+        self._phone_first = phone_first
         self._thinking_filler_step = 0
         # Stored customer emails (caller ID match, find_customer, the
         # existing-customer guard). The prompt says never to read them out;
@@ -683,7 +686,18 @@ class ReceptionistAgent(Agent):
             if getattr(item, "role", None) == "user":
                 heard = caller_digits(getattr(item, "text_content", "") or "")
                 break
-        mask = SpokenTextFilter(self._private_emails, self._language, heard_digits=heard)
+        # Only until the caller says a number, and only once: a caller who
+        # won't give one isn't asked the same thing forever.
+        said = [getattr(i, "text_content", "") or "" for i in chat_ctx.items]
+        roles = [getattr(i, "role", None) for i in chat_ctx.items]
+        phone_first = (
+            self._phone_first
+            and not any(caller_digits(t) for t, r in zip(said, roles) if r == "user")
+            and not any(PHONE_FIRST_QUESTIONS.get(self._language, "\0") in t for t, r in zip(said, roles) if r == "assistant")
+        )
+        mask = SpokenTextFilter(
+            self._private_emails, self._language, heard_digits=heard, phone_first=phone_first
+        )
         chunk_id = ""
         async for chunk in stream:
             if isinstance(chunk, str):
@@ -941,6 +955,7 @@ def build_receptionist_agent(
         private_emails=booking_tools.private_emails,
         on_thinking_filler=on_thinking_filler,
         thinking_filler=thinking_filler,
+        phone_first=not caller_phone and customer_lookup,
         on_suppressed_user_turn=on_suppressed_user_turn,
         on_turn_language=on_turn_language,
         instructions=_build_system_prompt(

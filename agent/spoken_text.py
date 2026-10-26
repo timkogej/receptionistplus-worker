@@ -145,6 +145,9 @@ def fix_phone_readback(text: str, heard: str | None) -> str:
 # ID 18."); the sentence carrying it is dropped (any language).
 _INTERNAL_DATA = re.compile(
     r"\bID\s*\d+\b|\b(?:service|employee|appointment)_id\b|\bany_person\b|\bOB-\d{3,}\b"
+    # "Pedikura ima šifro 18." (eval 2026-10-26)
+    r"|\b(?:šifr[aoei]\w*|številk[aoi] storitve)\s+\d+\b",
+    re.IGNORECASE,
 )
 _SENTENCE = re.compile(r"[^.!?\u2026]*[.!?\u2026]+\s*|[^.!?\u2026]+$")
 
@@ -176,13 +179,63 @@ def _self_correction_start(language: str) -> re.Pattern:
     return re.compile(rf"^\s*{word}\b\s*[,.:!]\s*(?:(?:pozor|wait|warte)\s*[,.:!]\s*)?", re.I)
 
 
+# --- Phone number first on a withheld number (caller block, R-ASK-DETAILS) --
+# With the number withheld, the phone number has to come first so
+# find_customer can match an existing customer before a misheard name is
+# taken down (live call 2026-10-17). The prompt says so, and the model still
+# asked for the name first in about half the eval calls (2026-10-26). Until
+# the caller has said a phone number, a question for the name is replaced
+# with the one for the number.
+_NAME_QUESTION = {
+    "sl": r"\b(?:ime in priimek|vaše ime|svoje ime|kako vam je ime|kako se pišete)\b",
+    "en": r"\b(?:your (?:first and last |full )?name|first and last name)\b",
+    "de": r"\b(?:Ihren (?:vollen )?Namen|Vor- und Nachnamen|wie heißen Sie)\b",
+    "hr": r"\b(?:ime i prezime|vaše ime|kako se zovete)\b",
+    "it": r"\b(?:nome e cognome|il suo nome|come si chiama)\b",
+}
+_PHONE_QUESTION = {
+    "sl": "Mi lahko najprej poveste svojo telefonsko številko?",
+    "en": "Could I first have your phone number?",
+    "de": "Darf ich zuerst Ihre Telefonnummer haben?",
+    "hr": "Možete li mi najprije reći svoj broj telefona?",
+    "it": "Può dirmi prima il suo numero di telefono?",
+}
+
+
+PHONE_FIRST_QUESTIONS = _PHONE_QUESTION
+
+
+def ask_phone_before_name(text: str, language: str) -> str:
+    """`text` with a question for the caller's name replaced by the one for
+    their phone number (once; any further name question is dropped)."""
+    pattern = _NAME_QUESTION.get(language)
+    if not pattern or not re.search(pattern, text, re.I):
+        return text
+    out, replaced = [], False
+    for m in _SENTENCE.finditer(text):
+        sentence = m.group(0)
+        if sentence.rstrip().endswith("?") and re.search(pattern, sentence, re.I):
+            if not replaced:
+                lead = sentence[: len(sentence) - len(sentence.lstrip())]
+                trail = sentence[len(sentence.rstrip()):]
+                out.append(lead + _PHONE_QUESTION[language] + trail)
+                replaced = True
+            continue
+        out.append(sentence)
+    return "".join(out)
+
+
 class SpokenTextFilter:
     """Last pass over reply text before TTS, a sentence at a time (TTS
     speaks by sentence anyway): stored email addresses become "vaš
     e-naslov", the Slovenian read-back lead-in is cut, Slovenian clock
     hours are put right, and Cyrillic letters become Latin ones."""
 
-    def __init__(self, emails, language: str, heard_digits: str | None = None) -> None:
+    def __init__(
+        self, emails, language: str, heard_digits: str | None = None, *, phone_first: bool = False
+    ) -> None:
+        # Number withheld and no phone number said yet: ask for it before the name.
+        self._phone_first = phone_first
         # The digits of the phone number the caller last said, if any.
         self._heard_digits = heard_digits
         self._emails = {e.strip().lower() for e in emails if e and "@" in e}
@@ -246,6 +299,8 @@ class SpokenTextFilter:
             text = (" " if self._after_cut else "") + body
             self._after_cut = None
         text = drop_internal_sentences(text)
+        if self._phone_first:
+            text = ask_phone_before_name(text, self._language)
         if re.search(r"[\u0400-\u04FF]", text):
             text = text.translate(_CYRILLIC)
         if self._language == "sl":

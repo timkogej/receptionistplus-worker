@@ -148,5 +148,26 @@ class ThinkingAloud(unittest.TestCase):
                          "It's the 3rd of November.")
 
 
+
+class PhoneFirst(unittest.TestCase):
+    def test_name_question_becomes_phone_question(self):
+        f = SpokenTextFilter(set(), "sl", phone_first=True)
+        out = f.feed("Super. Mi lahko poveste svoje ime in priimek? ") + f.flush()
+        self.assertEqual(out.strip(), "Super. Mi lahko najprej poveste svojo telefonsko številko?")
+
+    def test_off_leaves_it(self):
+        f = SpokenTextFilter(set(), "sl")
+        out = f.feed("Super. Mi lahko poveste svoje ime in priimek? ") + f.flush()
+        self.assertEqual(out.strip(), "Super. Mi lahko poveste svoje ime in priimek?")
+
+
+
+class InternalCode(unittest.TestCase):
+    def test_service_code_sentence_dropped(self):
+        f = SpokenTextFilter(set(), "sl")
+        out = f.feed("Pedikura ima šifro 18. V sredo imamo proste termine. ") + f.flush()
+        self.assertEqual(out.strip(), "V sredo imamo proste termine.")
+
+
 if __name__ == "__main__":
     unittest.main()
