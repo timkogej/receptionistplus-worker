@@ -153,7 +153,7 @@ class PhoneFirst(unittest.TestCase):
     def test_name_question_becomes_phone_question(self):
         f = SpokenTextFilter(set(), "sl", phone_first=True)
         out = f.feed("Super. Mi lahko poveste svoje ime in priimek? ") + f.flush()
-        self.assertEqual(out.strip(), "Super. Mi lahko najprej poveste svojo telefonsko številko?")
+        self.assertEqual(out.strip(), "Super. Na katero številko vas lahko pokličemo?")
 
     def test_off_leaves_it(self):
         f = SpokenTextFilter(set(), "sl")

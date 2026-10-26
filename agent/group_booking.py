@@ -23,6 +23,7 @@ import logging
 from livekit.agents import RunContext, function_tool
 
 from agent import booking_client
+from agent.spoken_time import spoken_time
 from agent.booking_client import BookingError
 from agent.booking_extras import answers_note
 from agent.call_policy import normalize_phone
@@ -43,28 +44,6 @@ def _min(t: str) -> int:
 
 def _hhmm(minutes: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
-
-
-_SL_HOURS = {1: "enih", 2: "dveh", 3: "treh", 4: "štirih", 5: "petih", 6: "šestih", 7: "sedmih",
-             8: "osmih", 9: "devetih", 10: "desetih", 11: "enajstih", 12: "dvanajstih"}
-_SL_HALF = {1: "pol enih", 2: "pol dveh", 3: "pol treh", 4: "pol štirih", 5: "pol petih", 6: "pol šestih",
-            7: "pol sedmih", 8: "pol osmih", 9: "pol devetih", 10: "pol desetih", 11: "pol enajstih",
-            12: "pol dvanajstih"}
-
-
-def spoken_sl_time(hhmm: str) -> str | None:
-    """"14:00" -> "ob dveh popoldan", "09:30" -> "ob pol desetih dopoldan":
-    the 12-hour form with the part of the day (R-TIME-LIST-STYLE). None for
-    quarter hours, which the model then words itself."""
-    h, m = int(hhmm[:2]), int(hhmm[3:5])
-    part = "dopoldan" if h < 12 else ("popoldan" if h < 18 else "zvečer")
-    if h == 12 and m == 0:
-        return "ob dvanajstih"
-    if m == 0:
-        return f"ob {_SL_HOURS[h % 12 or 12]} {part}"
-    if m == 30:
-        return f"ob {_SL_HALF[(h + 1) % 12 or 12]} {part}"
-    return None
 
 
 def _spread(options: list[dict], limit: int = MAX_OPTIONS) -> list[dict]:
@@ -193,7 +172,7 @@ class GroupBooking:
                     "people": [
                         {
                             "time": slot["time"],
-                            "say": spoken_sl_time(slot["time"]) if self._bt._language == "sl" else None,
+                            "say": spoken_time(slot["time"], self._bt._language),
                             "employee": names.get(slot["employee_id"]) if slot["employee_id"] else None,
                         }
                         for slot in opt["slots"]
@@ -323,7 +302,7 @@ class GroupBooking:
                 return {"success": False, "error": "existing_customer",
                         "first_name": existing.get("Ime"), "last_name": existing.get("Priimek"),
                         "email": existing.get("Email stranke") or "",
-                        "message": f"This number belongs to {full}. Ask \"Ali ste {full}?\"; if yes, book_group again with those details."}
+                        "message": f"This number belongs to {full}. Ask \"Termin vpišem na ime {full}?\" (in English \"Shall I put it under {full}?\"); if yes, book_group again with those details."}
             if not email:
                 email = (existing.get("Email stranke") or "").strip()
 
@@ -396,6 +375,11 @@ class GroupBooking:
             })
 
         self.created = made
+        self._bt.booked.extend(
+            {"date": m["date"], "time": m["time"], "service_ids": [m["service_id"]],
+             "employee": m["employee_name"], "name": m["name"]}
+            for m in made
+        )
         if self._bt.created_termin_id is None:
             self._bt.created_termin_id = made[0]["terminId"]
         self._bt.booking_interest = None

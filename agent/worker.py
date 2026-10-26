@@ -76,7 +76,7 @@ from agent.languages import (
     normalize_language,
     pack,
 )
-from agent.call_summary import summarize_call
+from agent.call_summary import booking_facts, summarize_call
 from agent.appointments import AppointmentTools
 from agent.group_booking import GroupBooking
 from agent.booking_extras import BookingExtras, render_extras_block
@@ -368,7 +368,9 @@ _META_COMMENTARY = re.compile(
     # said any person.").
     r"|\brow tagged\b|\bcaller (?:said|says|speaks?|spoke|wants|asked|asks|gave|gives|is|named)\b|\bany[_ ]person\b"
     r"|\b(?:today|tomorrow|yesterday) is\b|\b\d{4}-\d{2}-\d{2}\b"
-    r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b",
+    r"|\bservice (?:id )?\d+\b|\bemployee(?:_id| id)\b"
+    # "I need to re-check the correct slot." (eval 2026-10-26)
+    r"|\bI (?:need|have) to (?:re-?check|call|check|use)\b|\bthe (?:correct|right) slot\b",
     re.IGNORECASE,
 )
 _SENTENCE_END = re.compile(r"[.!?…](?:\s|$)")
@@ -939,11 +941,10 @@ def build_find_customer_tool(
             "email": email,
             "message": (
                 "This number belongs to an existing customer. Without saying you "
-                "looked anything up, ask once whether "
-                "you're speaking with them, by first name (in Slovenian in the "
-                "instrumental case: \"Ali govorim z Ano?\"). If the caller already "
-                "gave you a name, ask with the full stored name instead (\"Ali ste "
-                "Ana Novak?\") — what you heard may be misheard. If yes: pass exactly "
+                "looked anything up, ask once, with the full stored name: in Slovenian "
+                "\"Termin vpišem na ime Ana Novak?\" (for an existing appointment: "
+                "\"Govorim z Ano Novak?\"), in English \"Shall I put it under Ana "
+                "Novak?\". If yes: pass exactly "
                 "these first_name, last_name"
                 + (" and email" if email else "")
                 + " and this phone to create_booking (or, for an existing appointment, "
@@ -2357,6 +2358,11 @@ async def entrypoint(ctx: JobContext) -> None:
         # first. Only when the owner will be NOTIFIED (message/callback) is a
         # quick summary made before the insert, so the notification carries
         # it; otherwise it is written afterwards.
+        summary_facts = (
+            booking_facts(booking_tools.booked, booking_tools._company_data, company_language)
+            if booking_tools
+            else ""
+        )
         summary = None
         if notes.has_note:
             summary = await summarize_call(
@@ -2364,6 +2370,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=6.0,
+                facts=summary_facts,
             )
 
         try:
@@ -2408,6 +2415,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 company_language,
                 anthropic_api_key=settings.anthropic_api_key,
                 timeout=12.0,
+                facts=summary_facts,
             )
             if summary:
                 try:

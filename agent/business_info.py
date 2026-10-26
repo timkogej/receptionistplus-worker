@@ -135,20 +135,24 @@ def render_caller_block(
     if not caller_phone:
         if not can_lookup:
             return (
-                "Caller: the number is withheld — ask for a phone number as usual."
+                "Caller: the number is withheld — ask for a phone number as usual. Never "
+                "tell the caller their number is withheld or hidden."
                 if en
-                else "Klicatelj: številka je skrita — telefonsko številko vprašaj kot običajno."
+                else "Klicatelj: številka je skrita — telefonsko številko vprašaj kot običajno. "
+                "Klicatelju nikoli ne reci, da je njegova številka skrita."
             )
         return (
-            "Caller: the number is withheld. When booking, ask for the phone "
+            "Caller: the number is withheld (never say so to the caller: just "
+            "ask \"What number can we reach you on?\"). When booking, ask for the phone "
             "number FIRST, before the name; read it back, and once they confirm "
             "it, call find_customer with it and follow its answer — ask for the "
             "name (and email) only if it finds nobody or they say it isn't them. "
             "If you already asked for the name, still call find_customer once "
             "the number is confirmed."
             if en
-            else "Klicatelj: številka je skrita. Pri rezervaciji telefonsko "
-            "številko vprašaj NAJPREJ, pred imenom; preberi jo nazaj in, ko jo "
+            else "Klicatelj: številka je skrita (klicatelju tega nikoli ne reci, "
+            "samo vprašaj: \"Na katero številko vas lahko pokličemo?\"). Pri rezervaciji "
+            "telefonsko številko vprašaj NAJPREJ, pred imenom; preberi jo nazaj in, ko jo "
             "potrdi, pokliči find_customer s to številko ter sledi odgovoru — "
             "za ime (in e-naslov) vprašaj samo, če stranke ne najde ali če "
             "klicatelj reče, da to ni on. Če si za ime že vprašala, "
@@ -234,7 +238,7 @@ def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
         return (
             "Confirmation: by SMS to the phone number of the booking — don't "
             "ask for an email, and don't explain that you don't need one: just "
-            "ask for the next detail. After booking, mention they'll get a text."
+            "ask for the next detail. After booking, say briefly: \"You'll get a text confirmation.\""
             if sms_confirmation
             else "Confirmation: by email — ask for the caller's email address, "
             "unless they confirmed being the existing customer named above with "
@@ -243,7 +247,7 @@ def render_confirmation_line(sms_confirmation: bool, language: str) -> str:
     return (
         "Potrdilo: pride po SMS na telefonsko številko rezervacije — za "
         "e-naslov ne sprašuj in ne razlagaj, da ga ne potrebuješ: preprosto "
-        "vprašaj za naslednji podatek. Po rezervaciji omeni, da bodo dobili SMS."
+        "vprašaj za naslednji podatek. Po rezervaciji reci samo: \"Potrdilo dobite po SMS-u.\""
         if sms_confirmation
         else "Potrdilo: pride po e-pošti — vprašaj za e-poštni naslov, razen "
         "če je klicatelj potrdil, da je zgoraj navedena obstoječa stranka s "

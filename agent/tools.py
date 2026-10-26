@@ -92,6 +92,7 @@ from agent.call_policy import normalize_phone
 from agent.company_prompt import spoken_employee_names
 from agent.dates import spoken_date_label
 from agent.languages import pack
+from agent.spoken_time import spoken_time, spoken_time_list, spoken_time_map, times_said
 from agent.booking_client import (
     BookingError,
     BookingMalformedResponseError,
@@ -272,6 +273,26 @@ def _offer_times(slots_by_date: dict, per_part: int = 5) -> dict:
     return offer
 
 
+def _say_times(offer: dict, language: str) -> dict:
+    """offer_times as ready phrases, per day and part of the day ("ob enih,
+    pol dveh ali dveh"): the model reads them out instead of wording HH:MM
+    itself (agent/spoken_time.py says why)."""
+    out = {}
+    for date, parts in offer.items():
+        day = {}
+        for key, times in parts.items():
+            phrase = spoken_time_list(times, language)
+            if phrase:
+                day[key] = phrase
+        if day:
+            out[date] = day
+    return out
+
+
+def _all_times(slots_by_date: dict) -> list[str]:
+    return [t for times in slots_by_date.values() if isinstance(times, list) for t in times]
+
+
 def _day_label(iso_date: str, language: str) -> str | None:
     try:
         return spoken_date_label(datetime.strptime(iso_date, "%Y-%m-%d").date(), language)
@@ -363,6 +384,12 @@ class BookingTools:
         # Set on the first successful create_booking this session, for
         # receptionist_calls.created_termin_id / outcome (Phase 3 call logging).
         self.created_termin_id: str | None = None
+        # Every booking made in this call, for the owner's summary
+        # (call_summary.py): exact day and time, not the transcript's words.
+        self.booked: list[dict] = []
+        # Free times per date from the last get_slots, to check the time
+        # passed to check_slots/create_booking against the read-back.
+        self._last_slots: dict = {}
         # Set when the caller was told the owner will check/follow up (an
         # ambiguous create_booking outcome). worker.py turns it into a
         # callback request on the call row, so the owner actually hears.
@@ -664,6 +691,13 @@ class BookingTools:
             result["time_of_day"] = _time_of_day_summary(result["slots"])
             result["offer_times"] = _offer_times(result["slots"])
             result["day_labels"] = _day_labels(result["slots"], self._language)
+            self._last_slots.update({d: t for d, t in result["slots"].items() if isinstance(t, list)})
+            say = _say_times(result["offer_times"], self._language)
+            if say:
+                result["say_times"] = say
+            spoken = spoken_time_map(_all_times(result["slots"]), self._language)
+            if spoken:
+                result["spoken_times"] = spoken
         if window_note and isinstance(result, dict):
             result["note"] = window_note
         if isinstance(result.get("slots"), dict):
@@ -673,6 +707,35 @@ class BookingTools:
                 "time": None,
             }
         return result
+
+    def _readback_time(self, context, date: str, time: str) -> str:
+        """The time the caller said yes to, when the model passes another.
+
+        The model read back "ob pol dveh popoldan" (13:30), the caller
+        confirmed, and it then called check_slots with 14:30 — "pol dveh"
+        taken as English "half two" (evals 2026-10-26, 2 of 3 runs). The
+        latest reply of ours that names a time from that day's free times is
+        the read-back; if it names exactly one and that differs, it wins."""
+        free = self._last_slots.get(date)
+        if not isinstance(free, list) or not free or not isinstance(time, str):
+            return time
+        try:
+            items = list(context.session.history.items)
+        except Exception:
+            return time
+        for item in reversed(items):
+            if getattr(item, "type", None) != "message" or getattr(item, "role", None) != "assistant":
+                continue
+            said = times_said(item.text_content or "", free, self._language)
+            if not said:
+                continue
+            if len(said) == 1:
+                agreed = next(iter(said))
+                if agreed != time[:5]:
+                    logger.warning("time %s replaced by the read-back's %s (%s)", time, agreed, date)
+                    return agreed
+            return time
+        return time
 
     @function_tool
     async def check_slots(
@@ -697,6 +760,7 @@ class BookingTools:
         refusal = self._employee_selection_error(service_ids, employee_id, any_person)
         if refusal:
             return refusal
+        time = self._readback_time(context, date, time)
         employee_id, any_person, eligible = self._resolve_person(
             service_ids, employee_id, any_person
         )
@@ -734,6 +798,9 @@ class BookingTools:
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):
             result["day_label"] = label
+        said = spoken_time(time, self._language)
+        if said and isinstance(result, dict):
+            result["time_spoken"] = said
         return result
 
     @function_tool
@@ -774,6 +841,7 @@ class BookingTools:
             answers: The caller's answers to the owner's before-booking
                 questions for this service, "<question> — <answer>".
         """
+        time = self._readback_time(context, date, time)
         if (
             not self._company_data["company"].get("multiple_services_online")
             and len(service_ids) > 1
@@ -826,8 +894,8 @@ class BookingTools:
                     "email": stored_email,
                     "message": (
                         f"This phone number belongs to an existing customer, {full}. "
-                        f"Ask once, without explaining why: \"Ali ste {full}?\" (in "
-                        "the call's language). If yes: call create_booking again "
+                        f"Ask once, without explaining why: \"Termin vpišem na ime {full}?\" "
+                        f"(in English: \"Shall I put it under {full}?\"; otherwise in the call's language). If yes: call create_booking again "
                         "with exactly these first_name, last_name"
                         + (" and email (never read it aloud)" if stored_email else "")
                         + ". If no: call create_booking again with the caller's "
@@ -960,6 +1028,9 @@ class BookingTools:
             }
         if result.get("success") and result.get("terminId"):
             self.created_termin_id = result["terminId"]
+            self.booked.append(
+                {"date": date, "time": time, "service_ids": list(service_ids), "employee": result.get("oseba") or ""}
+            )
             # A retry after an ambiguous outcome went through cleanly.
             self.owner_followup_reason = None
             if self._on_booked is not None:
@@ -985,6 +1056,9 @@ class BookingTools:
         label = _day_label(date, self._language)
         if label and isinstance(result, dict):
             result["day_label"] = label
+        said = spoken_time(time, self._language)
+        if said and isinstance(result, dict):
+            result["time_spoken"] = said
         advice = self.extras.advice_for(service_ids)
         if advice and isinstance(result, dict) and result.get("success"):
             result["advice"] = advice
