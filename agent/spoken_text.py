@@ -258,6 +258,32 @@ _SL_PARTS_TWICE = re.compile(
 )
 
 
+# "Da, torej je tako prav." after the caller said "je tako prav" back (live
+# call 2026-10-27): the agent repeated its own question as an answer. And
+# "Preden nadaljujem: ali ste ..." announces the next step instead of taking it.
+_SL_ECHO_CONFIRM = re.compile(
+    r"(?:^|(?<=[.!?]))\s*(?:(?:da|ja|super|v redu|odlično)\s*,?\s*)?(?:torej\s+)?"
+    r"(?:je\s+)?tako\s+(?:je\s+)?prav\s*[.!]\s*",
+    re.I,
+)
+_SL_BEFORE_I_GO_ON = re.compile(r"\b[Pp]reden\s+nadaljujem(?:\s+(?:še|z rezervacijo))?\s*[:,\u2014-]+\s*")
+
+
+def drop_echo_and_announcing(text: str) -> str:
+    if not (_SL_ECHO_CONFIRM.search(text) or _SL_BEFORE_I_GO_ON.search(text)):
+        return text
+    lead = text[: len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()):]
+    text = _SL_ECHO_CONFIRM.sub(" ", text)
+    out = _SL_BEFORE_I_GO_ON.split(text, maxsplit=1)
+    if len(out) == 2:
+        head, tail = out[0].rstrip(), out[1]
+        if tail and (not head or head[-1] in ".!?"):
+            tail = tail[0].upper() + tail[1:]
+        text = (head + " " + tail) if head else tail
+    return lead + text.strip() + trail if text.strip() else ""
+
+
 def business_plural(text: str) -> str:
     text = _SL_SINGULAR_HAVE.sub(lambda m: m.group(1) + "mamo", text)
     text = _SL_PRI_NAS_IMATE.sub(lambda m: "Imamo" if m.group(1) == "P" else "imamo", text)
@@ -426,6 +452,10 @@ class SpokenTextFilter:
         if self._language == "sl":
             # "na številko 041 555 123": digits are read badly by TTS.
             text = _PHONE_DIGITS.sub(lambda m: spoken_sl_digits(re.sub(r"\D", "", m.group(0))), text)
+            before = text
+            text = drop_echo_and_announcing(text)
+            if before.strip() and not text:
+                self._after_cut = "."  # next words start a sentence
             text = business_plural(text)
             text = fix_slovenian_hours(text)
             text = fix_phone_readback(text, self._heard_digits)

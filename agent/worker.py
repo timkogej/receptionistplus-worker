@@ -1181,6 +1181,7 @@ class LanguageControl:
             words=len(text.split()),
             previous_detected=self.turn_language["previous"],
             allowed=self.allowed,
+            text=text,
         )
         self.turn_language["previous"] = detected
         if target:

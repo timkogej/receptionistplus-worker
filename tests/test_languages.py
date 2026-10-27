@@ -72,6 +72,16 @@ class DetectSwitch(unittest.TestCase):
         self.assertIsNone(L.detect_switch(current="sl", detected="de", words=9,
                                           previous_detected=None, allowed=["sl", "en"]))
 
+    def test_mixed_turn_with_slovenian_word_stays(self):
+        # Live call 2026-10-27: "Uh, let me reserve a termin." switched to English.
+        mixed = dict(current="sl", detected="en", words=6, allowed=ALL,
+                     text="Uh, let me reserve a termin.")
+        self.assertIsNone(L.detect_switch(previous_detected=None, **mixed))
+        self.assertEqual(L.detect_switch(previous_detected="en", **mixed), "en")
+        self.assertEqual(L.detect_switch(current="sl", detected="en", words=7, allowed=ALL,
+                                         previous_detected=None,
+                                         text="Hi, I would like to book a manicure."), "en")
+
 
 if __name__ == "__main__":
     unittest.main()

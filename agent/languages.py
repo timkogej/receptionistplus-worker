@@ -420,6 +420,23 @@ CLOSE_PAIRS = {frozenset(("sl", "hr"))}
 CLOSE_PAIR_MIN_WORDS = 5
 
 
+# Words that only the current language uses for booking. A turn that holds
+# one is mixed ("Uh, let me reserve a termin.", live call 2026-10-27: the
+# agent switched to English for one turn) and doesn't switch on its own.
+_OWN_WORDS = {
+    "sl": {"termin", "termina", "terminu", "rad", "rada", "bi", "prosim", "lahko", "rezerviral",
+           "rezervirala", "rezervirati", "naročil", "naročila", "hvala", "jutri", "danes", "ja",
+           "ne", "jaz", "imate", "želim", "manikuro", "pedikuro", "masažo"},
+}
+
+
+def _mixed(text: str, current: str) -> bool:
+    own = _OWN_WORDS.get(current)
+    if not own or not text:
+        return False
+    return any(w in own for w in re.findall(r"[a-zčšžćđ]+", text.lower()))
+
+
 def detect_switch(
     *,
     current: str,
@@ -427,6 +444,7 @@ def detect_switch(
     words: int,
     previous_detected: str | None,
     allowed: list[str] | tuple,
+    text: str = "",
 ) -> str | None:
     """The language to switch to before replying to this turn, or None.
 
@@ -436,6 +454,8 @@ def detect_switch(
     """
     lang = normalize_language(detected)
     if not lang or lang == current or lang not in allowed:
+        return None
+    if _mixed(text, current) and normalize_language(previous_detected) != lang:
         return None
     if frozenset((current, lang)) in CLOSE_PAIRS:
         # Slovenian and Croatian share much of their vocabulary; a

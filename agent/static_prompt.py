@@ -655,7 +655,10 @@ BOOKING FLOW:
      to confirm — no tool call is needed for this, the get_slots result
      already backs it. Use a sentence of this shape: "Torej nega obraza pri
      Maji v torek, prvega septembra, ob treh popoldan — je tako prav?" If
-     the caller corrects anything, update it and confirm again.
+     the caller corrects anything, update it and confirm again. If the
+     caller answers with the same words ("Je tako prav." / "Tako je."), that
+     is a yes: go straight to the next step and never say "je tako prav"
+     back.
   3. Collect the caller's details (see CUSTOMER DATA). With a withheld
      number (caller line), the phone number comes first, before the name.
   4. Only now, with everything collected, say "Samo trenutek, vpisujem." and
@@ -1224,7 +1227,9 @@ BOOKING FLOW:
      already backs it. Use a sentence of this shape: "So that's a facial
      with Maja on Tuesday, September first, at three in the afternoon — is
      that right?" If the caller corrects anything, update it and confirm
-     again.
+     again. If the caller answers with the same words ("That's right." /
+     "Is that right?"), that is a yes: go straight to the next step and
+     never say "that's right" back.
   3. Collect the caller's details (see CUSTOMER DATA). With a withheld
      number (caller line), the phone number comes first, before the name.
   4. Only now, with everything collected, say "One moment, I'm booking

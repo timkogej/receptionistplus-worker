@@ -169,5 +169,28 @@ class InternalCode(unittest.TestCase):
         self.assertEqual(out.strip(), "V sredo imamo proste termine.")
 
 
+class EchoAndAnnouncing(unittest.TestCase):
+    """Live call 2026-10-27: "Da, torej je tako prav. Preden nadaljujem: ali ste ..."."""
+
+    def run_filter(self, chunks):
+        f = SpokenTextFilter([], "sl")
+        out = "".join(f.feed(c) or "" for c in chunks)
+        return (out + (f.flush() or "")).strip()
+
+    def test_echoed_confirmation_and_lead_in_dropped(self):
+        self.assertEqual(
+            self.run_filter(["Da, torej je ", "tako prav. Preden nadaljujem: ali ste ", "starejši od trideset let?"]),
+            "Ali ste starejši od trideset let?",
+        )
+
+    def test_lead_in_mid_reply(self):
+        self.assertEqual(self.run_filter(["Hvala. Preden nadaljujem, ali imate alergijo?"]),
+                         "Hvala. Ali imate alergijo?")
+
+    def test_read_back_question_kept(self):
+        text = "Torej manikura v petek ob pol dvanajstih dopoldan. Je tako prav?"
+        self.assertEqual(self.run_filter([text]), text)
+
+
 if __name__ == "__main__":
     unittest.main()

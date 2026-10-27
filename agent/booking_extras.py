@@ -102,7 +102,10 @@ def render_extras_block(extras: BookingExtras | None, company_data: dict) -> str
             "(fix only capital letters and, in another language, translate it): don't rephrase it, "
             "don't add \"answer yes or no\", and don't say the owner set them. Pass every answer to "
             "create_booking in `answers` as \"<question> — <answer>\" (\"ne ve\" / \"ni odgovora\" if "
-            "the caller doesn't know or won't say). Never ask questions for services that aren't "
+            "the caller doesn't know or won't say). If the answer is unclear or contradicts itself "
+            "(\"Da.\" then \"Ne, nisem.\"), ask once, briefly, which it is (\"Torej niste?\"). "
+            "Ask the question straight, without a lead-in such as \"Preden nadaljujem\", and "
+            "don't thank for the answer. Never ask questions for services that aren't "
             "being booked.",
         ]
         lines += [f"- For {_scope(q, names)}: \"{q.text}\"" for q in extras.questions]
