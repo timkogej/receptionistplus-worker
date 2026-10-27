@@ -1,6 +1,13 @@
 import unittest
 
-from agent.spoken_text import SpokenTextFilter, caller_digits, fix_phone_readback, fix_slovenian_hours, spoken_sl_digits
+from agent.spoken_text import (
+    SpokenTextFilter,
+    caller_digits,
+    fix_phone_readback,
+    fix_slovenian_hours,
+    spoken_sl_digits,
+    without_audio_tags,
+)
 
 
 def run(parts, emails=(), language="sl"):
@@ -188,8 +195,25 @@ class EchoAndAnnouncing(unittest.TestCase):
                          "Hvala. Ali imate alergijo?")
 
     def test_read_back_question_kept(self):
-        text = "Torej manikura v petek ob pol dvanajstih dopoldan. Je tako prav?"
+        text = "Torej manikura v petek ob desetih dopoldan. Je tako prav?"
         self.assertEqual(self.run_filter([text]), text)
+
+
+class StressHalf(unittest.TestCase):
+    """Nina stresses "pol" oddly; "pól" sounds right (samples 2026-10-27)."""
+
+    def test_voice_gets_accent(self):
+        f = SpokenTextFilter([], "sl")
+        out = (f.feed("Imamo ob desetih, pol enajstih ali pol dvanajstih.") or "") + (f.flush() or "")
+        self.assertEqual(out.strip(), "Imamo ob desetih, pól enajstih ali pól dvanajstih.")
+
+    def test_other_pol_untouched(self):
+        f = SpokenTextFilter([], "sl")
+        out = (f.feed("Traja uro in pol. Pol ure prej pridite.") or "") + (f.flush() or "")
+        self.assertNotIn("pól", out.lower())
+
+    def test_transcript_gets_plain_pol(self):
+        self.assertEqual(without_audio_tags("Ob pól dveh popoldan."), "Ob pol dveh popoldan.")
 
 
 if __name__ == "__main__":

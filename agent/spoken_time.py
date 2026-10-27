@@ -138,7 +138,7 @@ def times_said(text: str, candidates, language: str = "sl") -> set[str]:
     """Which of `candidates` (HH:MM) `text` names. Full phrases first ("ob
     pol dveh popoldan"); without the part of the day, the bare form ("ob pol
     dveh"), which may match two candidates (1:30 and 13:30)."""
-    low = " ".join(str(text or "").lower().split())
+    low = " ".join(str(text or "").lower().replace("pól", "pol").split())
     cands = sorted({str(t)[:5] for t in candidates})
     found = {t for t in cands if (p := spoken_time(t, language)) and p.lower() in low}
     if found:

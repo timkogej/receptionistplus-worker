@@ -349,9 +349,24 @@ def audio_tags(text: str, keep: bool) -> str:
     return _AUDIO_TAG.sub(swap, text)
 
 
+# Nina (tts-rt-v2) stresses "pol" oddly in "ob pol dvanajstih"; written
+# "pól" it sounds right (samples 2026-10-27, Tim chose this one). Only for
+# the voice: the transcript and summary get plain "pol" back.
+_SL_HALF = re.compile(
+    r"\b([Pp])ol(?=\s+(?:enih|dveh|treh|štirih|petih|šestih|sedmih|osmih|devetih|desetih"
+    r"|enajstih|dvanajstih)\b)"
+)
+_SL_HALF_ACCENT = re.compile(r"\b([Pp])ól\b")
+
+
+def stress_half(text: str) -> str:
+    return _SL_HALF.sub(lambda m: m.group(1) + "ól", text)
+
+
 def without_audio_tags(text: str) -> str:
     """For the stored transcript and the summary."""
-    return audio_tags(text or "", keep=False).strip()
+    text = _SL_HALF_ACCENT.sub(lambda m: m.group(1) + "ol", text or "")
+    return audio_tags(text, keep=False).strip()
 
 
 _PHONE_DIGITS = re.compile(r"(?<![\w.,])\+?\d{2,4}(?:[ /-]?\d{2,4}){2,3}(?![\w.,]\d)")
@@ -458,6 +473,7 @@ class SpokenTextFilter:
                 self._after_cut = "."  # next words start a sentence
             text = business_plural(text)
             text = fix_slovenian_hours(text)
+            text = stress_half(text)
             text = fix_phone_readback(text, self._heard_digits)
             stripped = _READBACK_LEAD_IN.sub("", text)
             if stripped != text:
