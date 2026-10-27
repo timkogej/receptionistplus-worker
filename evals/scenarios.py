@@ -281,7 +281,10 @@ def _natural_day() -> int:
 
 
 _SL_DAYS_ACC = ("ponedeljek", "torek", "sredo", "četrtek", "petek", "soboto", "nedeljo")
-_SL_MONTHS = r"(?:januarja|februarja|marca|aprila|maja|junija|julija|avgusta|septembra|oktobra|novembra|decembra)"
+# A month only after an ordinal day ("devetindvajsetega oktobra"), so the
+# employee "Maja" doesn't count as May (eval 2026-10-27).
+_SL_MONTHS = (r"\w+ega\s+(?:januarja|februarja|marca|aprila|maja|junija|julija|avgusta|septembra"
+              r"|oktobra|novembra|decembra)\b")
 
 
 def _check_natural_booking(fake, notes) -> list[str]:
